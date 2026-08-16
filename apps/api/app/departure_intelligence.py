@@ -1,0 +1,527 @@
+from __future__ import annotations
+
+from collections import Counter, defaultdict
+from datetime import date, datetime
+from math import floor
+
+from fastapi import HTTPException
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from .models import FactGPSEvent, FactLoadingOrderLine, FactShipment, FactShipmentSPBU, MasterDepot, MasterMT, MasterSPBU
+
+
+ALGORITHM_VERSION = "departure_profile.circular_gap_v1"
+GPS_SOURCE_TYPES = {"DEPOT_EXIT", "DEPOT_GEOFENCE_EXIT", "ACTUAL_DEPOT_EXIT", "GPS_DEPOT_EXIT"}
+DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+
+def build_departure_intelligence_payload(
+    db: Session,
+    depot_id: str,
+    start_date: date,
+    end_date: date,
+    bucket_minutes: int = 30,
+    limit: int = 25,
+    offset: int = 0,
+    search: str | None = None,
+    sort_column: str = "observation_count",
+    sort_direction: str = "desc",
+) -> dict:
+    if bucket_minutes not in {30, 60}:
+        raise HTTPException(status_code=400, detail="bucket_minutes must be 30 or 60.")
+    if end_date < start_date:
+        raise HTTPException(status_code=400, detail="end_date must be greater than or equal to start_date.")
+    depot = db.get(MasterDepot, depot_id)
+    if not depot:
+        raise HTTPException(status_code=404, detail="Depot not found.")
+
+    raw_rows = load_departure_rows(db, depot_id, start_date, end_date, search)
+    gps_lookup = load_gps_departure_lookup(db, depot_id, raw_rows)
+    quantity_lookup = load_quantity_lookup(db, raw_rows)
+    observations = build_observations(raw_rows, gps_lookup, quantity_lookup)
+    valid_observations = [row for row in observations if row["departure_datetime_used"]]
+
+    profiles = sort_profiles(build_profiles(valid_observations, bucket_minutes), sort_column, sort_direction)
+    total = len(profiles)
+    visible_profiles = profiles[offset : offset + limit]
+
+    return {
+        "phase": 2,
+        "page_name": "Depot Departure Time Intelligence",
+        "algorithm_version": ALGORITHM_VERSION,
+        "effective_filters": {
+            "depot_id": depot.depot_id,
+            "depot_name": depot.depot_name,
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "bucket_minutes": bucket_minutes,
+            "search": search or "",
+            "sort_column": sort_column,
+            "sort_direction": "desc" if sort_direction == "desc" else "asc",
+        },
+        "summary": build_summary(observations, valid_observations, profiles),
+        "distribution": build_distribution(valid_observations, bucket_minutes),
+        "weekday_heatmap": build_weekday_heatmap(valid_observations, bucket_minutes),
+        "box_plot": build_box_plot(visible_profiles),
+        "profiles": visible_profiles,
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "observations": build_observation_sample(valid_observations, visible_profiles),
+        "notes": [
+            "The unit of analysis is unique shipment_id + spbu_id.",
+            "departure_datetime_used prefers a reliable GPS depot-exit event when available, otherwise LO gate-out.",
+            "Preferred Historical Departure Window is descriptive and uses circular-time P20-P80 bounds.",
+        ],
+    }
+
+
+def build_departure_date_availability(db: Session, depot_id: str) -> dict:
+    depot = db.get(MasterDepot, depot_id)
+    if not depot:
+        raise HTTPException(status_code=404, detail="Depot not found.")
+    rows = db.execute(
+        select(FactShipment.operating_date, func.count())
+        .where(
+            FactShipment.depot_id == depot_id,
+            FactShipment.operating_date.is_not(None),
+            FactShipment.gate_out_datetime.is_not(None),
+        )
+        .group_by(FactShipment.operating_date)
+        .order_by(FactShipment.operating_date)
+    ).all()
+    dates = [{"date": operating_date.isoformat(), "shipment_count": count} for operating_date, count in rows]
+    return {
+        "depot_id": depot.depot_id,
+        "depot_name": depot.depot_name,
+        "available_dates": [item["date"] for item in dates],
+        "dates": dates,
+        "min_date": dates[0]["date"] if dates else None,
+        "max_date": dates[-1]["date"] if dates else None,
+    }
+
+
+def load_departure_rows(db: Session, depot_id: str, start_date: date, end_date: date, search: str | None) -> list:
+    stmt = (
+        select(FactShipmentSPBU, FactShipment, MasterSPBU, MasterDepot, MasterMT)
+        .join(FactShipment, FactShipment.shipment_id == FactShipmentSPBU.shipment_id)
+        .join(MasterSPBU, MasterSPBU.spbu_id == FactShipmentSPBU.spbu_id)
+        .join(MasterDepot, MasterDepot.depot_id == FactShipment.depot_id)
+        .outerjoin(MasterMT, MasterMT.mt_id == FactShipment.mt_id)
+        .where(
+            FactShipment.depot_id == depot_id,
+            FactShipment.operating_date >= start_date,
+            FactShipment.operating_date <= end_date,
+        )
+        .order_by(FactShipment.operating_date, FactShipment.source_shipment_id, MasterSPBU.spbu_code)
+    )
+    if search and search.strip():
+        pattern = f"%{search.strip().lower()}%"
+        stmt = stmt.where(
+            func.lower(MasterSPBU.spbu_code).like(pattern)
+            | func.lower(MasterSPBU.spbu_name).like(pattern)
+            | func.lower(FactShipment.source_shipment_id).like(pattern)
+        )
+    return db.execute(stmt).all()
+
+
+def load_gps_departure_lookup(db: Session, depot_id: str, rows: list) -> dict[str, datetime]:
+    vehicle_dates: dict[str, set[date]] = defaultdict(set)
+    shipments_by_vehicle: dict[str, list[FactShipment]] = defaultdict(list)
+    for _, shipment, _, _, _ in rows:
+        if shipment.vehicle_registration and shipment.operating_date:
+            vehicle_dates[shipment.vehicle_registration].add(shipment.operating_date)
+            shipments_by_vehicle[shipment.vehicle_registration].append(shipment)
+    if not vehicle_dates:
+        return {}
+
+    vehicles = list(vehicle_dates)
+    gps_events = db.scalars(
+        select(FactGPSEvent).where(
+            FactGPSEvent.vehicle_registration.in_(vehicles),
+            FactGPSEvent.nearest_depot_id == depot_id,
+            FactGPSEvent.event_datetime.is_not(None),
+            FactGPSEvent.event_type.in_(GPS_SOURCE_TYPES),
+        )
+    ).all()
+    events_by_vehicle: dict[str, list[FactGPSEvent]] = defaultdict(list)
+    for event in gps_events:
+        if event.vehicle_registration and event.event_datetime and event.event_datetime.date() in vehicle_dates.get(event.vehicle_registration, set()):
+            events_by_vehicle[event.vehicle_registration].append(event)
+
+    lookup: dict[str, datetime] = {}
+    for vehicle_registration, shipments in shipments_by_vehicle.items():
+        events = sorted(events_by_vehicle.get(vehicle_registration, []), key=lambda item: item.event_datetime)
+        if not events:
+            continue
+        for shipment in shipments:
+            candidates = [event for event in events if event.event_datetime.date() == shipment.operating_date]
+            if shipment.gate_out_datetime:
+                candidates = [
+                    event
+                    for event in candidates
+                    if abs((event.event_datetime - shipment.gate_out_datetime).total_seconds()) <= 6 * 60 * 60
+                ]
+                candidates.sort(key=lambda event: abs((event.event_datetime - shipment.gate_out_datetime).total_seconds()))
+            if candidates:
+                lookup[shipment.shipment_id] = candidates[0].event_datetime
+    return lookup
+
+
+def load_quantity_lookup(db: Session, rows: list) -> dict[tuple[str, str], dict]:
+    keys = {(shipment_spbu.shipment_id, shipment_spbu.spbu_id) for shipment_spbu, *_ in rows}
+    if not keys:
+        return {}
+    shipment_ids = {shipment_id for shipment_id, _ in keys}
+    line_rows = db.execute(
+        select(FactLoadingOrderLine, FactShipment)
+        .join(FactShipment, FactShipment.shipment_id == FactLoadingOrderLine.shipment_id)
+        .where(FactLoadingOrderLine.shipment_id.in_(shipment_ids))
+    ).all()
+    lookup: dict[tuple[str, str], dict] = defaultdict(lambda: {"quantity": 0.0, "products": set()})
+    for line, shipment in line_rows:
+        if not line.spbu_id:
+            continue
+        key = (shipment.shipment_id, line.spbu_id)
+        if key not in keys:
+            continue
+        lookup[key]["quantity"] += float(line.quantity or 0)
+        if line.source_product_name:
+            lookup[key]["products"].add(line.source_product_name)
+    return lookup
+
+
+def build_observations(rows: list, gps_lookup: dict[str, datetime], quantity_lookup: dict[tuple[str, str], dict]) -> list[dict]:
+    observations = []
+    seen: set[tuple[str, str]] = set()
+    for shipment_spbu, shipment, spbu, depot, mt in rows:
+        key = (shipment.shipment_id, spbu.spbu_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        gps_dt = gps_lookup.get(shipment.shipment_id)
+        lo_dt = shipment.gate_out_datetime
+        used_dt = gps_dt or lo_dt
+        source = "GPS" if gps_dt else "LO_GATE_OUT" if lo_dt else None
+        quantity = quantity_lookup.get(key, {"quantity": 0.0, "products": set()})
+        observations.append(
+            {
+                "observation_id": f"{shipment.shipment_id}:{spbu.spbu_id}",
+                "shipment_id": shipment.shipment_id,
+                "source_shipment_id": shipment.source_shipment_id,
+                "spbu_id": spbu.spbu_id,
+                "spbu_code": spbu.spbu_code,
+                "spbu_name": spbu.spbu_name,
+                "depot_id": depot.depot_id,
+                "depot_name": depot.depot_name,
+                "operation_date": shipment.operating_date.isoformat() if shipment.operating_date else None,
+                "vehicle_id": shipment.mt_id,
+                "vehicle_registration": shipment.vehicle_registration,
+                "vehicle_type_tag": mt.vehicle_type_tag if mt else None,
+                "project_tag_raw": shipment.project_tag_raw,
+                "loading_order_gate_out_datetime": lo_dt.isoformat() if lo_dt else None,
+                "gps_actual_depot_exit_datetime": gps_dt.isoformat() if gps_dt else None,
+                "departure_datetime_used": used_dt.isoformat() if used_dt else None,
+                "departure_time_source": source,
+                "departure_minute": minute_of_day(used_dt) if used_dt else None,
+                "day_of_week": DAY_NAMES[used_dt.weekday()] if used_dt else None,
+                "is_weekend": used_dt.weekday() >= 5 if used_dt else None,
+                "gps_vs_lo_difference_minutes": round((gps_dt - lo_dt).total_seconds() / 60, 1) if gps_dt and lo_dt else None,
+                "quantity": quantity["quantity"],
+                "products": sorted(quantity["products"]),
+                "assignment_source": shipment_spbu.assignment_source,
+            }
+        )
+    return observations
+
+
+def build_summary(observations: list[dict], valid_observations: list[dict], profiles: list[dict]) -> dict:
+    shipment_ids = {row["shipment_id"] for row in valid_observations}
+    vehicles = {row["vehicle_registration"] for row in valid_observations if row["vehicle_registration"]}
+    spbus = {row["spbu_id"] for row in valid_observations}
+    gps_rows = [row for row in observations if row["gps_actual_depot_exit_datetime"]]
+    lo_rows = [row for row in observations if row["loading_order_gate_out_datetime"]]
+    diff_values = [row["gps_vs_lo_difference_minutes"] for row in observations if row["gps_vs_lo_difference_minutes"] is not None]
+    high = sum(1 for row in profiles if row["confidence_level"] == "HIGH")
+    medium = sum(1 for row in profiles if row["confidence_level"] == "MEDIUM")
+    return {
+        "observation_count": len(valid_observations),
+        "profile_count": len(profiles),
+        "shipment_count": len(shipment_ids),
+        "spbu_count": len(spbus),
+        "vehicle_count": len(vehicles),
+        "quantity_dispatched": round(sum(float(row["quantity"] or 0) for row in valid_observations), 2),
+        "gps_timestamp_coverage_pct": percentage(len(gps_rows), len(observations)),
+        "lo_gate_out_coverage_pct": percentage(len(lo_rows), len(observations)),
+        "gps_observation_count": len(gps_rows),
+        "lo_gate_out_observation_count": len(lo_rows),
+        "missing_timestamp_count": sum(1 for row in observations if not row["departure_datetime_used"]),
+        "invalid_timestamp_count": 0,
+        "avg_gps_vs_lo_difference_minutes": round(sum(diff_values) / len(diff_values), 1) if diff_values else None,
+        "high_confidence_profiles": high,
+        "medium_confidence_profiles": medium,
+        "low_confidence_profiles": max(0, len(profiles) - high - medium),
+    }
+
+
+def build_profiles(observations: list[dict], bucket_minutes: int) -> list[dict]:
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for row in observations:
+        grouped[row["spbu_id"]].append(row)
+    profiles = []
+    for spbu_id, rows in grouped.items():
+        minutes = [int(row["departure_minute"]) for row in rows if row["departure_minute"] is not None]
+        if not minutes:
+            continue
+        stats = circular_stats(minutes)
+        source_counts = Counter(row["departure_time_source"] for row in rows)
+        peak_bucket_start, peak_bucket_count = peak_bucket(minutes, bucket_minutes)
+        shipment_ids = {row["shipment_id"] for row in rows}
+        vehicles = {row["vehicle_registration"] for row in rows if row["vehicle_registration"]}
+        confidence_score, confidence_level = confidence(stats["iqr_minutes"], len(minutes))
+        profiles.append(
+            {
+                "spbu_id": spbu_id,
+                "spbu_code": rows[0]["spbu_code"],
+                "spbu_name": rows[0]["spbu_name"],
+                "depot_id": rows[0]["depot_id"],
+                "depot_name": rows[0]["depot_name"],
+                "observation_count": len(minutes),
+                "shipment_count": len(shipment_ids),
+                "vehicle_count": len(vehicles),
+                "quantity_dispatched": round(sum(float(row["quantity"] or 0) for row in rows), 2),
+                "p20": minute_label(stats["p20"]),
+                "p25": minute_label(stats["p25"]),
+                "p50": minute_label(stats["p50"]),
+                "p75": minute_label(stats["p75"]),
+                "p80": minute_label(stats["p80"]),
+                "p90": minute_label(stats["p90"]),
+                "p95": minute_label(stats["p95"]),
+                "p20_minutes": stats["p20"],
+                "p25_minutes": stats["p25"],
+                "p50_minutes": stats["p50"],
+                "p75_minutes": stats["p75"],
+                "p80_minutes": stats["p80"],
+                "p90_minutes": stats["p90"],
+                "p95_minutes": stats["p95"],
+                "min": minute_label(stats["min"]),
+                "max": minute_label(stats["max"]),
+                "crosses_midnight": stats["crosses_midnight"],
+                "peak_departure_time": minute_label((peak_bucket_start + bucket_minutes / 2) % 1440),
+                "peak_departure_minutes": (peak_bucket_start + bucket_minutes / 2) % 1440,
+                "peak_departure_bucket": bucket_label(peak_bucket_start, bucket_minutes),
+                "peak_bucket_count": peak_bucket_count,
+                "preferred_historical_departure_window": f"{minute_label(stats['p20'])}-{minute_label(stats['p80'])}",
+                "dispersion_minutes_iqr": round(stats["iqr_minutes"], 1),
+                "robust_spread_minutes_p20_p80": round(stats["p80_linear"] - stats["p20_linear"], 1),
+                "outlier_count": stats["outlier_count"],
+                "confidence_score": confidence_score,
+                "confidence_level": confidence_level,
+                "departure_time_source_counts": dict(source_counts),
+                "algorithm_version": ALGORITHM_VERSION,
+                "box_plot_minutes": [stats["min_linear"], stats["p25_linear"], stats["p50_linear"], stats["p75_linear"], stats["max_linear"]],
+            }
+        )
+    return profiles
+
+
+def sort_profiles(profiles: list[dict], sort_column: str, sort_direction: str) -> list[dict]:
+    sort_keys = {
+        "spbu_code": lambda item: item.get("spbu_code") or "",
+        "preferred_historical_departure_window": lambda item: item.get("p20_minutes") or 0,
+        "peak_departure_time": lambda item: item.get("peak_departure_minutes") or 0,
+        "p50": lambda item: item.get("p50_minutes") or 0,
+        "p80": lambda item: item.get("p80_minutes") or 0,
+        "p90": lambda item: item.get("p90_minutes") or 0,
+        "p95": lambda item: item.get("p95_minutes") or 0,
+        "observation_count": lambda item: item.get("observation_count") or 0,
+        "dispersion_minutes_iqr": lambda item: item.get("dispersion_minutes_iqr") or 0,
+        "confidence_score": lambda item: item.get("confidence_score") or 0,
+    }
+    key_fn = sort_keys.get(sort_column, sort_keys["observation_count"])
+    reverse = sort_direction == "desc"
+    return sorted(profiles, key=lambda item: (key_fn(item), item.get("spbu_code") or item.get("spbu_id") or ""), reverse=reverse)
+
+
+def circular_stats(minutes: list[int]) -> dict:
+    values = unwrap_circular_minutes(minutes)
+    return {
+        **percentile_bundle(values),
+        "min": normalize_minute(values[0]),
+        "max": normalize_minute(values[-1]),
+        "min_linear": values[0],
+        "max_linear": values[-1],
+        "crosses_midnight": values[-1] >= 1440,
+        "outlier_count": outlier_count(values),
+    }
+
+
+def unwrap_circular_minutes(minutes: list[int]) -> list[float]:
+    sorted_minutes = sorted(float(minute % 1440) for minute in minutes)
+    if len(sorted_minutes) <= 1:
+        return sorted_minutes
+    gaps = []
+    for index, value in enumerate(sorted_minutes):
+        next_value = sorted_minutes[(index + 1) % len(sorted_minutes)]
+        if index == len(sorted_minutes) - 1:
+            next_value += 1440
+        gaps.append(next_value - value)
+    cut_index = gaps.index(max(gaps))
+    start = sorted_minutes[(cut_index + 1) % len(sorted_minutes)]
+    unwrapped = [value if value >= start else value + 1440 for value in sorted_minutes]
+    return sorted(unwrapped)
+
+
+def percentile_bundle(values: list[float]) -> dict:
+    p20 = percentile(values, 20)
+    p25 = percentile(values, 25)
+    p50 = percentile(values, 50)
+    p75 = percentile(values, 75)
+    p80 = percentile(values, 80)
+    p90 = percentile(values, 90)
+    p95 = percentile(values, 95)
+    return {
+        "p20": normalize_minute(p20),
+        "p25": normalize_minute(p25),
+        "p50": normalize_minute(p50),
+        "p75": normalize_minute(p75),
+        "p80": normalize_minute(p80),
+        "p90": normalize_minute(p90),
+        "p95": normalize_minute(p95),
+        "p20_linear": p20,
+        "p25_linear": p25,
+        "p50_linear": p50,
+        "p75_linear": p75,
+        "p80_linear": p80,
+        "p90_linear": p90,
+        "p95_linear": p95,
+        "iqr_minutes": max(0, p75 - p25),
+    }
+
+
+def percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0
+    if len(values) == 1:
+        return values[0]
+    rank = (len(values) - 1) * pct / 100
+    lower = floor(rank)
+    upper = min(lower + 1, len(values) - 1)
+    weight = rank - lower
+    return values[lower] * (1 - weight) + values[upper] * weight
+
+
+def outlier_count(values: list[float]) -> int:
+    if len(values) < 4:
+        return 0
+    p25 = percentile(values, 25)
+    p75 = percentile(values, 75)
+    iqr = p75 - p25
+    low = p25 - 1.5 * iqr
+    high = p75 + 1.5 * iqr
+    return sum(1 for value in values if value < low or value > high)
+
+
+def confidence(iqr_minutes: float, count: int) -> tuple[int, str]:
+    sample_score = min(1.0, count / 30) * 70
+    spread_score = max(0.0, 1.0 - min(iqr_minutes, 360) / 360) * 30
+    score = round(sample_score + spread_score)
+    if count >= 30 and iqr_minutes <= 180:
+        return score, "HIGH"
+    if count >= 10 and iqr_minutes <= 360:
+        return score, "MEDIUM"
+    return score, "LOW"
+
+
+def build_distribution(observations: list[dict], bucket_minutes: int) -> list[dict]:
+    buckets: dict[int, dict] = {}
+    for row in observations:
+        bucket_start = int(row["departure_minute"] // bucket_minutes * bucket_minutes)
+        bucket = buckets.setdefault(bucket_start, {"shipments": set(), "vehicles": set(), "quantity": 0.0, "value": 0})
+        bucket["value"] += 1
+        bucket["shipments"].add(row["shipment_id"])
+        if row["vehicle_registration"]:
+            bucket["vehicles"].add(row["vehicle_registration"])
+        bucket["quantity"] += float(row["quantity"] or 0)
+    return [
+        {
+            "name": bucket_label(start, bucket_minutes),
+            "bucket_start": minute_label(start),
+            "bucket_end": minute_label((start + bucket_minutes) % 1440),
+            "value": bucket.get("value", 0),
+            "shipments": len(bucket.get("shipments", set())),
+            "vehicles": len(bucket.get("vehicles", set())),
+            "quantity": round(bucket.get("quantity", 0), 2),
+        }
+        for start, bucket in sorted(buckets.items())
+    ]
+
+
+def build_weekday_heatmap(observations: list[dict], bucket_minutes: int) -> dict:
+    bucket_count = 1440 // bucket_minutes
+    x_axis = [bucket_label(index * bucket_minutes, bucket_minutes) for index in range(bucket_count)]
+    y_axis = DAY_NAMES
+    counts: dict[tuple[int, int], int] = Counter()
+    for row in observations:
+        if not row["departure_datetime_used"]:
+            continue
+        departure_dt = datetime.fromisoformat(row["departure_datetime_used"])
+        x_index = int(row["departure_minute"] // bucket_minutes)
+        y_index = departure_dt.weekday()
+        counts[(x_index, y_index)] += 1
+    return {
+        "x_axis": x_axis,
+        "y_axis": y_axis,
+        "data": [[x, y, value] for (x, y), value in sorted(counts.items())],
+    }
+
+
+def build_box_plot(profiles: list[dict]) -> dict:
+    return {
+        "categories": [profile["spbu_code"] for profile in profiles],
+        "data": [profile["box_plot_minutes"] for profile in profiles],
+    }
+
+
+def build_observation_sample(observations: list[dict], profiles: list[dict]) -> list[dict]:
+    profile_spbus = [profile["spbu_id"] for profile in profiles]
+    observations_by_spbu: dict[str, list[dict]] = defaultdict(list)
+    for row in observations:
+        if row["spbu_id"] in profile_spbus:
+            observations_by_spbu[row["spbu_id"]].append(row)
+
+    sample = []
+    for spbu_id in profile_spbus:
+        rows = sorted(observations_by_spbu.get(spbu_id, []), key=lambda row: (row["operation_date"] or "", row["source_shipment_id"]))
+        sample.extend(rows[:30])
+    return sample
+
+
+def peak_bucket(minutes: list[int], bucket_minutes: int) -> tuple[int, int]:
+    buckets = Counter(int(minute // bucket_minutes * bucket_minutes) for minute in minutes)
+    bucket_start, count = sorted(buckets.items(), key=lambda item: (-item[1], item[0]))[0]
+    return bucket_start, count
+
+
+def minute_of_day(value: datetime) -> int:
+    return value.hour * 60 + value.minute
+
+
+def normalize_minute(value: float) -> float:
+    return value % 1440
+
+
+def minute_label(value: float) -> str:
+    minute = int(round(value)) % 1440
+    return f"{minute // 60:02d}:{minute % 60:02d}"
+
+
+def bucket_label(start: int, bucket_minutes: int) -> str:
+    return f"{minute_label(start)}-{minute_label((start + bucket_minutes) % 1440)}"
+
+
+def percentage(numerator: int, denominator: int) -> float:
+    if denominator == 0:
+        return 0.0
+    return round(numerator * 100 / denominator, 1)

@@ -1,0 +1,2616 @@
+import { AlertTriangle, ArrowDown, ArrowUp, ArrowUpDown, CalendarDays, CheckCircle2, ChevronLeft, ChevronRight, Database, Download, Eye, FileUp, GitBranch, Pencil, Plus, RefreshCw, Route, Save, Search, Trash2, X } from "lucide-react";
+import ReactECharts from "echarts-for-react";
+import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
+import "./index.css";
+import { apiGet, apiSend, downloadFromApi, importSampleData, uploadImportFile, type SeriesPoint } from "./lib/api";
+import { ChartPanel } from "./components/ChartPanel";
+
+type Overview = Record<string, number>;
+type Charts = Record<string, SeriesPoint[]>;
+type ImportAudit = {
+  import_id: string;
+  domain: string;
+  filename: string;
+  sheet_name: string;
+  uploaded_at: string;
+  total_rows: number;
+  valid_rows: number;
+  warning_rows: number;
+  rejected_rows: number;
+  status: string;
+};
+type QualityIssue = {
+  issue_id: string;
+  entity_type: string;
+  entity_id: string | null;
+  rule_code: string;
+  severity: string;
+  description: string;
+};
+type CompatibilitySummary = {
+  compatible: number;
+  incompatible: number;
+  insufficient_data: number;
+  examples: Array<Record<string, unknown>>;
+};
+type Depot = {
+  depot_id: string;
+  depot_code: string | null;
+  depot_name: string;
+};
+type Product = {
+  product_id: string;
+  product_name: string;
+};
+type TagType = {
+  tag_type_id: string;
+  code: string;
+  name: string;
+};
+type CrudResponse = {
+  domain: string;
+  total: number;
+  limit: number;
+  offset: number;
+  rows: Array<Record<string, unknown>>;
+};
+type CrudField = {
+  key: string;
+  label: string;
+  kind?: "text" | "number" | "select" | "textarea" | "checkbox";
+  required?: boolean;
+  readonlyOnEdit?: boolean;
+  options?: Array<{ label: string; value: string }>;
+};
+type CrudDomainConfig = {
+  label: string;
+  idKey: string;
+  titleKey: string;
+  columns: string[];
+  fields: CrudField[];
+  depotFilter?: boolean;
+  statusFilter?: boolean;
+};
+type Page = "dashboard" | "master-data" | "tag-consistency" | "departure-intelligence";
+type CrudPageSize = 10 | 50 | 100 | "ALL";
+type CrudSortDirection = "asc" | "desc";
+type CrudModalMode = "add" | "edit" | null;
+type CrudBatchFormRow = {
+  recordId?: string;
+  values: Record<string, unknown>;
+};
+type TagConsistencyDetail = {
+  tag_type: string;
+  tag_type_name: string;
+  matching_rule: string;
+  spbu_required_tags: string[];
+  mt_available_tags: string[];
+  missing_tags: string[];
+  extra_mt_tags: string[];
+  result: string;
+  reason: string;
+  rule_expression?: string | null;
+};
+type TagConsistencyRow = {
+  analysis_id: string;
+  loading_order_number: string;
+  loading_order_date: string | null;
+  vehicle_registration: string | null;
+  mt_id: string | null;
+  mt_name: string | null;
+  mt_vehicle_class: number | null;
+  spbu_id: string | null;
+  spbu_name: string | null;
+  spbu_code: string | null;
+  spbu_vehicle_class: number | null;
+  depot: string | null;
+  product_name: string | null;
+  overall_status: string;
+  overall_group: "MATCH" | "MISMATCH" | "DATA_ISSUE";
+  mismatch_count: number;
+  data_issue_count: number;
+  vehicle_class_result: string;
+  tag_match_result: string;
+  primary_reason: string;
+  details: TagConsistencyDetail[];
+};
+type RankedMismatch = {
+  spbu?: string;
+  vehicle_registration?: string;
+  total_assignment: number;
+  mismatch: number;
+  mismatch_rate: number;
+};
+type TagConsistencySummary = {
+  total_lo_assignments: number;
+  matched: number;
+  mismatch: number;
+  data_issues: number;
+  analyzable_lo: number;
+  consistency_rate: number;
+  mismatch_by_tag_type: SeriesPoint[];
+  mismatch_by_tag_value: SeriesPoint[];
+  daily_consistency_rate: SeriesPoint[];
+  top_spbu_mismatch: RankedMismatch[];
+  top_mt_mismatch: RankedMismatch[];
+  data_quality_summary: SeriesPoint[];
+};
+type TagConsistencyResponse = {
+  latest_loading_order_date: string | null;
+  defaulted_to_latest_date: boolean;
+  effective_filters: Record<string, string | number | null>;
+  summary: TagConsistencySummary;
+  total: number;
+  limit: number;
+  offset: number;
+  rows: TagConsistencyRow[];
+};
+type TagConsistencyFilters = {
+  startDate: string;
+  endDate: string;
+  depotId: string;
+  spbu: string;
+  vehicle: string;
+  tagType: string;
+  status: string;
+  productId: string;
+  vehicleClass: string;
+  search: string;
+};
+type MismatchSortColumn = "label" | "total_assignment" | "mismatch" | "mismatch_rate";
+type DepartureSortColumn =
+  | "spbu_code"
+  | "preferred_historical_departure_window"
+  | "peak_departure_time"
+  | "p50"
+  | "p80"
+  | "p90"
+  | "p95"
+  | "observation_count"
+  | "dispersion_minutes_iqr"
+  | "confidence_score";
+type DepartureFilters = {
+  depotId: string;
+  startDate: string;
+  endDate: string;
+  bucketMinutes: string;
+  search: string;
+};
+type DepartureDateAvailability = {
+  depot_id: string;
+  depot_name: string;
+  available_dates: string[];
+  dates: Array<{ date: string; shipment_count: number }>;
+  min_date: string | null;
+  max_date: string | null;
+};
+type DepartureSummary = {
+  observation_count: number;
+  profile_count: number;
+  shipment_count: number;
+  spbu_count: number;
+  vehicle_count: number;
+  quantity_dispatched: number;
+  gps_timestamp_coverage_pct: number;
+  lo_gate_out_coverage_pct: number;
+  gps_observation_count: number;
+  lo_gate_out_observation_count: number;
+  missing_timestamp_count: number;
+  invalid_timestamp_count: number;
+  avg_gps_vs_lo_difference_minutes: number | null;
+  high_confidence_profiles: number;
+  medium_confidence_profiles: number;
+  low_confidence_profiles: number;
+};
+type DepartureProfile = {
+  spbu_id: string;
+  spbu_code: string;
+  spbu_name: string | null;
+  depot_name: string;
+  observation_count: number;
+  shipment_count: number;
+  vehicle_count: number;
+  quantity_dispatched: number;
+  p20: string;
+  p25: string;
+  p50: string;
+  p75: string;
+  p80: string;
+  p90: string;
+  p95: string;
+  peak_departure_time: string;
+  peak_departure_bucket: string;
+  preferred_historical_departure_window: string;
+  dispersion_minutes_iqr: number;
+  outlier_count: number;
+  confidence_score: number;
+  confidence_level: "HIGH" | "MEDIUM" | "LOW";
+  departure_time_source_counts: Record<string, number>;
+  algorithm_version: string;
+};
+type DepartureObservation = {
+  observation_id: string;
+  shipment_id: string;
+  source_shipment_id: string;
+  spbu_id: string;
+  spbu_code: string;
+  operation_date: string | null;
+  vehicle_registration: string | null;
+  loading_order_gate_out_datetime: string | null;
+  gps_actual_depot_exit_datetime: string | null;
+  departure_datetime_used: string | null;
+  departure_time_source: string | null;
+  gps_vs_lo_difference_minutes: number | null;
+  quantity: number;
+  products: string[];
+};
+type DepartureAnalysis = {
+  algorithm_version: string;
+  effective_filters: Record<string, string | number | null>;
+  summary: DepartureSummary;
+  distribution: SeriesPoint[];
+  weekday_heatmap: { x_axis: string[]; y_axis: string[]; data: number[][] };
+  box_plot: { categories: string[]; data: number[][] };
+  profiles: DepartureProfile[];
+  observations: DepartureObservation[];
+  total: number;
+  limit: number;
+  offset: number;
+  notes: string[];
+};
+
+const kpiLabels: Record<string, string> = {
+  total_mt: "Total MT",
+  active_mt: "Active MT",
+  total_spbu: "Total SPBU",
+  active_spbu: "Active SPBU",
+  total_depot: "Depots",
+  total_product: "Products",
+  total_canonical_tags: "Canonical Tags",
+  total_tag_types: "Tag Types",
+  total_loading_order_lines: "LO Lines",
+  total_shipments: "Shipments",
+  unique_mt_observed_in_lo: "Unique MT in LO",
+  unique_spbu_observed_in_lo: "Unique SPBU in LO",
+  unmatched_mt: "Unmatched MT",
+  unmatched_spbu: "Unmatched SPBU",
+  gps_events: "GPS Events",
+  gps_confirmed_spbu_visits: "GPS Visits",
+  data_quality_issues: "Quality Issues"
+};
+
+const crudDomainOrder = ["MOBIL_TANGKI", "SPBU", "LOADING_ORDER", "DEPOT", "PRODUCT", "TAG", "TAG_TYPE"];
+
+function tagTypeColumnKey(code: string): string {
+  return `tag_${code.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "")}`;
+}
+
+function crudConfigs(depots: Depot[], tagTypes: TagType[]): Record<string, CrudDomainConfig> {
+  const depotOptions = [{ label: "No depot", value: "" }, ...depots.map((depot) => ({ label: depot.depot_name, value: depot.depot_id }))];
+  const mtTagColumns = tagTypes.map((tagType) => tagTypeColumnKey(tagType.code));
+  const spbuTagColumns = tagTypes.map((tagType) => tagTypeColumnKey(tagType.code));
+  const editableTagFields = tagTypes
+    .filter((tagType) => tagType.code !== "VEHICLE_CLASS")
+    .map((tagType) => ({
+      key: tagTypeColumnKey(tagType.code),
+      label: `Tag ${tagType.name || tagType.code}`,
+      kind: "textarea" as const
+    }));
+  const tagTypeOptions = [
+    { label: "Auto by tag value", value: "" },
+    ...tagTypes.map((tagType) => ({ label: `${tagType.code} - ${tagType.name}`, value: tagType.tag_type_id }))
+  ];
+  const statusOptions = [
+    { label: "ACTIVE", value: "ACTIVE" },
+    { label: "INACTIVE", value: "INACTIVE" }
+  ];
+  return {
+    MOBIL_TANGKI: {
+      label: "Mobil Tangki",
+      idKey: "mt_id",
+      titleKey: "vehicle_registration",
+      depotFilter: true,
+      columns: ["vehicle_registration", "vehicle_name_raw", "capacity_label", "number_of_compartments", ...mtTagColumns, "active_status"],
+      fields: [
+        { key: "vehicle_name_raw", label: "Raw Name", required: true },
+        { key: "vehicle_registration", label: "Registration" },
+        { key: "capacity_label", label: "Capacity" },
+        { key: "vehicle_type_tag", label: "Tag Vehicle Class", kind: "number" },
+        ...editableTagFields,
+        { key: "number_of_compartments", label: "Compartments", kind: "number" },
+        { key: "depot_id", label: "Depot", kind: "select", options: depotOptions },
+        { key: "assignee", label: "Assignee" },
+        { key: "active_status", label: "Status", kind: "select", options: statusOptions }
+      ]
+    },
+    SPBU: {
+      label: "SPBU",
+      idKey: "spbu_id",
+      titleKey: "spbu_code",
+      depotFilter: true,
+      columns: ["spbu_code", "city", "latitude", "longitude", ...spbuTagColumns, "active_status"],
+      fields: [
+        { key: "spbu_code", label: "SPBU Code", required: true },
+        { key: "spbu_name", label: "Name" },
+        { key: "address", label: "Address", kind: "textarea" },
+        { key: "city", label: "City" },
+        { key: "latitude", label: "Latitude", kind: "number" },
+        { key: "longitude", label: "Longitude", kind: "number" },
+        { key: "master_distance_km", label: "Distance KM", kind: "number" },
+        { key: "master_travel_time_min", label: "Travel Time Min", kind: "number" },
+        { key: "vehicle_type_tag", label: "Tag Vehicle Class", kind: "number" },
+        ...editableTagFields,
+        { key: "primary_depot_id", label: "Depot", kind: "select", options: depotOptions },
+        { key: "active_status", label: "Status", kind: "select", options: statusOptions }
+      ]
+    },
+    LOADING_ORDER: {
+      label: "Loading Order",
+      idKey: "crud_record_id",
+      titleKey: "loading_order_number",
+      depotFilter: true,
+      statusFilter: false,
+      columns: ["loading_order_number", "source_depot_name", "shipment_id", "vehicle_registration", "validation_date", "validation_time", "source_spbu_code", "shipto", "source_product_name", "quantity", "status"],
+      fields: [
+        { key: "loading_order_number", label: "Loading Order Number", required: true, readonlyOnEdit: true },
+        { key: "source_depot_name", label: "Depot Name (TBBM)", required: true, readonlyOnEdit: true },
+        { key: "shipment_id", label: "Shipment ID", required: true },
+        { key: "source_spbu_code", label: "Source SPBU Code" },
+        { key: "shipto", label: "Ship To" },
+        { key: "product_id", label: "Product ID" },
+        { key: "source_product_name", label: "Source Product Name" },
+        { key: "quantity", label: "Quantity", kind: "number" },
+        { key: "status", label: "Operational Status" },
+        { key: "source_distance_km", label: "Source Distance KM", kind: "number" },
+        { key: "actual_km", label: "Actual KM", kind: "number" }
+      ]
+    },
+    DEPOT: {
+      label: "Depot",
+      idKey: "depot_id",
+      titleKey: "depot_name",
+      columns: ["depot_code", "depot_name", "region", "timezone", "active_status"],
+      fields: [
+        { key: "depot_code", label: "Depot Code" },
+        { key: "depot_name", label: "Depot Name", required: true },
+        { key: "latitude", label: "Latitude", kind: "number" },
+        { key: "longitude", label: "Longitude", kind: "number" },
+        { key: "region", label: "Region" },
+        { key: "timezone", label: "Timezone" },
+        { key: "active_status", label: "Status", kind: "select", options: statusOptions }
+      ]
+    },
+    PRODUCT: {
+      label: "Product",
+      idKey: "product_id",
+      titleKey: "product_name",
+      columns: ["product_name", "normalized_product", "active_status"],
+      fields: [
+        { key: "product_name", label: "Product Name", required: true },
+        { key: "active_status", label: "Status", kind: "select", options: statusOptions }
+      ]
+    },
+    TAG: {
+      label: "Tag",
+      idKey: "tag_id",
+      titleKey: "tag_value",
+      columns: ["tag_value", "normalized_tag", "tag_type_code", "active_status"],
+      fields: [
+        { key: "tag_value", label: "Tag Value", required: true },
+        { key: "tag_type_id", label: "Tag Type", kind: "select", options: tagTypeOptions },
+        { key: "active_status", label: "Status", kind: "select", options: statusOptions }
+      ]
+    },
+    TAG_TYPE: {
+      label: "Tag Type",
+      idKey: "tag_type_id",
+      titleKey: "code",
+      columns: ["code", "name", "description", "admin_editable"],
+      fields: [
+        { key: "code", label: "Code", required: true },
+        { key: "name", label: "Name", required: true },
+        { key: "description", label: "Description", kind: "textarea" },
+        { key: "admin_editable", label: "Admin Editable", kind: "checkbox" }
+      ]
+    }
+  };
+}
+
+function crudColumnLabel(column: string): string {
+  const labels: Record<string, string> = {
+    validation_date: "Tanggal Validasi",
+    validation_time: "Jam Validasi",
+    vehicle_registration: "Vehicle Registration"
+  };
+  return labels[column] ?? column.replace(/_/g, " ");
+}
+
+function formatCrudValue(value: unknown, column?: string): string {
+  if (value === null || value === undefined || value === "") return "-";
+  if (column === "validation_date") return formatCrudDate(String(value));
+  if (column === "validation_time") return formatCrudTime(String(value));
+  if (column?.endsWith("_datetime")) return formatImportDateTime(String(value));
+  if (typeof value === "boolean") return value ? "Yes" : "No";
+  if (typeof value === "number") return value.toLocaleString();
+  return String(value);
+}
+
+function formatCrudDate(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("id-ID", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).format(date);
+}
+
+function formatCrudTime(value: string): string {
+  const normalized = value.includes("T") ? value : `1970-01-01T${value}`;
+  const date = new Date(normalized);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("id-ID", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  }).format(date);
+}
+
+function formatImportDateTime(value: string): string {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("id-ID", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
+  }).format(date);
+}
+
+function formatDate(value: string | null): string {
+  if (!value) return "-";
+  const date = new Date(`${value}T00:00:00`);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("id-ID", { year: "numeric", month: "2-digit", day: "2-digit" }).format(date);
+}
+
+function formatDateTime(value: string | null): string {
+  if (!value) return "-";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("id-ID", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit"
+  }).format(date);
+}
+
+function minuteAxisLabel(value: number): string {
+  const rounded = Math.round(value) % 1440;
+  return `${String(Math.floor(rounded / 60)).padStart(2, "0")}:${String(rounded % 60).padStart(2, "0")}`;
+}
+
+function shiftedMinuteAxisLabel(value: number): string {
+  const dayShift = Math.floor(Math.max(0, Math.round(value)) / 1440);
+  const label = minuteAxisLabel(value);
+  return dayShift > 0 ? `${label} +${dayShift}d` : label;
+}
+
+function parseIsoDate(value: string): Date {
+  const [year, month, day] = value.split("-").map(Number);
+  return new Date(year, month - 1, day);
+}
+
+function isoDateFromParts(year: number, monthIndex: number, day: number): string {
+  return `${year}-${String(monthIndex + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+}
+
+function isoDateFromDate(value: Date): string {
+  return isoDateFromParts(value.getFullYear(), value.getMonth(), value.getDate());
+}
+
+function monthLabel(value: Date): string {
+  return new Intl.DateTimeFormat("en-US", { month: "short", year: "numeric" }).format(value);
+}
+
+function pageFromPath(pathname: string): Page {
+  if (pathname === "/master-data") return "master-data";
+  if (pathname === "/tag-consistency") return "tag-consistency";
+  if (pathname === "/departure-intelligence") return "departure-intelligence";
+  return "dashboard";
+}
+
+function confidenceClass(level: string): string {
+  if (level === "HIGH") return "border-mint bg-mint/10 text-mint";
+  if (level === "MEDIUM") return "border-amber bg-amber/10 text-amber";
+  return "border-rust bg-rust/10 text-rust";
+}
+
+function statusClass(status: string): string {
+  if (status === "MATCH") return "border-mint bg-mint/10 text-mint";
+  if (status === "MISMATCH") return "border-rust bg-rust/10 text-rust";
+  return "border-amber bg-amber/10 text-amber";
+}
+
+function statusLabel(status: string): string {
+  if (["MT_NOT_FOUND", "SPBU_NOT_FOUND", "MT_TAG_INCOMPLETE", "SPBU_TAG_INCOMPLETE", "DATA_ERROR"].includes(status)) return "DATA ISSUE";
+  return status.replace(/_/g, " ");
+}
+
+function renderTags(values: string[], variant: "default" | "missing" = "default") {
+  if (!values.length) return <span className="text-slate-400">-</span>;
+  return (
+    <div className="flex flex-wrap gap-1">
+      {values.map((value) => (
+        <span key={value} className={`border px-2 py-1 text-xs ${variant === "missing" ? "border-rust bg-rust/10 text-rust" : "border-line bg-slate-50 text-slate-700"}`}>
+          {value}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+const emptyTagConsistencySummary: TagConsistencySummary = {
+  total_lo_assignments: 0,
+  matched: 0,
+  mismatch: 0,
+  data_issues: 0,
+  analyzable_lo: 0,
+  consistency_rate: 0,
+  mismatch_by_tag_type: [],
+  mismatch_by_tag_value: [],
+  daily_consistency_rate: [],
+  top_spbu_mismatch: [],
+  top_mt_mismatch: [],
+  data_quality_summary: []
+};
+
+function sortedMismatchRows(
+  rows: RankedMismatch[],
+  labelKey: "spbu" | "vehicle_registration",
+  sortColumn: MismatchSortColumn,
+  sortDirection: CrudSortDirection
+): RankedMismatch[] {
+  return [...rows].sort((left, right) => {
+    const leftValue = sortColumn === "label" ? left[labelKey] ?? "" : left[sortColumn];
+    const rightValue = sortColumn === "label" ? right[labelKey] ?? "" : right[sortColumn];
+    const comparison =
+      typeof leftValue === "number" && typeof rightValue === "number"
+        ? leftValue - rightValue
+        : String(leftValue).localeCompare(String(rightValue));
+    return sortDirection === "asc" ? comparison : -comparison;
+  });
+}
+
+function DepartureDatePicker({
+  label,
+  value,
+  availableDates,
+  dateCounts,
+  minDate,
+  maxDate,
+  disabled,
+  onChange
+}: {
+  label: string;
+  value: string;
+  availableDates: Set<string>;
+  dateCounts: Map<string, number>;
+  minDate: string | null;
+  maxDate: string | null;
+  disabled?: boolean;
+  onChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [visibleMonth, setVisibleMonth] = useState(() => (value ? parseIsoDate(value) : minDate ? parseIsoDate(minDate) : new Date()));
+  const calendarRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (value) {
+      setVisibleMonth(parseIsoDate(value));
+    } else if (minDate) {
+      setVisibleMonth(parseIsoDate(minDate));
+    }
+  }, [minDate, value]);
+
+  useEffect(() => {
+    if (!open) return;
+    const handleClick = (event: MouseEvent) => {
+      if (calendarRef.current && !calendarRef.current.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [open]);
+
+  const monthStart = new Date(visibleMonth.getFullYear(), visibleMonth.getMonth(), 1);
+  const firstGridDate = new Date(monthStart);
+  firstGridDate.setDate(firstGridDate.getDate() - firstGridDate.getDay());
+  const days = Array.from({ length: 42 }, (_, index) => {
+    const day = new Date(firstGridDate);
+    day.setDate(firstGridDate.getDate() + index);
+    return day;
+  });
+  const min = minDate ? parseIsoDate(minDate) : null;
+  const max = maxDate ? parseIsoDate(maxDate) : null;
+
+  function moveMonth(delta: number) {
+    setVisibleMonth((current) => new Date(current.getFullYear(), current.getMonth() + delta, 1));
+  }
+
+  return (
+    <div className="relative" ref={calendarRef}>
+      <button
+        type="button"
+        className="flex w-full items-center justify-between gap-2 border border-line bg-white px-3 py-2 text-left text-sm disabled:bg-slate-100 disabled:text-slate-400"
+        onClick={() => !disabled && setOpen((current) => !current)}
+        disabled={disabled}
+        title={label}
+      >
+        <span className={value ? "text-slate-900" : "text-slate-400"}>{value || label}</span>
+        <CalendarDays size={16} className="text-slate-500" />
+      </button>
+      {open && (
+        <div className="absolute left-0 top-[calc(100%+6px)] z-40 w-80 border border-line bg-white p-3 shadow-xl">
+          <div className="mb-2 flex items-center justify-between">
+            <button type="button" className="inline-flex h-8 w-8 items-center justify-center border border-line" onClick={() => moveMonth(-1)} title="Previous month">
+              <ChevronLeft size={16} />
+            </button>
+            <div className="text-sm font-semibold">{monthLabel(visibleMonth)}</div>
+            <button type="button" className="inline-flex h-8 w-8 items-center justify-center border border-line" onClick={() => moveMonth(1)} title="Next month">
+              <ChevronRight size={16} />
+            </button>
+          </div>
+          <div className="grid grid-cols-7 gap-1 text-center text-xs font-semibold uppercase tracking-wide text-slate-500">
+            {["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"].map((day) => <div key={day}>{day}</div>)}
+          </div>
+          <div className="mt-1 grid grid-cols-7 gap-1">
+            {days.map((day) => {
+              const isoDate = isoDateFromDate(day);
+              const inMonth = day.getMonth() === visibleMonth.getMonth();
+              const hasData = availableDates.has(isoDate);
+              const selected = value === isoDate;
+              const outsideRange = Boolean((min && day < min) || (max && day > max));
+              const count = dateCounts.get(isoDate) ?? 0;
+              return (
+                <button
+                  key={isoDate}
+                  type="button"
+                  className={[
+                    "h-9 border text-sm",
+                    selected ? "border-mint bg-mint text-white" : hasData ? "border-mint bg-mint/10 text-mint" : "border-line bg-slate-50 text-slate-400",
+                    !inMonth ? "opacity-40" : "",
+                    outsideRange ? "cursor-not-allowed opacity-30" : "hover:border-mint"
+                  ].join(" ")}
+                  disabled={outsideRange}
+                  onClick={() => {
+                    onChange(isoDate);
+                    setOpen(false);
+                  }}
+                  title={hasData ? `${isoDate}: ${count.toLocaleString()} shipments` : `${isoDate}: no departure data`}
+                >
+                  {day.getDate()}
+                </button>
+              );
+            })}
+          </div>
+          <div className="mt-3 flex flex-wrap items-center gap-3 text-xs text-slate-500">
+            <span className="inline-flex items-center gap-1"><span className="h-3 w-3 border border-mint bg-mint/10" /> Ada data</span>
+            <span className="inline-flex items-center gap-1"><span className="h-3 w-3 border border-line bg-slate-50" /> Tidak ada data</span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function emptyCrudValues(config: CrudDomainConfig): Record<string, unknown> {
+  return Object.fromEntries(config.fields.map((field) => [field.key, field.kind === "checkbox" ? false : ""]));
+}
+
+function crudValuesFromRow(row: Record<string, unknown>, config: CrudDomainConfig): Record<string, unknown> {
+  return Object.fromEntries(config.fields.map((field) => [field.key, row[field.key] ?? (field.kind === "checkbox" ? false : "")]));
+}
+
+function App() {
+  const [currentPage, setCurrentPage] = useState<Page>(() => pageFromPath(window.location.pathname));
+  const [overview, setOverview] = useState<Overview>({});
+  const [charts, setCharts] = useState<Charts>({});
+  const [imports, setImports] = useState<ImportAudit[]>([]);
+  const [issues, setIssues] = useState<QualityIssue[]>([]);
+  const [depots, setDepots] = useState<Depot[]>([]);
+  const [products, setProducts] = useState<Product[]>([]);
+  const [tagTypes, setTagTypes] = useState<TagType[]>([]);
+  const [compatibility, setCompatibility] = useState<CompatibilitySummary | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [domain, setDomain] = useState("MOBIL_TANGKI");
+  const [sheetName, setSheetName] = useState("Mobil Tangki");
+  const [exportDomain, setExportDomain] = useState("ALL");
+  const [exportDepotId, setExportDepotId] = useState("");
+  const [exportFormat, setExportFormat] = useState("xlsx");
+  const [dashboardDepotId, setDashboardDepotId] = useState("ALL");
+  const [crudDomain, setCrudDomain] = useState("MOBIL_TANGKI");
+  const [crudRows, setCrudRows] = useState<Array<Record<string, unknown>>>([]);
+  const [crudTotal, setCrudTotal] = useState(0);
+  const [crudOffset, setCrudOffset] = useState(0);
+  const [crudLimit, setCrudLimit] = useState<CrudPageSize>(10);
+  const [crudSearch, setCrudSearch] = useState("");
+  const [crudAppliedSearch, setCrudAppliedSearch] = useState("");
+  const [crudSearchColumn, setCrudSearchColumn] = useState("vehicle_registration");
+  const [crudAppliedSearchColumn, setCrudAppliedSearchColumn] = useState("vehicle_registration");
+  const [crudSortColumn, setCrudSortColumn] = useState("vehicle_registration");
+  const [crudSortDirection, setCrudSortDirection] = useState<CrudSortDirection>("asc");
+  const [crudDepotId, setCrudDepotId] = useState("ALL");
+  const [crudModalMode, setCrudModalMode] = useState<CrudModalMode>(null);
+  const [crudBatchForms, setCrudBatchForms] = useState<CrudBatchFormRow[]>([]);
+  const [selectedCrudIds, setSelectedCrudIds] = useState<Set<string>>(() => new Set());
+  const [crudLoading, setCrudLoading] = useState(false);
+  const [crudSyncing, setCrudSyncing] = useState(false);
+  const [tagFilters, setTagFilters] = useState<TagConsistencyFilters>({
+    startDate: "",
+    endDate: "",
+    depotId: "ALL",
+    spbu: "",
+    vehicle: "",
+    tagType: "ALL",
+    status: "ALL",
+    productId: "",
+    vehicleClass: "",
+    search: ""
+  });
+  const [tagAnalysis, setTagAnalysis] = useState<TagConsistencyResponse | null>(null);
+  const [tagLoading, setTagLoading] = useState(false);
+  const [tagOffset, setTagOffset] = useState(0);
+  const [tagLimit, setTagLimit] = useState(25);
+  const [tagSortColumn, setTagSortColumn] = useState("loading_order_date");
+  const [tagSortDirection, setTagSortDirection] = useState<CrudSortDirection>("desc");
+  const [mismatchRowsPerPage, setMismatchRowsPerPage] = useState(10);
+  const [spbuMismatchPage, setSpbuMismatchPage] = useState(0);
+  const [mtMismatchPage, setMtMismatchPage] = useState(0);
+  const [spbuMismatchSortColumn, setSpbuMismatchSortColumn] = useState<MismatchSortColumn>("mismatch");
+  const [spbuMismatchSortDirection, setSpbuMismatchSortDirection] = useState<CrudSortDirection>("desc");
+  const [mtMismatchSortColumn, setMtMismatchSortColumn] = useState<MismatchSortColumn>("mismatch");
+  const [mtMismatchSortDirection, setMtMismatchSortDirection] = useState<CrudSortDirection>("desc");
+  const [selectedAnalysis, setSelectedAnalysis] = useState<TagConsistencyRow | null>(null);
+  const [departureFilters, setDepartureFilters] = useState<DepartureFilters>({
+    depotId: "",
+    startDate: "",
+    endDate: "",
+    bucketMinutes: "30",
+    search: ""
+  });
+  const [departureAnalysis, setDepartureAnalysis] = useState<DepartureAnalysis | null>(null);
+  const [appliedDepartureFilters, setAppliedDepartureFilters] = useState<DepartureFilters | null>(null);
+  const [departureDateAvailability, setDepartureDateAvailability] = useState<DepartureDateAvailability | null>(null);
+  const [departureDateLoading, setDepartureDateLoading] = useState(false);
+  const [departureLoading, setDepartureLoading] = useState(false);
+  const [departureOffset, setDepartureOffset] = useState(0);
+  const [departureLimit, setDepartureLimit] = useState(25);
+  const [departureSortColumn, setDepartureSortColumn] = useState<DepartureSortColumn>("observation_count");
+  const [departureSortDirection, setDepartureSortDirection] = useState<CrudSortDirection>("desc");
+  const [selectedDepartureSpbuId, setSelectedDepartureSpbuId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const crudRequestRef = useRef(0);
+  const tagRequestRef = useRef(0);
+  const departureRequestRef = useRef(0);
+  const configs = useMemo(() => crudConfigs(depots, tagTypes), [depots, tagTypes]);
+  const activeCrudConfig = configs[crudDomain];
+
+  async function fetchCrud() {
+    const requestId = crudRequestRef.current + 1;
+    crudRequestRef.current = requestId;
+    setCrudLoading(true);
+    setError(null);
+    try {
+      const requestLimit = crudLimit === "ALL" ? 10000 : crudLimit;
+      const requestOffset = crudLimit === "ALL" ? 0 : crudOffset;
+      const params = new URLSearchParams({
+        limit: String(requestLimit),
+        offset: String(requestOffset)
+      });
+      params.set("sort_column", crudSortColumn || activeCrudConfig.columns[0]);
+      params.set("sort_direction", crudSortDirection);
+      if (crudAppliedSearch.trim()) {
+        params.set("search", crudAppliedSearch.trim());
+        params.set("search_column", crudAppliedSearchColumn || activeCrudConfig.columns[0]);
+      }
+      if (crudDepotId !== "ALL") params.set("depot_id", crudDepotId);
+      const payload = await apiGet<CrudResponse>(`/api/v1/master-crud/${crudDomain}?${params.toString()}`);
+      if (crudRequestRef.current === requestId) {
+        setCrudRows(payload.rows);
+        setCrudTotal(payload.total);
+        setSelectedCrudIds(new Set());
+      }
+    } catch (err) {
+      if (crudRequestRef.current === requestId) {
+        setError(err instanceof Error ? err.message : "Failed to load CRUD data");
+      }
+    } finally {
+      if (crudRequestRef.current === requestId) {
+        setCrudLoading(false);
+      }
+    }
+  }
+
+  async function fetchTagAnalysis(nextOffset = tagOffset, filters = tagFilters) {
+    const requestId = tagRequestRef.current + 1;
+    tagRequestRef.current = requestId;
+    setTagLoading(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams({
+        limit: String(tagLimit),
+        offset: String(nextOffset),
+        sort_column: tagSortColumn,
+        sort_direction: tagSortDirection
+      });
+      if (filters.startDate) params.set("start_date", filters.startDate);
+      if (filters.endDate) params.set("end_date", filters.endDate);
+      if (filters.depotId !== "ALL") params.set("depot_id", filters.depotId);
+      if (filters.spbu.trim()) params.set("spbu", filters.spbu.trim());
+      if (filters.vehicle.trim()) params.set("vehicle", filters.vehicle.trim());
+      if (filters.tagType !== "ALL") params.set("tag_type", filters.tagType);
+      if (filters.status !== "ALL") params.set("overall_status", filters.status);
+      if (filters.productId) params.set("product_id", filters.productId);
+      if (filters.vehicleClass) params.set("vehicle_class", filters.vehicleClass);
+      if (filters.search.trim()) params.set("search", filters.search.trim());
+      const payload = await apiGet<TagConsistencyResponse>(`/api/v1/tag-consistency/analysis?${params.toString()}`);
+      if (tagRequestRef.current === requestId) {
+        setTagAnalysis(payload);
+      }
+    } catch (err) {
+      if (tagRequestRef.current === requestId) {
+        setError(err instanceof Error ? err.message : "Failed to load tag consistency analysis");
+      }
+    } finally {
+      if (tagRequestRef.current === requestId) {
+        setTagLoading(false);
+      }
+    }
+  }
+
+  async function fetchDepartureAnalysis(nextOffset = departureOffset, filters = departureFilters) {
+    if (!filters.depotId || !filters.startDate || !filters.endDate) {
+      setError("Select a depot, start date, and end date before running Phase 2.");
+      return;
+    }
+    const requestId = departureRequestRef.current + 1;
+    departureRequestRef.current = requestId;
+    setDepartureLoading(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams({
+        depot_id: filters.depotId,
+        start_date: filters.startDate,
+        end_date: filters.endDate,
+        bucket_minutes: filters.bucketMinutes,
+        limit: String(departureLimit),
+        offset: String(nextOffset),
+        sort_column: departureSortColumn,
+        sort_direction: departureSortDirection
+      });
+      if (filters.search.trim()) params.set("search", filters.search.trim());
+      const payload = await apiGet<DepartureAnalysis>(`/api/v1/departure-intelligence/analysis?${params.toString()}`);
+      if (departureRequestRef.current === requestId) {
+        setDepartureAnalysis(payload);
+        setAppliedDepartureFilters(filters);
+        setSelectedDepartureSpbuId(payload.profiles[0]?.spbu_id ?? null);
+      }
+    } catch (err) {
+      if (departureRequestRef.current === requestId) {
+        setError(err instanceof Error ? err.message : "Failed to load departure intelligence");
+      }
+    } finally {
+      if (departureRequestRef.current === requestId) {
+        setDepartureLoading(false);
+      }
+    }
+  }
+
+  async function fetchDepartureDateAvailability(depotId: string) {
+    if (!depotId) {
+      setDepartureDateAvailability(null);
+      return;
+    }
+    setDepartureDateLoading(true);
+    try {
+      const payload = await apiGet<DepartureDateAvailability>(`/api/v1/departure-intelligence/available-dates?depot_id=${encodeURIComponent(depotId)}`);
+      setDepartureDateAvailability(payload);
+    } catch (err) {
+      setDepartureDateAvailability(null);
+      setError(err instanceof Error ? err.message : "Failed to load departure date availability");
+    } finally {
+      setDepartureDateLoading(false);
+    }
+  }
+
+  async function refresh() {
+    setError(null);
+    const dashboardParams = dashboardDepotId !== "ALL" ? `?depot_id=${encodeURIComponent(dashboardDepotId)}` : "";
+    const issueParams = new URLSearchParams({ limit: "20" });
+    if (dashboardDepotId !== "ALL") issueParams.set("depot_id", dashboardDepotId);
+    const compatibilityParams = new URLSearchParams({ limit: "12" });
+    if (dashboardDepotId !== "ALL") compatibilityParams.set("depot_id", dashboardDepotId);
+    const [overviewData, chartData, importData, issueData, depotData, tagTypeData, productData] = await Promise.all([
+      apiGet<Overview>(`/api/v1/foundation/overview${dashboardParams}`),
+      apiGet<Charts>(`/api/v1/foundation/charts${dashboardParams}`),
+      apiGet<ImportAudit[]>("/api/v1/imports"),
+      apiGet<QualityIssue[]>(`/api/v1/data-quality/issues?${issueParams.toString()}`),
+      apiGet<Depot[]>("/api/v1/master/depots"),
+      apiGet<CrudResponse>("/api/v1/master-crud/TAG_TYPE?limit=10000"),
+      apiGet<Product[]>("/api/v1/master/products")
+    ]);
+    setOverview(overviewData);
+    setCharts(chartData);
+    setImports(importData);
+    setIssues(issueData);
+    setDepots(depotData);
+    setTagTypes(tagTypeData.rows as unknown as TagType[]);
+    setProducts(productData);
+    setExportDepotId((current) => current || depotData[0]?.depot_id || "");
+    apiGet<CompatibilitySummary>(`/api/v1/master/compatibility/summary?${compatibilityParams.toString()}`)
+      .then(setCompatibility)
+      .catch(() => setCompatibility({ compatible: 0, incompatible: 0, insufficient_data: 0, examples: [] }));
+  }
+
+  useEffect(() => {
+    refresh().catch((err) => setError(err.message));
+  }, [dashboardDepotId]);
+
+  useEffect(() => {
+    if (currentPage === "master-data") {
+      fetchCrud();
+    }
+  }, [currentPage, crudDomain, crudOffset, crudLimit, crudDepotId, crudAppliedSearch, crudAppliedSearchColumn, crudSortColumn, crudSortDirection]);
+
+  useEffect(() => {
+    if (currentPage === "tag-consistency") {
+      fetchTagAnalysis();
+    }
+  }, [currentPage, tagOffset, tagLimit, tagSortColumn, tagSortDirection]);
+
+  useEffect(() => {
+    if (currentPage === "departure-intelligence" && departureAnalysis && appliedDepartureFilters) {
+      fetchDepartureAnalysis(departureOffset, appliedDepartureFilters);
+    }
+  }, [currentPage, departureOffset, departureLimit, departureSortColumn, departureSortDirection]);
+
+  useEffect(() => {
+    if (currentPage === "departure-intelligence") {
+      fetchDepartureDateAvailability(departureFilters.depotId);
+    }
+  }, [currentPage, departureFilters.depotId]);
+
+  useEffect(() => {
+    const handlePopState = () => setCurrentPage(pageFromPath(window.location.pathname));
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, []);
+
+  const hasData = useMemo(() => (overview.total_mt ?? 0) > 0 || (overview.total_spbu ?? 0) > 0, [overview]);
+  const visibleCrudIds = useMemo(
+    () =>
+      crudRows
+        .map((row) => row[activeCrudConfig.idKey])
+        .filter((value): value is string | number => value !== null && value !== undefined && value !== "")
+        .map(String),
+    [activeCrudConfig.idKey, crudRows]
+  );
+  const selectedCrudRows = useMemo(
+    () =>
+      crudRows.filter((row) => {
+        const rawRecordId = row[activeCrudConfig.idKey];
+        return rawRecordId !== null && rawRecordId !== undefined && rawRecordId !== "" && selectedCrudIds.has(String(rawRecordId));
+      }),
+    [activeCrudConfig.idKey, crudRows, selectedCrudIds]
+  );
+  const allVisibleCrudRowsSelected = visibleCrudIds.length > 0 && visibleCrudIds.every((recordId) => selectedCrudIds.has(recordId));
+  const selectedCrudCount = selectedCrudRows.length;
+  const isCrudAllRecords = crudLimit === "ALL";
+  const crudPageSizeNumber = typeof crudLimit === "number" ? crudLimit : 0;
+  const crudDisplayOffset = isCrudAllRecords ? 0 : crudOffset;
+  const crudShowingStart = crudTotal === 0 ? 0 : crudDisplayOffset + 1;
+  const crudShowingEnd = isCrudAllRecords ? crudRows.length : Math.min(crudDisplayOffset + crudPageSizeNumber, crudTotal);
+  const crudPageNumber = isCrudAllRecords ? 1 : Math.floor(crudOffset / crudPageSizeNumber) + 1;
+  const crudPageCount = isCrudAllRecords ? 1 : Math.max(1, Math.ceil(crudTotal / crudPageSizeNumber));
+  const canPreviousCrudPage = !isCrudAllRecords && crudOffset > 0 && !crudLoading;
+  const canNextCrudPage = !isCrudAllRecords && crudOffset + crudPageSizeNumber < crudTotal && !crudLoading;
+  const canSyncCrudDomain = ["DEPOT", "PRODUCT", "TAG"].includes(crudDomain);
+  const tagSummary = tagAnalysis?.summary ?? emptyTagConsistencySummary;
+  const tagRows = tagAnalysis?.rows ?? [];
+  const tagTotal = tagAnalysis?.total ?? 0;
+  const tagShowingStart = tagTotal === 0 ? 0 : tagOffset + 1;
+  const tagShowingEnd = Math.min(tagOffset + tagLimit, tagTotal);
+  const tagPageNumber = Math.floor(tagOffset / tagLimit) + 1;
+  const tagPageCount = Math.max(1, Math.ceil(tagTotal / tagLimit));
+  const canPreviousTagPage = tagOffset > 0 && !tagLoading;
+  const canNextTagPage = tagOffset + tagLimit < tagTotal && !tagLoading;
+  const departureSummary = departureAnalysis?.summary;
+  const departureAvailableDateSet = useMemo(() => new Set(departureDateAvailability?.available_dates ?? []), [departureDateAvailability]);
+  const departureDateCountMap = useMemo(
+    () => new Map((departureDateAvailability?.dates ?? []).map((item) => [item.date, item.shipment_count])),
+    [departureDateAvailability]
+  );
+  const departureProfiles = departureAnalysis?.profiles ?? [];
+  const departureObservations = departureAnalysis?.observations ?? [];
+  const departureTotal = departureAnalysis?.total ?? 0;
+  const departureShowingStart = departureTotal === 0 ? 0 : departureOffset + 1;
+  const departureShowingEnd = Math.min(departureOffset + departureLimit, departureTotal);
+  const departurePageNumber = Math.floor(departureOffset / departureLimit) + 1;
+  const departurePageCount = Math.max(1, Math.ceil(departureTotal / departureLimit));
+  const canPreviousDeparturePage = departureOffset > 0 && !departureLoading;
+  const canNextDeparturePage = departureOffset + departureLimit < departureTotal && !departureLoading;
+  const selectedDepartureProfile = departureProfiles.find((profile) => profile.spbu_id === selectedDepartureSpbuId) ?? departureProfiles[0] ?? null;
+  const selectedDepartureObservations = selectedDepartureProfile
+    ? departureObservations.filter((row) => row.spbu_id === selectedDepartureProfile.spbu_id).slice(0, 20)
+    : [];
+  const heatmapOption = useMemo(() => {
+    const heatmap = departureAnalysis?.weekday_heatmap;
+    if (!heatmap) return null;
+    const maxValue = Math.max(1, ...heatmap.data.map((item) => item[2] ?? 0));
+    return {
+      tooltip: {
+        position: "top",
+        formatter: (params: { data: number[] }) => `${heatmap.y_axis[params.data[1]]}<br />${heatmap.x_axis[params.data[0]]}: ${params.data[2]} observations`
+      },
+      grid: { top: 16, right: 24, bottom: 76, left: 84 },
+      xAxis: { type: "category", data: heatmap.x_axis, axisLabel: { interval: 1, rotate: 45 } },
+      yAxis: { type: "category", data: heatmap.y_axis },
+      visualMap: { min: 0, max: maxValue, calculable: true, orient: "horizontal", left: "center", bottom: 0, inRange: { color: ["#edf2f1", "#7fb2a8", "#2f7d6d"] } },
+      series: [{ type: "heatmap", data: heatmap.data, emphasis: { itemStyle: { shadowBlur: 6, shadowColor: "rgba(0,0,0,0.18)" } } }]
+    };
+  }, [departureAnalysis]);
+  const boxPlotOption = useMemo(() => {
+    const boxPlot = departureAnalysis?.box_plot;
+    if (!boxPlot) return null;
+    const flattenedValues = boxPlot.data.flat();
+    const yMin = Math.max(0, Math.floor(Math.min(0, ...flattenedValues) / 180) * 180);
+    const yMax = Math.max(1440, Math.ceil(Math.max(1440, ...flattenedValues) / 180) * 180);
+    return {
+      tooltip: {
+        trigger: "item",
+        formatter: (params: { name: string; data: number[] }) =>
+          `${params.name}<br />Min ${shiftedMinuteAxisLabel(params.data[1])}<br />Q1 ${shiftedMinuteAxisLabel(params.data[2])}<br />P50 ${shiftedMinuteAxisLabel(params.data[3])}<br />Q3 ${shiftedMinuteAxisLabel(params.data[4])}<br />Max ${shiftedMinuteAxisLabel(params.data[5])}`
+      },
+      grid: { top: 16, right: 24, bottom: 76, left: 52 },
+      xAxis: { type: "category", data: boxPlot.categories, axisLabel: { interval: 0, rotate: 45 } },
+      yAxis: { type: "value", min: yMin, max: yMax, interval: 180, axisLabel: { formatter: (value: number) => shiftedMinuteAxisLabel(value) } },
+      dataZoom: boxPlot.categories.length > 30 ? [{ type: "slider", bottom: 18, height: 18 }, { type: "inside" }] : undefined,
+      series: [{ name: "Departure time", type: "boxplot", data: boxPlot.data, itemStyle: { color: "#dfe9e6", borderColor: "#2f7d6d" } }]
+    };
+  }, [departureAnalysis]);
+  const allSpbuMismatchRows = useMemo(
+    () => sortedMismatchRows(tagSummary.top_spbu_mismatch, "spbu", spbuMismatchSortColumn, spbuMismatchSortDirection),
+    [tagSummary.top_spbu_mismatch, spbuMismatchSortColumn, spbuMismatchSortDirection]
+  );
+  const allMtMismatchRows = useMemo(
+    () => sortedMismatchRows(tagSummary.top_mt_mismatch, "vehicle_registration", mtMismatchSortColumn, mtMismatchSortDirection),
+    [tagSummary.top_mt_mismatch, mtMismatchSortColumn, mtMismatchSortDirection]
+  );
+  const spbuMismatchPageCount = Math.max(1, Math.ceil(allSpbuMismatchRows.length / mismatchRowsPerPage));
+  const mtMismatchPageCount = Math.max(1, Math.ceil(allMtMismatchRows.length / mismatchRowsPerPage));
+  const visibleSpbuMismatchRows = allSpbuMismatchRows.slice(spbuMismatchPage * mismatchRowsPerPage, (spbuMismatchPage + 1) * mismatchRowsPerPage);
+  const visibleMtMismatchRows = allMtMismatchRows.slice(mtMismatchPage * mismatchRowsPerPage, (mtMismatchPage + 1) * mismatchRowsPerPage);
+
+  async function handleImportSample() {
+    setLoading(true);
+    setError(null);
+    try {
+      await importSampleData();
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Import failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function handleDomainChange(nextDomain: string) {
+    setDomain(nextDomain);
+    const defaultSheets: Record<string, string> = {
+      MOBIL_TANGKI: "Mobil Tangki",
+      SPBU: "SPBU",
+      LOADING_ORDER: "Data Medan Mei",
+      GPS: ""
+    };
+    setSheetName(defaultSheets[nextDomain] ?? "");
+  }
+
+  async function handleFileSelected(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    setUploading(true);
+    setError(null);
+    try {
+      await uploadImportFile(domain, sheetName || "Sheet1", file);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "File import failed");
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  async function handleExportTemplate() {
+    setExporting(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams({ domain, file_format: exportFormat });
+      await downloadFromApi(`/api/v1/exports/template?${params.toString()}`, `template_${domain.toLowerCase()}.${exportFormat}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Template export failed");
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  async function handleExportData() {
+    if (!exportDepotId) {
+      setError("Depot belum tersedia untuk export data.");
+      return;
+    }
+    setExporting(true);
+    setError(null);
+    try {
+      const actualFormat = exportDomain === "ALL" ? "xlsx" : exportFormat;
+      const params = new URLSearchParams({ domain: exportDomain, depot_id: exportDepotId, file_format: actualFormat });
+      await downloadFromApi(`/api/v1/exports/data?${params.toString()}`, `export_${exportDomain.toLowerCase()}.${actualFormat}`);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Data export failed");
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  function closeCrudModal() {
+    setCrudModalMode(null);
+    setCrudBatchForms([]);
+  }
+
+  function openCrudAddModal() {
+    setError(null);
+    setCrudModalMode("add");
+    setCrudBatchForms([{ values: emptyCrudValues(activeCrudConfig) }]);
+  }
+
+  function openCrudEditModal() {
+    if (selectedCrudRows.length === 0) {
+      setError("Pilih minimal satu row untuk edit.");
+      return;
+    }
+    setError(null);
+    setCrudModalMode("edit");
+    setCrudBatchForms(
+      selectedCrudRows.map((row) => ({
+        recordId: String(row[activeCrudConfig.idKey]),
+        values: crudValuesFromRow(row, activeCrudConfig)
+      }))
+    );
+  }
+
+  function addCrudBatchRow() {
+    setCrudBatchForms((current) => [...current, { values: emptyCrudValues(activeCrudConfig) }]);
+  }
+
+  function removeCrudBatchRow(rowIndex: number) {
+    setCrudBatchForms((current) => current.filter((_, index) => index !== rowIndex));
+  }
+
+  function updateCrudBatchValue(rowIndex: number, fieldKey: string, value: unknown) {
+    setCrudBatchForms((current) =>
+      current.map((formRow, index) =>
+        index === rowIndex ? { ...formRow, values: { ...formRow.values, [fieldKey]: value } } : formRow
+      )
+    );
+  }
+
+  function changeCrudDomain(nextDomain: string) {
+    const nextSearchColumn = configs[nextDomain].columns[0] ?? "";
+    crudRequestRef.current += 1;
+    setCrudDomain(nextDomain);
+    setCrudRows([]);
+    setCrudTotal(0);
+    setSelectedCrudIds(new Set());
+    setCrudOffset(0);
+    setCrudSearch("");
+    setCrudAppliedSearch("");
+    setCrudSearchColumn(nextSearchColumn);
+    setCrudAppliedSearchColumn(nextSearchColumn);
+    setCrudSortColumn(nextSearchColumn);
+    setCrudSortDirection("asc");
+    closeCrudModal();
+  }
+
+  async function saveCrudBatch() {
+    if (!crudModalMode || crudBatchForms.length === 0) return;
+    setCrudLoading(true);
+    setError(null);
+    try {
+      for (const formRow of crudBatchForms) {
+        if (crudModalMode === "edit") {
+          if (!formRow.recordId) continue;
+          await apiSend(`/api/v1/master-crud/${crudDomain}/${encodeURIComponent(formRow.recordId)}`, "PUT", formRow.values);
+        } else {
+          await apiSend(`/api/v1/master-crud/${crudDomain}`, "POST", formRow.values);
+        }
+      }
+      closeCrudModal();
+      await fetchCrud();
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to save master data");
+    } finally {
+      setCrudLoading(false);
+    }
+  }
+
+  async function deleteSelectedCrudRows() {
+    if (selectedCrudRows.length === 0) {
+      setError("Pilih minimal satu row untuk delete.");
+      return;
+    }
+    if (!window.confirm(`Delete ${selectedCrudRows.length.toLocaleString()} ${activeCrudConfig.label} record?`)) return;
+    setCrudLoading(true);
+    setError(null);
+    try {
+      for (const row of selectedCrudRows) {
+        const recordId = String(row[activeCrudConfig.idKey]);
+        await apiSend(`/api/v1/master-crud/${crudDomain}/${encodeURIComponent(recordId)}`, "DELETE");
+      }
+      setSelectedCrudIds(new Set());
+      await fetchCrud();
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to delete master data");
+    } finally {
+      setCrudLoading(false);
+    }
+  }
+
+  async function syncCrudMasterData() {
+    if (!canSyncCrudDomain) return;
+    setCrudSyncing(true);
+    setError(null);
+    try {
+      await apiSend(`/api/v1/master-crud/${crudDomain}/sync`, "POST");
+      setSelectedCrudIds(new Set());
+      setCrudOffset(0);
+      await fetchCrud();
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to sync master data");
+    } finally {
+      setCrudSyncing(false);
+    }
+  }
+
+  function applyCrudSearch() {
+    setCrudOffset(0);
+    setCrudAppliedSearch(crudSearch.trim());
+    setCrudAppliedSearchColumn(crudSearchColumn || activeCrudConfig.columns[0]);
+  }
+
+  function handleCrudLimitChange(value: string) {
+    setCrudOffset(0);
+    setCrudLimit(value === "ALL" ? "ALL" : (Number(value) as CrudPageSize));
+  }
+
+  function handleCrudSort(column: string) {
+    setCrudOffset(0);
+    setCrudSortDirection((current) => (crudSortColumn === column && current === "asc" ? "desc" : "asc"));
+    setCrudSortColumn(column);
+  }
+
+  function updateTagFilter(key: keyof TagConsistencyFilters, value: string) {
+    setTagFilters((current) => ({ ...current, [key]: value }));
+  }
+
+  function applyTagFilters() {
+    setTagOffset(0);
+    setSpbuMismatchPage(0);
+    setMtMismatchPage(0);
+    fetchTagAnalysis(0);
+  }
+
+  function resetTagFilters() {
+    const cleared = {
+      startDate: "",
+      endDate: "",
+      depotId: "ALL",
+      spbu: "",
+      vehicle: "",
+      tagType: "ALL",
+      status: "ALL",
+      productId: "",
+      vehicleClass: "",
+      search: ""
+    };
+    setTagFilters(cleared);
+    setTagOffset(0);
+    setSpbuMismatchPage(0);
+    setMtMismatchPage(0);
+    fetchTagAnalysis(0, cleared);
+  }
+
+  function updateDepartureFilter(key: keyof DepartureFilters, value: string) {
+    setDepartureFilters((current) => ({
+      ...current,
+      [key]: value,
+      ...(key === "depotId" ? { startDate: "", endDate: "" } : {})
+    }));
+    if (key === "depotId") {
+      setDepartureDateAvailability(null);
+    }
+  }
+
+  function applyDepartureFilters() {
+    setDepartureOffset(0);
+    fetchDepartureAnalysis(0, departureFilters);
+  }
+
+  function handleDepartureSort(column: DepartureSortColumn) {
+    setDepartureOffset(0);
+    setDepartureSortDirection((current) => (departureSortColumn === column && current === "asc" ? "desc" : "asc"));
+    setDepartureSortColumn(column);
+  }
+
+  function handleTagSort(column: string) {
+    setTagOffset(0);
+    setTagSortDirection((current) => (tagSortColumn === column && current === "asc" ? "desc" : "asc"));
+    setTagSortColumn(column);
+  }
+
+  function handleMismatchRowsPerPage(value: string) {
+    setMismatchRowsPerPage(Number(value));
+    setSpbuMismatchPage(0);
+    setMtMismatchPage(0);
+  }
+
+  function handleSpbuMismatchSort(column: MismatchSortColumn) {
+    setSpbuMismatchPage(0);
+    setSpbuMismatchSortDirection((current) => (spbuMismatchSortColumn === column && current === "asc" ? "desc" : "asc"));
+    setSpbuMismatchSortColumn(column);
+  }
+
+  function handleMtMismatchSort(column: MismatchSortColumn) {
+    setMtMismatchPage(0);
+    setMtMismatchSortDirection((current) => (mtMismatchSortColumn === column && current === "asc" ? "desc" : "asc"));
+    setMtMismatchSortColumn(column);
+  }
+
+  function toggleCrudRowSelection(recordId: string) {
+    setSelectedCrudIds((current) => {
+      const next = new Set(current);
+      if (next.has(recordId)) {
+        next.delete(recordId);
+      } else {
+        next.add(recordId);
+      }
+      return next;
+    });
+  }
+
+  function toggleVisibleCrudSelection() {
+    setSelectedCrudIds((current) => {
+      const next = new Set(current);
+      if (allVisibleCrudRowsSelected) {
+        visibleCrudIds.forEach((recordId) => next.delete(recordId));
+      } else {
+        visibleCrudIds.forEach((recordId) => next.add(recordId));
+      }
+      return next;
+    });
+  }
+
+  function navigate(page: Page) {
+    const path = page === "master-data" ? "/master-data" : page === "tag-consistency" ? "/tag-consistency" : page === "departure-intelligence" ? "/departure-intelligence" : "/";
+    if (window.location.pathname !== path) {
+      window.history.pushState({}, "", path);
+    }
+    setCurrentPage(page);
+  }
+
+  function pageNavButtonClass(page: Page) {
+    return `rounded-full border px-4 py-2 text-sm font-semibold transition ${
+      currentPage === page
+        ? "border-transparent bg-gradient-to-r from-petrolime to-lime-300 text-petroink shadow-sm"
+        : "border-petroblue/10 bg-white/85 text-slate-600 hover:border-petrolime/50 hover:bg-petrocloud hover:text-petroblue"
+    }`;
+  }
+
+  return (
+    <main className="min-h-screen bg-transparent text-petroink">
+      <header className="px-5 pt-5">
+        <div className="mx-auto flex max-w-7xl flex-col gap-4 rounded-[28px] border border-petroblue/10 bg-gradient-to-br from-white via-white to-petrocloud/70 px-5 py-5 shadow-card lg:flex-row lg:items-center lg:justify-between">
+          <div>
+            <div className="mb-2 inline-flex items-center rounded-full bg-petrolime/15 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-petroblue">
+              Petrofin Dispatch Analytics
+            </div>
+            <h1 className="font-display text-2xl font-semibold text-petroink">Dispatch Intelligence Platform</h1>
+            <p className="mt-1 text-sm text-slate-600">
+              {currentPage === "master-data"
+                ? "Master Data Management"
+                : currentPage === "tag-consistency"
+                  ? "Evaluate daily Loading Order assignments against MT-SPBU tagging rules."
+                  : currentPage === "departure-intelligence"
+                    ? "Phase 2 historical depot departure profiles by SPBU."
+                  : "Data Foundation Overview"}
+            </p>
+          </div>
+          <div className="flex flex-wrap justify-end gap-2">
+            <button className={pageNavButtonClass("dashboard")} onClick={() => navigate("dashboard")} title="Open dashboard visualization">
+              Dashboard
+            </button>
+            <button className={pageNavButtonClass("master-data")} onClick={() => navigate("master-data")} title="Open master data CRUD">
+              Master Data
+            </button>
+            <button className={pageNavButtonClass("tag-consistency")} onClick={() => navigate("tag-consistency")} title="Open tag consistency analysis">
+              Tag Consistency Analysis
+            </button>
+            <button className={pageNavButtonClass("departure-intelligence")} onClick={() => navigate("departure-intelligence")} title="Open Phase 2 departure intelligence">
+              Phase 2 - Depot Departure Time Intelligence
+            </button>
+          </div>
+        </div>
+      </header>
+
+      <div className="mx-auto max-w-7xl px-5 py-5">
+        {error && <div className="mb-4 border border-rust bg-white px-4 py-3 text-sm text-rust">{error}</div>}
+        {!hasData && (
+          <section className="mb-5 border border-line bg-white p-5">
+            <div className="flex items-start gap-3">
+              <Database className="mt-1 text-mint" />
+              <div>
+                <h2 className="text-lg font-semibold">No canonical data loaded</h2>
+                <p className="mt-1 text-sm text-slate-600">Use the import action to stage, validate, normalize, and publish the provided MT, SPBU, and LO workbooks.</p>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {currentPage === "departure-intelligence" && (
+        <>
+        <section className="mb-5 border border-line bg-white p-4">
+          <div className="mb-3 flex flex-col gap-1">
+            <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Phase 2 - Depot Departure Time Intelligence</div>
+            <div className="text-xs text-slate-500">Historical depot departure behavior only. This page does not calculate arrivals, ETA, route sequence, or dispatch recommendations.</div>
+          </div>
+          <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-[1.4fr_0.8fr_0.8fr_0.7fr_1fr_auto]">
+            <select className="border border-line bg-white px-3 py-2 text-sm" value={departureFilters.depotId} onChange={(event) => updateDepartureFilter("depotId", event.target.value)} title="Depot">
+              <option value="">Select Depot</option>
+              {depots.map((depot) => (
+                <option key={depot.depot_id} value={depot.depot_id}>{depot.depot_name}</option>
+              ))}
+            </select>
+            <DepartureDatePicker
+              label={departureDateLoading ? "Loading dates" : "Start Date"}
+              value={departureFilters.startDate}
+              availableDates={departureAvailableDateSet}
+              dateCounts={departureDateCountMap}
+              minDate={departureDateAvailability?.min_date ?? null}
+              maxDate={departureDateAvailability?.max_date ?? null}
+              disabled={!departureFilters.depotId || departureDateLoading}
+              onChange={(value) => updateDepartureFilter("startDate", value)}
+            />
+            <DepartureDatePicker
+              label={departureDateLoading ? "Loading dates" : "End Date"}
+              value={departureFilters.endDate}
+              availableDates={departureAvailableDateSet}
+              dateCounts={departureDateCountMap}
+              minDate={departureDateAvailability?.min_date ?? null}
+              maxDate={departureDateAvailability?.max_date ?? null}
+              disabled={!departureFilters.depotId || departureDateLoading}
+              onChange={(value) => updateDepartureFilter("endDate", value)}
+            />
+            <select className="border border-line bg-white px-3 py-2 text-sm" value={departureFilters.bucketMinutes} onChange={(event) => updateDepartureFilter("bucketMinutes", event.target.value)} title="Time bucket size">
+              <option value="30">30-minute buckets</option>
+              <option value="60">60-minute buckets</option>
+            </select>
+            <input
+              className="border border-line px-3 py-2 text-sm"
+              value={departureFilters.search}
+              onChange={(event) => updateDepartureFilter("search", event.target.value)}
+              onKeyDown={(event) => { if (event.key === "Enter") applyDepartureFilters(); }}
+              placeholder="Search SPBU or shipment"
+              title="Search SPBU or shipment"
+            />
+            <button className="inline-flex items-center justify-center gap-2 bg-mint px-3 py-2 text-sm font-medium text-white disabled:opacity-60" onClick={applyDepartureFilters} disabled={departureLoading} title="Run depot departure time intelligence">
+              <Search size={16} />
+              {departureLoading ? "Running" : "Apply"}
+            </button>
+          </div>
+        </section>
+
+        {!departureAnalysis && (
+          <section className="border border-line bg-white p-8 text-center">
+            <div className="mx-auto max-w-2xl text-sm text-slate-600">
+              Select a depot and analysis period, then click Apply to run Depot Departure Time Intelligence.
+            </div>
+          </section>
+        )}
+
+        {departureAnalysis && departureSummary && (
+        <>
+        <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-6">
+          {[
+            ["Observations", departureSummary.observation_count.toLocaleString()],
+            ["SPBU Profiles", departureSummary.profile_count.toLocaleString()],
+            ["Shipments", departureSummary.shipment_count.toLocaleString()],
+            ["Vehicles", departureSummary.vehicle_count.toLocaleString()],
+            ["Quantity", departureSummary.quantity_dispatched.toLocaleString()],
+            ["Missing Timestamps", departureSummary.missing_timestamp_count.toLocaleString()]
+          ].map(([label, value]) => (
+            <div key={label} className="border border-line bg-white p-4">
+              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">{label}</div>
+              <div className="mt-2 text-2xl font-semibold">{value}</div>
+            </div>
+          ))}
+        </section>
+
+        <section className="mt-5 grid gap-4 lg:grid-cols-3">
+          <div className="border border-line bg-white p-4">
+            <div className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-600">Source Data Quality</div>
+            <div className="grid gap-3 text-sm">
+              <div className="flex items-center justify-between border-b border-line pb-2"><span>GPS timestamp coverage</span><span className="font-semibold">{departureSummary.gps_timestamp_coverage_pct}%</span></div>
+              <div className="flex items-center justify-between border-b border-line pb-2"><span>LO gate-out coverage</span><span className="font-semibold">{departureSummary.lo_gate_out_coverage_pct}%</span></div>
+              <div className="flex items-center justify-between border-b border-line pb-2"><span>GPS observations</span><span className="font-semibold">{departureSummary.gps_observation_count.toLocaleString()}</span></div>
+              <div className="flex items-center justify-between border-b border-line pb-2"><span>LO gate-out observations</span><span className="font-semibold">{departureSummary.lo_gate_out_observation_count.toLocaleString()}</span></div>
+              <div className="flex items-center justify-between"><span>Avg GPS vs LO difference</span><span className="font-semibold">{departureSummary.avg_gps_vs_lo_difference_minutes ?? "-"} min</span></div>
+            </div>
+          </div>
+          <div className="border border-line bg-white p-4 lg:col-span-2">
+            <div className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-600">Confidence Mix</div>
+            <div className="grid gap-3 sm:grid-cols-3">
+              {[
+                ["High", departureSummary.high_confidence_profiles, "HIGH"],
+                ["Medium", departureSummary.medium_confidence_profiles, "MEDIUM"],
+                ["Low", departureSummary.low_confidence_profiles, "LOW"]
+              ].map(([label, value, level]) => (
+                <div key={label} className={`border p-4 ${confidenceClass(String(level))}`}>
+                  <div className="text-xs font-semibold uppercase tracking-wide">{label}</div>
+                  <div className="mt-2 text-3xl font-semibold">{Number(value).toLocaleString()}</div>
+                </div>
+              ))}
+            </div>
+            <div className="mt-4 text-xs text-slate-500">Algorithm: {departureAnalysis.algorithm_version}. Peak departure time is the midpoint of the busiest bucket.</div>
+          </div>
+        </section>
+
+        <section className="mt-5 grid gap-4 lg:grid-cols-2">
+          <ChartPanel title="24-Hour Departure Distribution" data={departureAnalysis.distribution} />
+          <section className="min-h-[320px] border border-line bg-white p-4">
+            <div className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-600">Weekday Departure Heatmap</div>
+            {heatmapOption ? <ReactECharts option={heatmapOption} style={{ height: 260 }} /> : <div className="py-20 text-center text-sm text-slate-500">No heatmap data.</div>}
+          </section>
+          <section className="min-h-[360px] border border-line bg-white p-4 lg:col-span-2">
+            <div className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-600">SPBU Departure Time Box Plot - Current Table Page</div>
+            <div className="mb-3 text-xs text-slate-500">Circular-time scale: labels with +1d are early-morning departures visually shifted after midnight to avoid false 24-hour spread.</div>
+            {boxPlotOption ? <ReactECharts option={boxPlotOption} style={{ height: 300 }} /> : <div className="py-20 text-center text-sm text-slate-500">No box plot data.</div>}
+          </section>
+        </section>
+
+        <section className="mt-5 border border-line bg-white p-4">
+          <div className="mb-3 flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+            <div>
+              <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">SPBU Departure Profiles</div>
+              <div className="mt-1 text-xs text-slate-500">Showing {departureShowingStart}-{departureShowingEnd} of {departureTotal.toLocaleString()} profiles</div>
+            </div>
+            <select className="border border-line bg-white px-3 py-2 text-sm" value={departureLimit} onChange={(event) => { setDepartureOffset(0); setDepartureLimit(Number(event.target.value)); }} title="Rows per page">
+              <option value={10}>10 rows</option>
+              <option value={25}>25 rows</option>
+              <option value={50}>50 rows</option>
+              <option value={100}>100 rows</option>
+            </select>
+          </div>
+          <div className="overflow-x-auto border border-line">
+            <table className="w-full border-collapse text-sm">
+              <thead>
+                <tr className="border-b border-line bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+                  {[
+                    ["spbu_code", "SPBU"],
+                    ["preferred_historical_departure_window", "Preferred Historical Departure Window"],
+                    ["peak_departure_time", "Peak"],
+                    ["p50", "P50"],
+                    ["p80", "P80"],
+                    ["p90", "P90"],
+                    ["p95", "P95"],
+                    ["observation_count", "Obs"],
+                    ["dispersion_minutes_iqr", "IQR"],
+                    ["confidence_score", "Confidence"]
+                  ].map(([column, label]) => {
+                    const isActiveSortColumn = departureSortColumn === column;
+                    return (
+                      <th key={column} className="whitespace-nowrap px-3 py-2" aria-sort={isActiveSortColumn ? (departureSortDirection === "asc" ? "ascending" : "descending") : "none"}>
+                        <button
+                          type="button"
+                          className="inline-flex min-h-6 items-center gap-1 text-left uppercase tracking-wide hover:text-slate-900"
+                          onClick={() => handleDepartureSort(column as DepartureSortColumn)}
+                          title={`Sort by ${label}`}
+                        >
+                          <span>{label}</span>
+                          {isActiveSortColumn ? (
+                            departureSortDirection === "asc" ? <ArrowUp size={14} aria-hidden="true" /> : <ArrowDown size={14} aria-hidden="true" />
+                          ) : (
+                            <ArrowUpDown size={14} className="text-slate-300" aria-hidden="true" />
+                          )}
+                        </button>
+                      </th>
+                    );
+                  })}
+                </tr>
+              </thead>
+              <tbody>
+                {departureProfiles.map((profile) => (
+                  <tr
+                    key={profile.spbu_id}
+                    className={`cursor-pointer border-b border-line ${selectedDepartureProfile?.spbu_id === profile.spbu_id ? "bg-mint/10" : ""}`}
+                    onClick={() => setSelectedDepartureSpbuId(profile.spbu_id)}
+                  >
+                    <td className="whitespace-nowrap px-3 py-2">
+                      <div className="font-medium">{profile.spbu_code}</div>
+                      <div className="text-xs text-slate-500">{profile.spbu_name ?? "-"}</div>
+                    </td>
+                    <td className="whitespace-nowrap px-3 py-2 font-semibold">{profile.preferred_historical_departure_window}</td>
+                    <td className="whitespace-nowrap px-3 py-2">{profile.peak_departure_time} <span className="text-xs text-slate-500">({profile.peak_departure_bucket})</span></td>
+                    <td className="whitespace-nowrap px-3 py-2">{profile.p50}</td>
+                    <td className="whitespace-nowrap px-3 py-2">{profile.p80}</td>
+                    <td className="whitespace-nowrap px-3 py-2">{profile.p90}</td>
+                    <td className="whitespace-nowrap px-3 py-2">{profile.p95}</td>
+                    <td className="whitespace-nowrap px-3 py-2">{profile.observation_count.toLocaleString()}</td>
+                    <td className="whitespace-nowrap px-3 py-2">{profile.dispersion_minutes_iqr.toLocaleString()} min</td>
+                    <td className="px-3 py-2">
+                      <span className={`inline-flex border px-2 py-1 text-xs font-semibold ${confidenceClass(profile.confidence_level)}`}>{profile.confidence_level} {profile.confidence_score}</span>
+                    </td>
+                  </tr>
+                ))}
+                {departureProfiles.length === 0 && (
+                  <tr><td className="px-3 py-8 text-center text-sm text-slate-500" colSpan={10}>No departure profiles match the selected depot and period.</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+          <div className="mt-4 flex items-center justify-between gap-3 text-sm">
+            <button className="border border-line px-3 py-2 disabled:opacity-50" onClick={() => setDepartureOffset(Math.max(0, departureOffset - departureLimit))} disabled={!canPreviousDeparturePage}>Previous</button>
+            <span className="text-slate-500">Page {departurePageNumber} of {departurePageCount}</span>
+            <button className="border border-line px-3 py-2 disabled:opacity-50" onClick={() => setDepartureOffset(departureOffset + departureLimit)} disabled={!canNextDeparturePage}>Next</button>
+          </div>
+        </section>
+
+        <section className="mt-5 border border-line bg-white p-4">
+          <div className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-600">SPBU Explorer - Source Lineage</div>
+          {selectedDepartureProfile ? (
+            <>
+              <div className="mb-3 grid gap-3 md:grid-cols-4">
+                <div className="border border-line p-3">
+                  <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Selected SPBU</div>
+                  <div className="mt-1 font-semibold">{selectedDepartureProfile.spbu_code}</div>
+                </div>
+                <div className="border border-line p-3">
+                  <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Source Counts</div>
+                  <div className="mt-1 text-sm">GPS {selectedDepartureProfile.departure_time_source_counts.GPS ?? 0} / LO {selectedDepartureProfile.departure_time_source_counts.LO_GATE_OUT ?? 0}</div>
+                </div>
+                <div className="border border-line p-3">
+                  <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Vehicles</div>
+                  <div className="mt-1 font-semibold">{selectedDepartureProfile.vehicle_count.toLocaleString()}</div>
+                </div>
+                <div className="border border-line p-3">
+                  <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Quantity</div>
+                  <div className="mt-1 font-semibold">{selectedDepartureProfile.quantity_dispatched.toLocaleString()}</div>
+                </div>
+              </div>
+              <div className="overflow-x-auto border border-line">
+                <table className="w-full border-collapse text-sm">
+                  <thead>
+                    <tr className="border-b border-line bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+                      <th className="whitespace-nowrap px-3 py-2">Operation Date</th>
+                      <th className="whitespace-nowrap px-3 py-2">Shipment</th>
+                      <th className="whitespace-nowrap px-3 py-2">Vehicle</th>
+                      <th className="whitespace-nowrap px-3 py-2">LO Gate-Out</th>
+                      <th className="whitespace-nowrap px-3 py-2">GPS Depot Exit</th>
+                      <th className="whitespace-nowrap px-3 py-2">Used Timestamp</th>
+                      <th className="whitespace-nowrap px-3 py-2">Source</th>
+                      <th className="whitespace-nowrap px-3 py-2">GPS vs LO</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {selectedDepartureObservations.map((row) => (
+                      <tr key={row.observation_id} className="border-b border-line">
+                        <td className="whitespace-nowrap px-3 py-2">{formatDate(row.operation_date)}</td>
+                        <td className="whitespace-nowrap px-3 py-2">{row.source_shipment_id}</td>
+                        <td className="whitespace-nowrap px-3 py-2">{row.vehicle_registration ?? "-"}</td>
+                        <td className="whitespace-nowrap px-3 py-2">{formatDateTime(row.loading_order_gate_out_datetime)}</td>
+                        <td className="whitespace-nowrap px-3 py-2">{formatDateTime(row.gps_actual_depot_exit_datetime)}</td>
+                        <td className="whitespace-nowrap px-3 py-2">{formatDateTime(row.departure_datetime_used)}</td>
+                        <td className="whitespace-nowrap px-3 py-2">{row.departure_time_source ?? "-"}</td>
+                        <td className="whitespace-nowrap px-3 py-2">{row.gps_vs_lo_difference_minutes ?? "-"} min</td>
+                      </tr>
+                    ))}
+                    {selectedDepartureObservations.length === 0 && (
+                      <tr><td className="px-3 py-8 text-center text-sm text-slate-500" colSpan={8}>No observations for the selected profile.</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          ) : (
+            <div className="py-8 text-center text-sm text-slate-500">Select a profile row to inspect source timestamps.</div>
+          )}
+        </section>
+        </>
+        )}
+        </>
+        )}
+
+        {currentPage === "tag-consistency" && (
+        <>
+        <section className="mb-5 border border-line bg-white p-4">
+          <div className="mb-3 flex flex-col gap-1">
+            <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Tag Consistency Analysis</div>
+            <div className="text-xs text-slate-500">
+              {tagAnalysis?.effective_filters.start_date && tagAnalysis?.effective_filters.end_date
+                ? `Tanggal analisis: ${formatDate(String(tagAnalysis.effective_filters.start_date))} - ${formatDate(String(tagAnalysis.effective_filters.end_date))}`
+                : "Default date menggunakan latest available Loading Order date."}
+            </div>
+          </div>
+          <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-5">
+            <input className="border border-line px-3 py-2 text-sm" type="date" value={tagFilters.startDate} onChange={(event) => updateTagFilter("startDate", event.target.value)} title="Start date" />
+            <input className="border border-line px-3 py-2 text-sm" type="date" value={tagFilters.endDate} onChange={(event) => updateTagFilter("endDate", event.target.value)} title="End date" />
+            <select className="border border-line bg-white px-3 py-2 text-sm" value={tagFilters.depotId} onChange={(event) => updateTagFilter("depotId", event.target.value)} title="Depot">
+              <option value="ALL">All Depots</option>
+              {depots.map((depot) => (
+                <option key={depot.depot_id} value={depot.depot_id}>{depot.depot_name}</option>
+              ))}
+            </select>
+            <input className="border border-line px-3 py-2 text-sm" value={tagFilters.spbu} onChange={(event) => updateTagFilter("spbu", event.target.value)} placeholder="SPBU" title="Filter SPBU" />
+            <input className="border border-line px-3 py-2 text-sm" value={tagFilters.vehicle} onChange={(event) => updateTagFilter("vehicle", event.target.value)} placeholder="Vehicle / MT" title="Filter vehicle registration" />
+            <select className="border border-line bg-white px-3 py-2 text-sm" value={tagFilters.tagType} onChange={(event) => updateTagFilter("tagType", event.target.value)} title="Tag type">
+              <option value="ALL">All Tag Types</option>
+              {tagTypes.map((tagType) => (
+                <option key={tagType.code} value={tagType.code}>{tagType.name}</option>
+              ))}
+            </select>
+            <select className="border border-line bg-white px-3 py-2 text-sm" value={tagFilters.status} onChange={(event) => updateTagFilter("status", event.target.value)} title="Overall status">
+              <option value="ALL">All Status</option>
+              <option value="MATCH">Match</option>
+              <option value="MISMATCH">Mismatch</option>
+              <option value="DATA_ISSUE">Data Issue</option>
+            </select>
+            <select className="border border-line bg-white px-3 py-2 text-sm" value={tagFilters.productId} onChange={(event) => updateTagFilter("productId", event.target.value)} title="Product">
+              <option value="">All Products</option>
+              {products.map((product) => (
+                <option key={product.product_id} value={product.product_id}>{product.product_name}</option>
+              ))}
+            </select>
+            <input className="border border-line px-3 py-2 text-sm" type="number" value={tagFilters.vehicleClass} onChange={(event) => updateTagFilter("vehicleClass", event.target.value)} placeholder="Vehicle Class" title="Vehicle class" />
+            <input
+              className="border border-line px-3 py-2 text-sm"
+              value={tagFilters.search}
+              onChange={(event) => updateTagFilter("search", event.target.value)}
+              onKeyDown={(event) => { if (event.key === "Enter") applyTagFilters(); }}
+              placeholder="Search LO, MT, SPBU"
+              title="Search analysis"
+            />
+          </div>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button className="inline-flex items-center justify-center gap-2 bg-mint px-3 py-2 text-sm font-medium text-white disabled:opacity-60" onClick={applyTagFilters} disabled={tagLoading} title="Apply tag consistency filters">
+              <Search size={16} />
+              {tagLoading ? "Loading" : "Apply Filter"}
+            </button>
+            <button className="inline-flex items-center justify-center gap-2 border border-line px-3 py-2 text-sm" onClick={resetTagFilters} title="Reset filters">
+              <RefreshCw size={16} />
+              Reset
+            </button>
+          </div>
+        </section>
+
+        <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-6">
+          {[
+            ["Total LO Assignments", tagSummary.total_lo_assignments.toLocaleString()],
+            ["Matched", tagSummary.matched.toLocaleString()],
+            ["Mismatch", tagSummary.mismatch.toLocaleString()],
+            ["Data Issues", tagSummary.data_issues.toLocaleString()],
+            ["Analyzable LO", tagSummary.analyzable_lo.toLocaleString()],
+            ["Consistency Rate", `${tagSummary.consistency_rate.toLocaleString()}%`]
+          ].map(([label, value]) => (
+            <div key={label} className="border border-line bg-white p-4">
+              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">{label}</div>
+              <div className="mt-2 text-2xl font-semibold">{value}</div>
+            </div>
+          ))}
+        </section>
+
+        <section className="mt-5 grid gap-4 lg:grid-cols-2">
+          <ChartPanel title="Mismatch by Tag Type" data={tagSummary.mismatch_by_tag_type} orientation="horizontal" />
+          <ChartPanel title="Mismatch by Tag Value" data={tagSummary.mismatch_by_tag_value} orientation="horizontal" />
+          <ChartPanel title="Daily Tag Consistency Rate" data={tagSummary.daily_consistency_rate} />
+          <ChartPanel title="Data Quality Issues" data={tagSummary.data_quality_summary} kind="pie" />
+          <div className="flex flex-wrap items-center justify-between gap-3 lg:col-span-2">
+            <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Mismatch Tables</div>
+            <label className="inline-flex items-center gap-2 text-sm">
+              <span className="text-xs font-semibold uppercase tracking-wide text-slate-500">Rows per page</span>
+              <select className="border border-line bg-white px-3 py-2 text-sm" value={mismatchRowsPerPage} onChange={(event) => handleMismatchRowsPerPage(event.target.value)} title="Rows per page for both mismatch tables">
+                <option value={10}>10 rows</option>
+                <option value={20}>20 rows</option>
+                <option value={50}>50 rows</option>
+              </select>
+            </label>
+          </div>
+          <section className="border border-line bg-white p-4">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">All SPBU with Tag Mismatch</div>
+              <div className="text-xs text-slate-500">{allSpbuMismatchRows.length.toLocaleString()} SPBU</div>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full border-collapse text-sm">
+                <thead>
+                  <tr className="border-b border-line text-left text-xs uppercase tracking-wide text-slate-500">
+                    {[
+                      ["label", "SPBU"],
+                      ["total_assignment", "Assignments"],
+                      ["mismatch", "Mismatch"],
+                      ["mismatch_rate", "Rate"]
+                    ].map(([column, label]) => (
+                      <th key={column} className="py-2 pr-3">
+                        <button className="inline-flex items-center gap-1 uppercase tracking-wide" onClick={() => handleSpbuMismatchSort(column as MismatchSortColumn)} title={`Sort SPBU mismatch by ${label}`}>
+                          <span>{label}</span>
+                          {spbuMismatchSortColumn === column ? (spbuMismatchSortDirection === "asc" ? <ArrowUp size={14} /> : <ArrowDown size={14} />) : <ArrowUpDown size={14} className="text-slate-300" />}
+                        </button>
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {visibleSpbuMismatchRows.map((row) => (
+                    <tr key={row.spbu} className="border-b border-line">
+                      <td className="py-2 pr-3">{row.spbu}</td>
+                      <td className="py-2 pr-3">{row.total_assignment.toLocaleString()}</td>
+                      <td className="py-2 pr-3">{row.mismatch.toLocaleString()}</td>
+                      <td className="py-2 pr-3">{row.mismatch_rate.toLocaleString()}%</td>
+                    </tr>
+                  ))}
+                  {allSpbuMismatchRows.length === 0 && (
+                    <tr><td className="py-8 text-center text-slate-500" colSpan={4}>No SPBU mismatch in the active filter.</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+            <div className="mt-4 flex items-center justify-between gap-3 text-sm">
+              <button className="border border-line px-3 py-2 disabled:opacity-50" onClick={() => setSpbuMismatchPage(Math.max(0, spbuMismatchPage - 1))} disabled={spbuMismatchPage === 0}>Previous</button>
+              <span className="text-slate-500">Page {spbuMismatchPage + 1} of {spbuMismatchPageCount}</span>
+              <button className="border border-line px-3 py-2 disabled:opacity-50" onClick={() => setSpbuMismatchPage(Math.min(spbuMismatchPageCount - 1, spbuMismatchPage + 1))} disabled={spbuMismatchPage + 1 >= spbuMismatchPageCount}>Next</button>
+            </div>
+          </section>
+          <section className="border border-line bg-white p-4">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">All MT with Tag Mismatch</div>
+              <div className="text-xs text-slate-500">{allMtMismatchRows.length.toLocaleString()} MT</div>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full border-collapse text-sm">
+                <thead>
+                  <tr className="border-b border-line text-left text-xs uppercase tracking-wide text-slate-500">
+                    {[
+                      ["label", "Vehicle Registration"],
+                      ["total_assignment", "Assignments"],
+                      ["mismatch", "Mismatch"],
+                      ["mismatch_rate", "Rate"]
+                    ].map(([column, label]) => (
+                      <th key={column} className="py-2 pr-3">
+                        <button className="inline-flex items-center gap-1 uppercase tracking-wide" onClick={() => handleMtMismatchSort(column as MismatchSortColumn)} title={`Sort MT mismatch by ${label}`}>
+                          <span>{label}</span>
+                          {mtMismatchSortColumn === column ? (mtMismatchSortDirection === "asc" ? <ArrowUp size={14} /> : <ArrowDown size={14} />) : <ArrowUpDown size={14} className="text-slate-300" />}
+                        </button>
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {visibleMtMismatchRows.map((row) => (
+                    <tr key={row.vehicle_registration} className="border-b border-line">
+                      <td className="py-2 pr-3">{row.vehicle_registration}</td>
+                      <td className="py-2 pr-3">{row.total_assignment.toLocaleString()}</td>
+                      <td className="py-2 pr-3">{row.mismatch.toLocaleString()}</td>
+                      <td className="py-2 pr-3">{row.mismatch_rate.toLocaleString()}%</td>
+                    </tr>
+                  ))}
+                  {allMtMismatchRows.length === 0 && (
+                    <tr><td className="py-8 text-center text-slate-500" colSpan={4}>No MT mismatch in the active filter.</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+            <div className="mt-4 flex items-center justify-between gap-3 text-sm">
+              <button className="border border-line px-3 py-2 disabled:opacity-50" onClick={() => setMtMismatchPage(Math.max(0, mtMismatchPage - 1))} disabled={mtMismatchPage === 0}>Previous</button>
+              <span className="text-slate-500">Page {mtMismatchPage + 1} of {mtMismatchPageCount}</span>
+              <button className="border border-line px-3 py-2 disabled:opacity-50" onClick={() => setMtMismatchPage(Math.min(mtMismatchPageCount - 1, mtMismatchPage + 1))} disabled={mtMismatchPage + 1 >= mtMismatchPageCount}>Next</button>
+            </div>
+          </section>
+        </section>
+
+        <section className="mt-5 border border-line bg-white p-4">
+          <div className="mb-3 flex flex-col gap-1 lg:flex-row lg:items-center lg:justify-between">
+            <div>
+              <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Main Analysis Table</div>
+              <div className="mt-1 text-xs text-slate-500">Showing {tagShowingStart}-{tagShowingEnd} of {tagTotal.toLocaleString()} assignments</div>
+            </div>
+            <select className="border border-line bg-white px-3 py-2 text-sm" value={tagLimit} onChange={(event) => { setTagOffset(0); setTagLimit(Number(event.target.value)); }} title="Rows per page">
+              <option value={25}>25 rows</option>
+              <option value={50}>50 rows</option>
+              <option value={100}>100 rows</option>
+            </select>
+          </div>
+          <div className="overflow-x-auto border border-line">
+            <table className="w-full border-collapse text-sm">
+              <thead>
+                <tr className="border-b border-line bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+                  {[
+                    ["loading_order_date", "Date"],
+                    ["loading_order_number", "Loading Order"],
+                    ["vehicle_registration", "Vehicle Registration"],
+                    ["spbu_name", "SPBU"],
+                    ["depot", "Depot"],
+                    ["overall_status", "Overall Status"]
+                  ].map(([column, label]) => (
+                    <th key={column} className="whitespace-nowrap px-3 py-2">
+                      <button className="inline-flex items-center gap-1 uppercase tracking-wide" onClick={() => handleTagSort(column)} title={`Sort by ${label}`}>
+                        <span>{label}</span>
+                        {tagSortColumn === column ? (tagSortDirection === "asc" ? <ArrowUp size={14} /> : <ArrowDown size={14} />) : <ArrowUpDown size={14} className="text-slate-300" />}
+                      </button>
+                    </th>
+                  ))}
+                  <th className="whitespace-nowrap px-3 py-2">Vehicle Class Result</th>
+                  <th className="whitespace-nowrap px-3 py-2">Tag Match Result</th>
+                  <th className="whitespace-nowrap px-3 py-2">Issue / Reason</th>
+                  <th className="whitespace-nowrap px-3 py-2">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {tagRows.map((row) => (
+                  <tr key={row.analysis_id} className="border-b border-line">
+                    <td className="whitespace-nowrap px-3 py-2">{formatDate(row.loading_order_date)}</td>
+                    <td className="whitespace-nowrap px-3 py-2">{row.loading_order_number}</td>
+                    <td className="whitespace-nowrap px-3 py-2">{row.vehicle_registration ?? "-"}</td>
+                    <td className="whitespace-nowrap px-3 py-2">{row.spbu_code ?? row.spbu_name ?? "-"}</td>
+                    <td className="max-w-48 truncate px-3 py-2" title={row.depot ?? "-"}>{row.depot ?? "-"}</td>
+                    <td className="px-3 py-2">
+                      <span className={`inline-flex border px-2 py-1 text-xs font-semibold ${statusClass(row.overall_status)}`}>{statusLabel(row.overall_status)}</span>
+                    </td>
+                    <td className="px-3 py-2">{row.vehicle_class_result.replace(/_/g, " ")}</td>
+                    <td className="px-3 py-2">{row.tag_match_result.replace(/_/g, " ")} ({row.mismatch_count})</td>
+                    <td className="max-w-80 truncate px-3 py-2" title={row.primary_reason}>{row.primary_reason}</td>
+                    <td className="px-3 py-2">
+                      <button className="inline-flex items-center gap-2 border border-line px-3 py-2 text-xs" onClick={() => setSelectedAnalysis(row)} title="View tag matrix detail">
+                        <Eye size={14} />
+                        View Detail
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+                {tagRows.length === 0 && (
+                  <tr>
+                    <td className="px-3 py-8 text-center text-sm text-slate-500" colSpan={10}>
+                      {tagLoading ? "Loading analysis..." : "No Loading Order assignments match the active filter."}
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+          <div className="mt-4 flex items-center justify-between gap-3 text-sm">
+            <button className="border border-line px-3 py-2 disabled:opacity-50" onClick={() => setTagOffset(Math.max(0, tagOffset - tagLimit))} disabled={!canPreviousTagPage}>Previous</button>
+            <span className="text-slate-500">Page {tagPageNumber} of {tagPageCount}</span>
+            <button className="border border-line px-3 py-2 disabled:opacity-50" onClick={() => setTagOffset(tagOffset + tagLimit)} disabled={!canNextTagPage}>Next</button>
+          </div>
+        </section>
+        </>
+        )}
+
+        {currentPage === "dashboard" && (
+        <section className="mb-5 border border-line bg-white p-4">
+          <div className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-600">Dashboard Filter</div>
+          <div className="grid gap-3 md:grid-cols-[1fr_auto]">
+            <select className="border border-line bg-white px-3 py-2 text-sm" value={dashboardDepotId} onChange={(event) => setDashboardDepotId(event.target.value)} title="Filter dashboard by depot">
+              <option value="ALL">All Depots</option>
+              {depots.map((depot) => (
+                <option key={depot.depot_id} value={depot.depot_id}>
+                  {depot.depot_name}
+                </option>
+              ))}
+            </select>
+            <button className="inline-flex items-center justify-center gap-2 border border-line px-3 py-2 text-sm" onClick={() => refresh()} title="Apply dashboard filter">
+              <RefreshCw size={16} />
+              Apply Filter
+            </button>
+          </div>
+        </section>
+        )}
+
+        {currentPage === "master-data" && (
+        <section className="mb-5 border border-line bg-white p-4">
+          <div className="mb-3 flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-slate-600">
+            <FileUp size={16} />
+            Import Data
+          </div>
+          <div className="grid gap-3 lg:grid-cols-[0.9fr_1.2fr_auto_auto_auto_auto]">
+            <select className="border border-line bg-white px-3 py-2 text-sm" value={domain} onChange={(event) => handleDomainChange(event.target.value)} title="Import domain">
+              <option value="MOBIL_TANGKI">Mobil Tangki</option>
+              <option value="SPBU">SPBU</option>
+              <option value="LOADING_ORDER">Loading Order</option>
+              <option value="GPS">GPS Data</option>
+            </select>
+            <input className="border border-line px-3 py-2 text-sm" value={sheetName} onChange={(event) => setSheetName(event.target.value)} placeholder="Sheet name" title="Sheet name" />
+            <input ref={fileInputRef} className="hidden" type="file" accept=".xlsx,.csv,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={handleFileSelected} />
+            <button className="inline-flex items-center justify-center gap-2 bg-amber px-3 py-2 text-sm font-medium text-white disabled:opacity-60" onClick={() => fileInputRef.current?.click()} disabled={uploading} title="Choose XLSX or CSV file to import">
+              <FileUp size={16} />
+              {uploading ? "Uploading" : "Import File"}
+            </button>
+            <button className="inline-flex items-center justify-center gap-2 border border-line px-3 py-2 text-sm" onClick={handleExportTemplate} disabled={exporting} title="Download import template">
+              <Download size={16} />
+              Template
+            </button>
+            <button className="inline-flex items-center justify-center gap-2 border border-line px-3 py-2 text-sm" onClick={() => refresh()} title="Refresh master data">
+              <RefreshCw size={16} />
+              Refresh
+            </button>
+            <button className="inline-flex items-center justify-center gap-2 bg-mint px-3 py-2 text-sm font-medium text-white disabled:opacity-60" onClick={handleImportSample} disabled={loading} title="Load provided Phase 0 sample workbooks">
+              <FileUp size={16} />
+              {loading ? "Importing" : "Import Samples"}
+            </button>
+          </div>
+        </section>
+        )}
+
+        {currentPage === "master-data" && (
+        <section className="mb-5 border border-line bg-white p-4">
+          <div className="mb-3 flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-slate-600">
+            <Download size={16} />
+            Export Data Per Depot
+          </div>
+          <div className="grid gap-3 md:grid-cols-[1fr_1.3fr_0.7fr_auto]">
+            <select
+              className="border border-line bg-white px-3 py-2 text-sm"
+              value={exportDomain}
+              onChange={(event) => {
+                setExportDomain(event.target.value);
+                if (event.target.value === "ALL") setExportFormat("xlsx");
+              }}
+              title="Export data domain"
+            >
+              <option value="ALL">All Data</option>
+              <option value="MOBIL_TANGKI">Mobil Tangki</option>
+              <option value="SPBU">SPBU</option>
+              <option value="SHIPMENT">Shipments</option>
+              <option value="LOADING_ORDER">Loading Orders</option>
+            </select>
+            <select className="border border-line bg-white px-3 py-2 text-sm" value={exportDepotId} onChange={(event) => setExportDepotId(event.target.value)} title="Depot">
+              {depots.length === 0 && <option value="">No depot data</option>}
+              {depots.map((depot) => (
+                <option key={depot.depot_id} value={depot.depot_id}>
+                  {depot.depot_name}
+                </option>
+              ))}
+            </select>
+            <select className="border border-line bg-white px-3 py-2 text-sm" value={exportFormat} onChange={(event) => setExportFormat(event.target.value)} title="Export format">
+              <option value="xlsx">XLSX</option>
+              <option value="csv" disabled={exportDomain === "ALL"}>
+                CSV
+              </option>
+            </select>
+            <button className="inline-flex items-center justify-center gap-2 bg-mint px-3 py-2 text-sm font-medium text-white disabled:opacity-60" onClick={handleExportData} disabled={exporting || !exportDepotId} title="Download canonical data filtered by depot">
+              <Download size={16} />
+              {exporting ? "Exporting" : "Export Data"}
+            </button>
+          </div>
+        </section>
+        )}
+
+        {currentPage === "master-data" && (
+        <section className="mb-5 border border-line bg-white p-4">
+          <div className="mb-3 flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-slate-600">
+            <FileUp size={16} />
+            Import History
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full border-collapse text-sm">
+              <thead>
+                <tr className="border-b border-line text-left text-xs uppercase tracking-wide text-slate-500">
+                  <th className="py-2 pr-3">Domain</th>
+                  <th className="py-2 pr-3">File</th>
+                  <th className="py-2 pr-3">Tanggal & Waktu Import</th>
+                  <th className="py-2 pr-3">Rows</th>
+                  <th className="py-2 pr-3">Valid</th>
+                  <th className="py-2 pr-3">Warnings</th>
+                  <th className="py-2 pr-3">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {imports.map((item) => (
+                  <tr key={item.import_id} className="border-b border-line">
+                    <td className="py-2 pr-3">{item.domain}</td>
+                    <td className="py-2 pr-3">{item.filename}</td>
+                    <td className="whitespace-nowrap py-2 pr-3">{formatImportDateTime(item.uploaded_at)}</td>
+                    <td className="py-2 pr-3">{item.total_rows.toLocaleString()}</td>
+                    <td className="py-2 pr-3">{item.valid_rows.toLocaleString()}</td>
+                    <td className="py-2 pr-3">{item.warning_rows.toLocaleString()}</td>
+                    <td className="py-2 pr-3">{item.status}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+        )}
+
+        {currentPage === "master-data" && (
+        <section className="mb-5 border border-line bg-white p-4">
+          <div className="mb-3 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+            <div>
+              <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Master Data CRUD</div>
+              <div className="mt-1 text-xs text-slate-500">
+                Showing {crudShowingStart}-{crudShowingEnd} of {crudTotal.toLocaleString()} records
+                {selectedCrudIds.size > 0 && <span className="ml-2">Selected {selectedCrudIds.size.toLocaleString()}</span>}
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {crudDomainOrder.map((domainKey) => (
+                <button
+                  key={domainKey}
+                  className={`border px-3 py-2 text-sm ${crudDomain === domainKey ? "border-mint bg-mint text-white" : "border-line bg-white"}`}
+                  onClick={() => changeCrudDomain(domainKey)}
+                  title={`Open ${configs[domainKey].label} CRUD`}
+                >
+                  {configs[domainKey].label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="mb-4 grid gap-3 md:grid-cols-[1.5fr_0.8fr_0.8fr_0.6fr_auto]">
+            <input
+              className="border border-line px-3 py-2 text-sm"
+              value={crudSearch}
+              onChange={(event) => setCrudSearch(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") applyCrudSearch();
+              }}
+              placeholder={`Search ${activeCrudConfig.label}`}
+              title="Search master data"
+            />
+            <select
+              className="border border-line bg-white px-3 py-2 text-sm"
+              value={crudSearchColumn}
+              onChange={(event) => setCrudSearchColumn(event.target.value)}
+              title="Search column"
+            >
+              {activeCrudConfig.columns.map((column) => (
+                <option key={column} value={column}>
+                  {crudColumnLabel(column)}
+                </option>
+              ))}
+            </select>
+            <select
+              className="border border-line bg-white px-3 py-2 text-sm disabled:bg-slate-100"
+              value={crudDepotId}
+              onChange={(event) => { setCrudOffset(0); setCrudDepotId(event.target.value); }}
+              disabled={!activeCrudConfig.depotFilter}
+              title="Filter depot"
+            >
+              <option value="ALL">All Depots</option>
+              {depots.map((depot) => (
+                <option key={depot.depot_id} value={depot.depot_id}>
+                  {depot.depot_name}
+                </option>
+              ))}
+            </select>
+            <select className="border border-line bg-white px-3 py-2 text-sm" value={String(crudLimit)} onChange={(event) => handleCrudLimitChange(event.target.value)} title="Rows per page">
+              <option value={10}>10 rows</option>
+              <option value={50}>50 rows</option>
+              <option value={100}>100 rows</option>
+              <option value="ALL">All records</option>
+            </select>
+            <button className="inline-flex items-center justify-center gap-2 bg-amber px-3 py-2 text-sm font-medium text-white" onClick={applyCrudSearch} title="Apply search">
+              <Search size={16} />
+              Search
+            </button>
+          </div>
+
+          <div className="mb-4 flex flex-wrap items-center gap-2">
+            <button className="inline-flex items-center justify-center gap-2 bg-mint px-3 py-2 text-sm font-medium text-white disabled:opacity-60" onClick={openCrudAddModal} disabled={crudLoading} title="Add one or more records">
+              <Plus size={16} />
+              Add
+            </button>
+            {canSyncCrudDomain && (
+              <button className="inline-flex items-center justify-center gap-2 border border-line px-3 py-2 text-sm disabled:opacity-50" onClick={syncCrudMasterData} disabled={crudLoading || crudSyncing} title={`Sync ${activeCrudConfig.label} from imported source data`}>
+                <RefreshCw size={16} />
+                {crudSyncing ? "Syncing" : "Sync"}
+              </button>
+            )}
+            <button className="inline-flex items-center justify-center gap-2 border border-line px-3 py-2 text-sm disabled:opacity-50" onClick={openCrudEditModal} disabled={crudLoading || selectedCrudCount === 0} title="Edit selected records">
+              <Pencil size={16} />
+              Edit {selectedCrudCount > 0 ? `(${selectedCrudCount})` : ""}
+            </button>
+            <button className="inline-flex items-center justify-center gap-2 border border-line px-3 py-2 text-sm text-rust disabled:opacity-50" onClick={deleteSelectedCrudRows} disabled={crudLoading || selectedCrudCount === 0} title="Delete selected records">
+              <Trash2 size={16} />
+              Delete {selectedCrudCount > 0 ? `(${selectedCrudCount})` : ""}
+            </button>
+          </div>
+
+          <div className="overflow-x-auto border border-line">
+            <table className="w-full border-collapse text-sm">
+              <thead>
+                <tr className="border-b border-line bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+                  <th className="w-12 px-3 py-2">
+                    <input
+                      aria-label="Select all visible master data rows"
+                      type="checkbox"
+                      checked={allVisibleCrudRowsSelected}
+                      disabled={visibleCrudIds.length === 0}
+                      onChange={toggleVisibleCrudSelection}
+                    />
+                  </th>
+                  {activeCrudConfig.columns.map((column) => {
+                    const isActiveSortColumn = crudSortColumn === column;
+                    return (
+                      <th key={column} className="whitespace-nowrap px-3 py-2" aria-sort={isActiveSortColumn ? (crudSortDirection === "asc" ? "ascending" : "descending") : "none"}>
+                        <button
+                          type="button"
+                          className="inline-flex min-h-6 items-center gap-1 text-left uppercase tracking-wide hover:text-slate-900"
+                          onClick={() => handleCrudSort(column)}
+                          title={`Sort by ${crudColumnLabel(column)}`}
+                        >
+                          <span>{crudColumnLabel(column)}</span>
+                          {isActiveSortColumn ? (
+                            crudSortDirection === "asc" ? <ArrowUp size={14} aria-hidden="true" /> : <ArrowDown size={14} aria-hidden="true" />
+                          ) : (
+                            <ArrowUpDown size={14} className="text-slate-300" aria-hidden="true" />
+                          )}
+                        </button>
+                      </th>
+                    );
+                  })}
+                </tr>
+              </thead>
+              <tbody>
+                {crudRows.map((row, rowIndex) => {
+                  const rawRecordId = row[activeCrudConfig.idKey];
+                  const hasRecordId = rawRecordId !== null && rawRecordId !== undefined && rawRecordId !== "";
+                  const recordId = hasRecordId ? String(rawRecordId) : `${crudDomain}-${crudOffset}-${rowIndex}`;
+                  return (
+                    <tr key={recordId} className="border-b border-line">
+                      <td className="px-3 py-2">
+                        <input
+                          aria-label={`Select ${activeCrudConfig.label} row ${rowIndex + 1}`}
+                          type="checkbox"
+                          checked={hasRecordId && selectedCrudIds.has(recordId)}
+                          disabled={!hasRecordId}
+                          onChange={() => toggleCrudRowSelection(recordId)}
+                        />
+                      </td>
+                      {activeCrudConfig.columns.map((column) => (
+                        <td key={column} className="max-w-64 truncate px-3 py-2" title={formatCrudValue(row[column], column)}>
+                          {formatCrudValue(row[column], column)}
+                        </td>
+                      ))}
+                    </tr>
+                  );
+                })}
+                {crudRows.length === 0 && (
+                  <tr>
+                    <td className="px-3 py-8 text-center text-sm text-slate-500" colSpan={activeCrudConfig.columns.length + 1}>
+                      {crudLoading ? "Loading data..." : "No records match the active filter."}
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="mt-4 flex items-center justify-between gap-3 text-sm">
+            <button className="border border-line px-3 py-2 disabled:opacity-50" onClick={() => setCrudOffset(Math.max(0, crudOffset - crudPageSizeNumber))} disabled={!canPreviousCrudPage}>
+              Previous
+            </button>
+            <span className="text-slate-500">
+              Page {crudPageNumber} of {crudPageCount}
+            </span>
+            <button className="border border-line px-3 py-2 disabled:opacity-50" onClick={() => setCrudOffset(crudOffset + crudPageSizeNumber)} disabled={!canNextCrudPage}>
+              Next
+            </button>
+          </div>
+        </section>
+        )}
+
+        {currentPage === "master-data" && crudModalMode && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4 py-6">
+          <div className="flex max-h-[90vh] w-full max-w-6xl flex-col border border-line bg-white shadow-xl">
+            <div className="flex items-center justify-between gap-3 border-b border-line px-5 py-4">
+              <div>
+                <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">
+                  {crudModalMode === "edit" ? `Edit ${crudBatchForms.length.toLocaleString()} ${activeCrudConfig.label} Record` : `Add ${activeCrudConfig.label} Record`}
+                </div>
+                <div className="mt-1 text-xs text-slate-500">
+                  {crudModalMode === "edit" ? "Setiap row terpilih dapat diedit sebelum disimpan." : "Tambahkan beberapa row sekaligus sebelum disimpan."}
+                </div>
+              </div>
+              <button type="button" className="inline-flex h-9 w-9 items-center justify-center border border-line" onClick={closeCrudModal} title="Close modal">
+                <X size={17} />
+              </button>
+            </div>
+
+            <form
+              className="flex min-h-0 flex-1 flex-col"
+              onSubmit={(event) => {
+                event.preventDefault();
+                saveCrudBatch();
+              }}
+            >
+              <div className="min-h-0 flex-1 overflow-auto px-5 py-4">
+                <div className="grid gap-4">
+                  {crudBatchForms.map((formRow, rowIndex) => (
+                    <div key={formRow.recordId ?? `new-${rowIndex}`} className="border border-line p-4">
+                      <div className="mb-3 flex items-center justify-between gap-3">
+                        <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                          Row {rowIndex + 1}{formRow.recordId ? ` - ${String(formRow.values[activeCrudConfig.titleKey] ?? formRow.recordId)}` : ""}
+                        </div>
+                        {(crudModalMode === "add" || crudBatchForms.length > 1) && (
+                          <button type="button" className="inline-flex items-center gap-1 text-xs text-rust disabled:opacity-40" onClick={() => removeCrudBatchRow(rowIndex)} disabled={crudBatchForms.length === 1 && crudModalMode === "add"}>
+                            <X size={14} />
+                            Remove
+                          </button>
+                        )}
+                      </div>
+                      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                        {activeCrudConfig.fields.map((field) => {
+                          const fieldValue = formRow.values[field.key] ?? "";
+                          const fieldDisabled = Boolean(crudModalMode === "edit" && field.readonlyOnEdit);
+                          if (field.kind === "checkbox") {
+                            return (
+                              <label key={field.key} className="flex items-center gap-2 text-sm">
+                                <input
+                                  type="checkbox"
+                                  checked={Boolean(fieldValue)}
+                                  disabled={fieldDisabled}
+                                  onChange={(event) => updateCrudBatchValue(rowIndex, field.key, event.target.checked)}
+                                />
+                                {field.label}
+                              </label>
+                            );
+                          }
+                          return (
+                            <label key={field.key} className="grid gap-1 text-sm">
+                              <span className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                                {field.label}{field.required ? " *" : ""}
+                              </span>
+                              {field.kind === "select" ? (
+                                <select
+                                  className="border border-line bg-white px-3 py-2 text-sm disabled:bg-slate-100"
+                                  value={String(fieldValue)}
+                                  disabled={fieldDisabled}
+                                  onChange={(event) => updateCrudBatchValue(rowIndex, field.key, event.target.value)}
+                                >
+                                  {(field.options ?? []).map((option) => (
+                                    <option key={option.value} value={option.value}>{option.label}</option>
+                                  ))}
+                                </select>
+                              ) : field.kind === "textarea" ? (
+                                <textarea
+                                  className="min-h-20 border border-line px-3 py-2 text-sm disabled:bg-slate-100"
+                                  value={String(fieldValue)}
+                                  disabled={fieldDisabled}
+                                  onChange={(event) => updateCrudBatchValue(rowIndex, field.key, event.target.value)}
+                                />
+                              ) : (
+                                <input
+                                  className="border border-line px-3 py-2 text-sm disabled:bg-slate-100"
+                                  type={field.kind === "number" ? "number" : "text"}
+                                  step={field.kind === "number" ? "any" : undefined}
+                                  value={String(fieldValue)}
+                                  disabled={fieldDisabled}
+                                  onChange={(event) => updateCrudBatchValue(rowIndex, field.key, event.target.value)}
+                                />
+                              )}
+                            </label>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-3 border-t border-line px-5 py-4">
+                <div className="text-xs text-slate-500">
+                  {crudBatchForms.length.toLocaleString()} row siap diproses
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {crudModalMode === "add" && (
+                    <button type="button" className="inline-flex items-center justify-center gap-2 border border-line px-3 py-2 text-sm" onClick={addCrudBatchRow}>
+                      <Plus size={16} />
+                      Add Row
+                    </button>
+                  )}
+                  <button type="button" className="border border-line px-3 py-2 text-sm" onClick={closeCrudModal}>Cancel</button>
+                  <button type="submit" className="inline-flex items-center justify-center gap-2 bg-mint px-3 py-2 text-sm font-medium text-white disabled:opacity-60" disabled={crudLoading || crudBatchForms.length === 0}>
+                    <Save size={16} />
+                    {crudLoading ? "Saving" : crudModalMode === "edit" ? "Save Changes" : "Save Records"}
+                  </button>
+                </div>
+              </div>
+            </form>
+          </div>
+        </div>
+        )}
+
+        {currentPage === "dashboard" && (
+        <>
+        <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          {Object.entries(kpiLabels).map(([key, label]) => (
+            <div key={key} className="border border-line bg-white p-4">
+              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">{label}</div>
+              <div className="mt-2 text-2xl font-semibold">{Number(overview[key] ?? 0).toLocaleString()}</div>
+            </div>
+          ))}
+        </section>
+
+        <section className="mt-5 grid gap-4 lg:grid-cols-2">
+          <ChartPanel title="MT by Tag Vehicle Class" data={charts.mt_by_vehicle_type_tag ?? []} />
+          <ChartPanel title="SPBU by Tag Vehicle Class" data={charts.spbu_by_vehicle_type_tag ?? []} />
+          <ChartPanel title="MT by Project Tag" data={charts.mt_by_project_tag ?? []} />
+          <ChartPanel title="SPBU by Project Tag" data={charts.spbu_by_project_tag ?? []} />
+          <ChartPanel title="SPBU per Shipment Distribution" data={charts.spbu_per_shipment_distribution ?? []} />
+          <ChartPanel title="Product Distribution" data={charts.product_distribution ?? []} kind="pie" />
+          <ChartPanel title="Reference Mapping Coverage" data={charts.reference_mapping_coverage ?? []} kind="pie" />
+          <ChartPanel title="Data Quality Issues by Severity" data={charts.data_quality_issues_by_severity ?? []} kind="pie" />
+          <ChartPanel title="MT vs SPBU Tag Coverage" data={charts.mt_vs_spbu_tag_coverage ?? []} kind="pie" />
+          <ChartPanel title="GPS Reconstruction Coverage" data={charts.gps_reconstruction_coverage ?? []} kind="pie" />
+        </section>
+
+        <section className="mt-5 grid gap-4 lg:grid-cols-3">
+          <div className="border border-line bg-white p-4">
+            <div className="mb-3 flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-slate-600">
+              <GitBranch size={16} />
+              Compatibility Summary
+            </div>
+            <div className="grid grid-cols-3 gap-2 text-center">
+              <div className="border border-line p-3">
+                <CheckCircle2 className="mx-auto text-mint" size={18} />
+                <div className="mt-2 text-xl font-semibold">{compatibility?.compatible ?? 0}</div>
+                <div className="text-xs text-slate-500">Compatible</div>
+              </div>
+              <div className="border border-line p-3">
+                <AlertTriangle className="mx-auto text-rust" size={18} />
+                <div className="mt-2 text-xl font-semibold">{compatibility?.incompatible ?? 0}</div>
+                <div className="text-xs text-slate-500">Incompatible</div>
+              </div>
+              <div className="border border-line p-3">
+                <Route className="mx-auto text-amber" size={18} />
+                <div className="mt-2 text-xl font-semibold">{compatibility?.insufficient_data ?? 0}</div>
+                <div className="text-xs text-slate-500">Insufficient</div>
+              </div>
+            </div>
+            <div className="mt-3 max-h-64 overflow-y-auto text-xs text-slate-700">
+              {(compatibility?.examples ?? []).slice(0, 6).map((item, index) => (
+                <div key={index} className="border-t border-line py-2">
+                  {String(item.vehicle_registration)} to {String(item.spbu_code)}: {String(item.explanation)}
+                </div>
+              ))}
+            </div>
+          </div>
+        </section>
+
+        <section className="mt-5 border border-line bg-white p-4">
+          <div className="mb-3 flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-slate-600">
+            <AlertTriangle size={16} />
+            Data Quality Explorer
+          </div>
+          <div className="grid gap-3 lg:grid-cols-2">
+            {issues.map((issue) => (
+              <div key={issue.issue_id} className="border border-line p-3 text-sm">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="font-semibold">{issue.rule_code}</span>
+                  <span className="text-xs uppercase text-rust">{issue.severity}</span>
+                </div>
+                <div className="mt-1 text-slate-600">
+                  {issue.entity_type} {issue.entity_id ?? "UNKNOWN"}: {issue.description}
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="mt-5 border border-line bg-white p-4">
+          <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Trip Reconstruction Validator</div>
+          <p className="mt-2 text-sm text-slate-600">GPS staging, geofence, visit, reconciliation, and stop-sequence tables are present. The screen reports NO_GPS_SEQUENCE until the future GPS_data source mapping is supplied or synthetic GPS acceptance scenarios are loaded.</p>
+        </section>
+        </>
+        )}
+
+        {selectedAnalysis && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4 py-6">
+          <div className="flex max-h-[90vh] w-full max-w-6xl flex-col border border-line bg-white shadow-xl">
+            <div className="flex items-center justify-between gap-3 border-b border-line px-5 py-4">
+              <div>
+                <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Loading Order Tag Analysis</div>
+                <div className="mt-1 text-xs text-slate-500">
+                  {selectedAnalysis.loading_order_number} · {formatDate(selectedAnalysis.loading_order_date)} · {selectedAnalysis.vehicle_registration ?? "-"} · {selectedAnalysis.spbu_code ?? selectedAnalysis.spbu_name ?? "-"}
+                </div>
+              </div>
+              <button type="button" className="inline-flex h-9 w-9 items-center justify-center border border-line" onClick={() => setSelectedAnalysis(null)} title="Close detail">
+                <X size={17} />
+              </button>
+            </div>
+            <div className="grid gap-3 border-b border-line px-5 py-4 text-sm md:grid-cols-4">
+              <div>
+                <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Overall Result</div>
+                <span className={`mt-2 inline-flex border px-2 py-1 text-xs font-semibold ${statusClass(selectedAnalysis.overall_status)}`}>{statusLabel(selectedAnalysis.overall_status)}</span>
+              </div>
+              <div>
+                <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Depot</div>
+                <div className="mt-2">{selectedAnalysis.depot ?? "-"}</div>
+              </div>
+              <div>
+                <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">MT Vehicle Class</div>
+                <div className="mt-2">{selectedAnalysis.mt_vehicle_class ?? "-"}</div>
+              </div>
+              <div>
+                <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">SPBU Maximum</div>
+                <div className="mt-2">{selectedAnalysis.spbu_vehicle_class ?? "-"}</div>
+              </div>
+            </div>
+            <div className="min-h-0 flex-1 overflow-auto px-5 py-4">
+              <table className="w-full border-collapse text-sm">
+                <thead>
+                  <tr className="border-b border-line text-left text-xs uppercase tracking-wide text-slate-500">
+                    <th className="py-2 pr-3">Tag Type</th>
+                    <th className="py-2 pr-3">SPBU Requirement</th>
+                    <th className="py-2 pr-3">MT Tags</th>
+                    <th className="py-2 pr-3">Missing</th>
+                    <th className="py-2 pr-3">Result</th>
+                    <th className="py-2 pr-3">Reason</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {selectedAnalysis.details.map((detail) => (
+                    <tr key={detail.tag_type} className="border-b border-line align-top">
+                      <td className="py-3 pr-3 font-medium">
+                        <div>{detail.tag_type_name}</div>
+                        <div className="mt-1 text-xs font-normal text-slate-500">{detail.matching_rule.replace(/_/g, " ")}</div>
+                      </td>
+                      <td className="py-3 pr-3">
+                        {detail.tag_type === "VEHICLE_CLASS" ? (
+                          <span>Maximum {detail.spbu_required_tags[0] ?? "-"}</span>
+                        ) : renderTags(detail.spbu_required_tags)}
+                      </td>
+                      <td className="py-3 pr-3">{renderTags(detail.mt_available_tags)}</td>
+                      <td className="py-3 pr-3">{renderTags(detail.missing_tags, "missing")}</td>
+                      <td className="py-3 pr-3">
+                        <span className={`inline-flex border px-2 py-1 text-xs font-semibold ${statusClass(detail.result)}`}>{statusLabel(detail.result)}</span>
+                      </td>
+                      <td className="py-3 pr-3">
+                        <div>{detail.reason}</div>
+                        {detail.rule_expression && <div className="mt-1 text-xs text-slate-500">Rule: {detail.rule_expression}</div>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+        )}
+      </div>
+    </main>
+  );
+}
+
+export default App;

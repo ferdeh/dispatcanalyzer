@@ -1,0 +1,59 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(circle at left top, rgba(184, 210, 17, 0.08), transparent 22%),
+    radial-gradient(circle at right top, rgba(11, 115, 191, 0.06), transparent 26%),
+    linear-gradient(180deg, #fbfaf8 0%, #f6f4f0 48%, #fbfaf8 100%);
+  color: #15385b;
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button {
+  transition: border-color 160ms ease, background-color 160ms ease, color 160ms ease, box-shadow 160ms ease, transform 160ms ease;
+}
+
+input,
+select,
+textarea {
+  background-color: rgba(255, 255, 255, 0.92);
+  border-radius: 14px;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: #b8d211;
+  box-shadow: 0 0 0 3px rgba(184, 210, 17, 0.18);
+  outline: none;
+}
+
+::selection {
+  background: rgba(184, 210, 17, 0.32);
+  color: #15385b;
+}
+
+section.border.border-line.bg-white,
+div.border.border-line.bg-white.p-4,
+div.border.border-line.bg-white.p-5 {
+  border-color: rgba(11, 115, 191, 0.12);
+  border-radius: 24px;
+  background: rgba(255, 255, 255, 0.95);
+  box-shadow: 0 18px 40px rgba(21, 56, 91, 0.08);
+}

@@ -1,0 +1,12 @@
+.git
+.DS_Store
+.env
+.venv/
+.venv-*/
+**/__pycache__/
+**/.pytest_cache/
+**/*.pyc
+apps/web/node_modules/
+apps/web/dist/
+apps/web/.vite/
+example data/~$*.xlsx
