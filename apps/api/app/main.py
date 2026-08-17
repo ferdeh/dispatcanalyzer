@@ -608,8 +608,11 @@ def depot_departure_intelligence(
     search: str | None = None,
     sort_column: str = "observation_count",
     sort_direction: str = "desc",
+    confidence_level: str | None = None,
+    spbu_ids: str | None = None,
     db: Session = Depends(get_db),
 ) -> dict:
+    parsed_spbu_ids = [item.strip() for item in spbu_ids.split(",") if item.strip()] if spbu_ids is not None else None
     return build_departure_intelligence_payload(
         db,
         depot_id=depot_id,
@@ -621,6 +624,8 @@ def depot_departure_intelligence(
         search=search,
         sort_column=sort_column,
         sort_direction=sort_direction,
+        confidence_level=confidence_level,
+        spbu_ids=parsed_spbu_ids,
     )
 
 

@@ -48,6 +48,8 @@ def build_departure_intelligence_payload(
     search: str | None = None,
     sort_column: str = "observation_count",
     sort_direction: str = "desc",
+    confidence_level: str | None = None,
+    spbu_ids: list[str] | None = None,
 ) -> dict:
     if bucket_minutes not in {30, 60}:
         raise HTTPException(status_code=400, detail="bucket_minutes must be 30 or 60.")
@@ -63,7 +65,8 @@ def build_departure_intelligence_payload(
     observations = build_observations(raw_rows, gps_lookup, quantity_lookup)
     valid_observations = [row for row in observations if row["departure_datetime_used"]]
 
-    profiles = sort_profiles(build_profiles(valid_observations, bucket_minutes), sort_column, sort_direction)
+    all_profiles = sort_profiles(build_profiles(valid_observations, bucket_minutes), sort_column, sort_direction)
+    profiles = filter_departure_profiles(all_profiles, confidence_level, spbu_ids)
     total = len(profiles)
     visible_profiles = profiles[offset : offset + limit]
 
@@ -80,8 +83,10 @@ def build_departure_intelligence_payload(
             "search": search or "",
             "sort_column": sort_column,
             "sort_direction": "desc" if sort_direction == "desc" else "asc",
+            "confidence_level": confidence_level or "ALL",
+            "spbu_ids": spbu_ids or [],
         },
-        "summary": build_summary(observations, valid_observations, profiles),
+        "summary": build_summary(observations, valid_observations, all_profiles),
         "distribution": build_distribution(valid_observations, bucket_minutes),
         "weekday_heatmap": build_weekday_heatmap(valid_observations, bucket_minutes),
         "box_plot": build_box_plot(visible_profiles),
@@ -441,6 +446,17 @@ def sort_profiles(profiles: list[dict], sort_column: str, sort_direction: str) -
     key_fn = sort_keys.get(sort_column, sort_keys["observation_count"])
     reverse = sort_direction == "desc"
     return sorted(profiles, key=lambda item: (key_fn(item), item.get("spbu_code") or item.get("spbu_id") or ""), reverse=reverse)
+
+
+def filter_departure_profiles(profiles: list[dict], confidence_level: str | None, spbu_ids: list[str] | None) -> list[dict]:
+    filtered = profiles
+    if confidence_level and confidence_level.upper() in {"HIGH", "MEDIUM", "LOW"}:
+        target_level = confidence_level.upper()
+        filtered = [profile for profile in filtered if profile.get("confidence_level") == target_level]
+    if spbu_ids is not None:
+        allowed_spbu_ids = {spbu_id for spbu_id in spbu_ids if spbu_id}
+        filtered = [profile for profile in filtered if profile.get("spbu_id") in allowed_spbu_ids]
+    return filtered
 
 
 def validate_shift_config(shifts: list[dict]) -> list[dict]:

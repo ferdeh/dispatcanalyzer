@@ -316,7 +316,12 @@ type ShiftAnalysis = {
   heatmap: { x_axis: string[]; y_axis: string[]; data: number[][] };
   notes: string[];
 };
-type ShiftSortColumn = "spbu_code" | "primary_shift_share" | "p50" | "confidence_score" | "observation_count";
+type DepartureConfidenceFilter = "ALL" | "HIGH" | "MEDIUM" | "LOW";
+type ShiftSummaryFilter = "ALL" | `SHIFT:${string}` | `STATUS:${"AMBIGUOUS" | "INSUFFICIENT_DATA"}`;
+type DepartureProfileFilterOptions = {
+  confidenceLevel?: DepartureConfidenceFilter;
+  shiftSummaryFilter?: ShiftSummaryFilter;
+};
 
 const kpiLabels: Record<string, string> = {
   total_mt: "Total MT",
@@ -665,6 +670,19 @@ function shiftPalette(index: number): string {
   return ["#2f7d6d", "#b87516", "#475569", "#7c3aed", "#0f766e", "#be123c", "#2563eb", "#a16207"][index % 8];
 }
 
+const assignmentStatusBoxPlotColors: Record<string, string> = {
+  CLEAR: "#2f7d6d",
+  MODERATE: "#b87516",
+  AMBIGUOUS: "#64748b",
+  INSUFFICIENT_DATA: "#b64a35"
+};
+
+const confidenceBoxPlotColors: Record<string, string> = {
+  HIGH: "#2f7d6d",
+  MEDIUM: "#b87516",
+  LOW: "#b64a35"
+};
+
 function renderTags(values: string[], variant: "default" | "missing" = "default") {
   if (!values.length) return <span className="text-slate-400">-</span>;
   return (
@@ -925,11 +943,8 @@ function App() {
   const [shiftAnalysis, setShiftAnalysis] = useState<ShiftAnalysis | null>(null);
   const [shiftLoading, setShiftLoading] = useState(false);
   const [shiftHelpOpen, setShiftHelpOpen] = useState(false);
-  const [shiftSearch, setShiftSearch] = useState("");
-  const [shiftFilter, setShiftFilter] = useState("ALL");
-  const [shiftStatusFilter, setShiftStatusFilter] = useState("ALL");
-  const [shiftSortColumn, setShiftSortColumn] = useState<ShiftSortColumn>("primary_shift_share");
-  const [shiftSortDirection, setShiftSortDirection] = useState<CrudSortDirection>("desc");
+  const [departureConfidenceFilter, setDepartureConfidenceFilter] = useState<DepartureConfidenceFilter>("ALL");
+  const [shiftSummaryFilter, setShiftSummaryFilter] = useState<ShiftSummaryFilter>("ALL");
   const [boxPlotHighlightBy, setBoxPlotHighlightBy] = useState<"NONE" | "PRIMARY_SHIFT" | "ASSIGNMENT_STATUS" | "CONFIDENCE">("NONE");
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -1012,11 +1027,34 @@ function App() {
     }
   }
 
-  async function fetchDepartureAnalysis(nextOffset = departureOffset, filters = departureFilters) {
+  function spbuIdsForShiftSummaryFilter(filter: ShiftSummaryFilter, analysis = shiftAnalysis): string[] | null {
+    if (filter === "ALL") return null;
+    if (!analysis) return [];
+    if (filter.startsWith("SHIFT:")) {
+      const shiftId = filter.replace("SHIFT:", "");
+      return analysis.rows.filter((row) => row.primary_shift_id === shiftId).map((row) => row.spbu_id);
+    }
+    if (filter === "STATUS:AMBIGUOUS") {
+      return analysis.rows.filter((row) => row.assignment_status === "AMBIGUOUS").map((row) => row.spbu_id);
+    }
+    if (filter === "STATUS:INSUFFICIENT_DATA") {
+      return analysis.rows.filter((row) => row.assignment_status === "INSUFFICIENT_DATA").map((row) => row.spbu_id);
+    }
+    return null;
+  }
+
+  async function fetchDepartureAnalysis(
+    nextOffset = departureOffset,
+    filters = departureFilters,
+    profileFilters: DepartureProfileFilterOptions = {}
+  ): Promise<DepartureAnalysis | null> {
     if (!filters.depotId || !filters.startDate || !filters.endDate) {
       setError("Select a depot, start date, and end date before running Phase 2.");
-      return;
+      return null;
     }
+    const effectiveConfidenceFilter = profileFilters.confidenceLevel ?? departureConfidenceFilter;
+    const effectiveShiftSummaryFilter = profileFilters.shiftSummaryFilter ?? shiftSummaryFilter;
+    const filteredSpbuIds = spbuIdsForShiftSummaryFilter(effectiveShiftSummaryFilter);
     const requestId = departureRequestRef.current + 1;
     departureRequestRef.current = requestId;
     setDepartureLoading(true);
@@ -1033,16 +1071,20 @@ function App() {
         sort_direction: departureSortDirection
       });
       if (filters.search.trim()) params.set("search", filters.search.trim());
+      if (effectiveConfidenceFilter !== "ALL") params.set("confidence_level", effectiveConfidenceFilter);
+      if (filteredSpbuIds !== null) params.set("spbu_ids", filteredSpbuIds.length > 0 ? filteredSpbuIds.join(",") : "__NO_MATCH__");
       const payload = await apiGet<DepartureAnalysis>(`/api/v1/departure-intelligence/analysis?${params.toString()}`);
       if (departureRequestRef.current === requestId) {
         setDepartureAnalysis(payload);
         setAppliedDepartureFilters(filters);
         setSelectedDepartureSpbuId(payload.profiles[0]?.spbu_id ?? null);
       }
+      return payload;
     } catch (err) {
       if (departureRequestRef.current === requestId) {
         setError(err instanceof Error ? err.message : "Failed to load departure intelligence");
       }
+      return null;
     } finally {
       if (departureRequestRef.current === requestId) {
         setDepartureLoading(false);
@@ -1067,11 +1109,8 @@ function App() {
     }
   }
 
-  async function fetchShiftAnalysis() {
-    if (!appliedDepartureFilters) {
-      setError("Run the main Phase 2 Apply first, then apply shift analysis.");
-      return;
-    }
+  async function fetchShiftAnalysis(filters = appliedDepartureFilters) {
+    if (!filters) return;
     const validationErrors = validateOperationalShifts(shiftConfigs);
     if (validationErrors.length > 0) {
       setError(validationErrors[0]);
@@ -1081,13 +1120,13 @@ function App() {
     setError(null);
     try {
       const payload = await apiSend<ShiftAnalysis>("/api/v1/departure-intelligence/shift-analysis", "POST", {
-        depot_id: appliedDepartureFilters.depotId,
-        start_date: appliedDepartureFilters.startDate,
-        end_date: appliedDepartureFilters.endDate,
-        bucket_minutes: Number(appliedDepartureFilters.bucketMinutes),
+        depot_id: filters.depotId,
+        start_date: filters.startDate,
+        end_date: filters.endDate,
+        bucket_minutes: Number(filters.bucketMinutes),
         shifts: shiftConfigs,
         assignment_method: shiftMethod,
-        search: appliedDepartureFilters.search,
+        search: filters.search,
         sort_column: departureSortColumn,
         sort_direction: departureSortDirection
       });
@@ -1148,7 +1187,7 @@ function App() {
     if (currentPage === "departure-intelligence" && departureAnalysis && appliedDepartureFilters) {
       fetchDepartureAnalysis(departureOffset, appliedDepartureFilters);
     }
-  }, [currentPage, departureOffset, departureLimit, departureSortColumn, departureSortDirection]);
+  }, [currentPage, departureOffset, departureLimit, departureSortColumn, departureSortDirection, departureConfidenceFilter, shiftSummaryFilter, shiftAnalysis]);
 
   useEffect(() => {
     if (currentPage === "departure-intelligence") {
@@ -1220,53 +1259,55 @@ function App() {
     ? departureObservations.filter((row) => row.spbu_id === selectedDepartureProfile.spbu_id).slice(0, 20)
     : [];
   const shiftValidationErrors = useMemo(() => validateOperationalShifts(shiftConfigs), [shiftConfigs]);
+  const shiftRowBySpbuId = useMemo(() => new Map((shiftAnalysis?.rows ?? []).map((row) => [row.spbu_id, row])), [shiftAnalysis]);
+  const currentPageShiftRows = useMemo(
+    () => departureProfiles.map((profile) => shiftRowBySpbuId.get(profile.spbu_id)).filter((row): row is ShiftAssignmentRow => Boolean(row)),
+    [departureProfiles, shiftRowBySpbuId]
+  );
   const selectedShiftRow = shiftAnalysis?.rows.find((row) => row.spbu_id === selectedDepartureProfile?.spbu_id) ?? null;
-  const sortedShiftRows = useMemo(() => {
-    const keyMap: Record<ShiftSortColumn, (row: ShiftAssignmentRow) => string | number> = {
-      spbu_code: (row) => row.spbu_code,
-      primary_shift_share: (row) => row.primary_shift_share,
-      p50: (row) => row.median_departure_minutes,
-      confidence_score: (row) => row.confidence_score,
-      observation_count: (row) => row.observation_count
-    };
-    return [...(shiftAnalysis?.rows ?? [])]
-      .filter((row) => {
-        const matchesSearch = !shiftSearch.trim() || `${row.spbu_code} ${row.spbu_name ?? ""}`.toLowerCase().includes(shiftSearch.trim().toLowerCase());
-        const matchesShift = shiftFilter === "ALL" || row.primary_shift_id === shiftFilter;
-        const matchesStatus = shiftStatusFilter === "ALL" || row.assignment_status === shiftStatusFilter;
-        return matchesSearch && matchesShift && matchesStatus;
-      })
-      .sort((left, right) => {
-        const leftValue = keyMap[shiftSortColumn](left);
-        const rightValue = keyMap[shiftSortColumn](right);
-        const direction = shiftSortDirection === "asc" ? 1 : -1;
-        if (typeof leftValue === "number" && typeof rightValue === "number") return (leftValue - rightValue) * direction;
-        return String(leftValue).localeCompare(String(rightValue)) * direction;
-      });
-  }, [shiftAnalysis, shiftFilter, shiftSearch, shiftSortColumn, shiftSortDirection, shiftStatusFilter]);
   const shiftAffinityHeatmapOption = useMemo(() => {
-    if (!shiftAnalysis?.heatmap) return null;
-    const heatmap = shiftAnalysis.heatmap;
-    const rowLookup = new Map(shiftAnalysis.rows.map((row) => [row.spbu_code, row]));
+    if (!shiftAnalysis || currentPageShiftRows.length === 0) return null;
+    const xAxis = shiftAnalysis.shift_config.map((shift) => shift.name);
+    const yAxis = currentPageShiftRows.map((row) => row.spbu_code);
+    const data = currentPageShiftRows.flatMap((row, rowIndex) =>
+      row.shift_distribution.map((distribution, shiftIndex) => [shiftIndex, rowIndex, distribution.share_pct, distribution.observation_count, row.observation_count])
+    );
     return {
       tooltip: {
         position: "top",
         formatter: (params: { data: number[] }) => {
           const [shiftIndex, rowIndex, share, count, total] = params.data;
-          const spbu = heatmap.y_axis[rowIndex];
-          const shift = heatmap.x_axis[shiftIndex];
-          const name = rowLookup.get(spbu)?.spbu_name ?? "";
+          const row = currentPageShiftRows[rowIndex];
+          const spbu = yAxis[rowIndex];
+          const shift = xAxis[shiftIndex];
+          const name = row?.spbu_name ?? "";
           return `${spbu}${name ? ` - ${name}` : ""}<br />${shift}<br />${count} of ${total} historical observations<br />Shift Affinity = ${share}%`;
         }
       },
       grid: { top: 18, right: 24, bottom: 42, left: 104 },
-      xAxis: { type: "category", data: heatmap.x_axis, axisLabel: { interval: 0, rotate: 0 } },
-      yAxis: { type: "category", data: heatmap.y_axis, axisLabel: { interval: 0 } },
-      visualMap: { min: 0, max: 100, calculable: true, orient: "horizontal", left: "center", bottom: 0, inRange: { color: ["#f1f5f3", "#8fbdb4", "#2f7d6d"] } },
-      dataZoom: heatmap.y_axis.length > 30 ? [{ type: "slider", yAxisIndex: 0, right: 0, width: 14 }, { type: "inside" }] : undefined,
-      series: [{ type: "heatmap", data: heatmap.data, emphasis: { itemStyle: { shadowBlur: 6, shadowColor: "rgba(0,0,0,0.16)" } } }]
+      xAxis: { type: "category", data: xAxis, axisLabel: { interval: 0, rotate: 0 } },
+      yAxis: { type: "category", data: yAxis, axisLabel: { interval: 0 } },
+      visualMap: {
+        min: 0,
+        max: 100,
+        dimension: 2,
+        calculable: true,
+        orient: "horizontal",
+        left: "center",
+        bottom: 0,
+        inRange: { color: ["#f8fafc", "#dbeafe", "#60a5fa", "#2563eb", "#1e3a8a"] }
+      },
+      dataZoom: yAxis.length > 30 ? [{ type: "slider", yAxisIndex: 0, right: 0, width: 14 }, { type: "inside" }] : undefined,
+      series: [
+        {
+          type: "heatmap",
+          data,
+          itemStyle: { borderColor: "#ffffff", borderWidth: 1 },
+          emphasis: { itemStyle: { borderColor: "#0f172a", borderWidth: 1, shadowBlur: 6, shadowColor: "rgba(0,0,0,0.16)" } }
+        }
+      ]
     };
-  }, [shiftAnalysis]);
+  }, [currentPageShiftRows, shiftAnalysis]);
   const heatmapOption = useMemo(() => {
     const heatmap = departureAnalysis?.weekday_heatmap;
     if (!heatmap) return null;
@@ -1291,14 +1332,12 @@ function App() {
     const yMax = Math.max(1440, Math.ceil(Math.max(1440, ...flattenedValues) / 180) * 180);
     const shiftRowsBySpbu = new Map((shiftAnalysis?.rows ?? []).map((row) => [row.spbu_code, row]));
     const shiftColorById = new Map((shiftAnalysis?.shift_config ?? []).map((shift, index) => [shift.shift_id, shiftPalette(index)]));
-    const statusColors: Record<string, string> = { CLEAR: "#2f7d6d", MODERATE: "#b87516", AMBIGUOUS: "#64748b", INSUFFICIENT_DATA: "#b64a35" };
-    const confidenceColors: Record<string, string> = { HIGH: "#2f7d6d", MEDIUM: "#b87516", LOW: "#b64a35" };
     const data = boxPlot.data.map((value, index) => {
       const row = shiftRowsBySpbu.get(boxPlot.categories[index]);
       let borderColor = "#2f7d6d";
       if (row && boxPlotHighlightBy === "PRIMARY_SHIFT" && row.primary_shift_id) borderColor = shiftColorById.get(row.primary_shift_id) ?? borderColor;
-      if (row && boxPlotHighlightBy === "ASSIGNMENT_STATUS") borderColor = statusColors[row.assignment_status] ?? borderColor;
-      if (row && boxPlotHighlightBy === "CONFIDENCE") borderColor = confidenceColors[row.confidence_level] ?? borderColor;
+      if (row && boxPlotHighlightBy === "ASSIGNMENT_STATUS") borderColor = assignmentStatusBoxPlotColors[row.assignment_status] ?? borderColor;
+      if (row && boxPlotHighlightBy === "CONFIDENCE") borderColor = confidenceBoxPlotColors[row.confidence_level] ?? borderColor;
       return { value, itemStyle: { color: "#dfe9e6", borderColor } };
     });
     const boundaryData = (shiftAnalysis?.shift_config ?? [])
@@ -1331,6 +1370,27 @@ function App() {
       ]
     };
   }, [boxPlotHighlightBy, departureAnalysis, shiftAnalysis]);
+  const boxPlotLegendItems = useMemo(() => {
+    if (boxPlotHighlightBy === "PRIMARY_SHIFT") {
+      return (shiftAnalysis?.shift_config ?? []).map((shift, index) => ({ label: shift.name, color: shiftPalette(index) }));
+    }
+    if (boxPlotHighlightBy === "ASSIGNMENT_STATUS") {
+      return [
+        { label: "CLEAR", color: assignmentStatusBoxPlotColors.CLEAR },
+        { label: "MODERATE", color: assignmentStatusBoxPlotColors.MODERATE },
+        { label: "AMBIGUOUS", color: assignmentStatusBoxPlotColors.AMBIGUOUS },
+        { label: "INSUFFICIENT DATA", color: assignmentStatusBoxPlotColors.INSUFFICIENT_DATA }
+      ];
+    }
+    if (boxPlotHighlightBy === "CONFIDENCE") {
+      return [
+        { label: "HIGH", color: confidenceBoxPlotColors.HIGH },
+        { label: "MEDIUM", color: confidenceBoxPlotColors.MEDIUM },
+        { label: "LOW", color: confidenceBoxPlotColors.LOW }
+      ];
+    }
+    return [];
+  }, [boxPlotHighlightBy, shiftAnalysis]);
   const allSpbuMismatchRows = useMemo(
     () => sortedMismatchRows(tagSummary.top_spbu_mismatch, "spbu", spbuMismatchSortColumn, spbuMismatchSortDirection),
     [tagSummary.top_spbu_mismatch, spbuMismatchSortColumn, spbuMismatchSortDirection]
@@ -1594,15 +1654,43 @@ function App() {
     if (key === "depotId") {
       setDepartureDateAvailability(null);
       setShiftAnalysis(null);
+      setDepartureConfidenceFilter("ALL");
+      setShiftSummaryFilter("ALL");
       const saved = window.localStorage.getItem(`departure-shift-config:${value}`);
       setShiftConfigs(saved ? JSON.parse(saved) : defaultShiftConfig);
     }
   }
 
-  function applyDepartureFilters() {
+  async function applyDepartureFilters() {
+    const validationErrors = validateOperationalShifts(shiftConfigs);
+    if (validationErrors.length > 0) {
+      setError(validationErrors[0]);
+      return;
+    }
     setDepartureOffset(0);
     setShiftAnalysis(null);
-    fetchDepartureAnalysis(0, departureFilters);
+    setDepartureConfidenceFilter("ALL");
+    setShiftSummaryFilter("ALL");
+    const payload = await fetchDepartureAnalysis(0, departureFilters, { confidenceLevel: "ALL", shiftSummaryFilter: "ALL" });
+    if (payload) {
+      await fetchShiftAnalysis(departureFilters);
+    }
+  }
+
+  function toggleConfidenceProfileFilter(level: "HIGH" | "MEDIUM" | "LOW") {
+    setDepartureConfidenceFilter((current) => (current === level ? "ALL" : level));
+    setDepartureOffset(0);
+  }
+
+  function toggleShiftSummaryProfileFilter(filter: ShiftSummaryFilter) {
+    setShiftSummaryFilter((current) => (current === filter ? "ALL" : filter));
+    setDepartureOffset(0);
+  }
+
+  function clearDepartureProfileFilters() {
+    setDepartureConfidenceFilter("ALL");
+    setShiftSummaryFilter("ALL");
+    setDepartureOffset(0);
   }
 
   function handleDepartureSort(column: DepartureSortColumn) {
@@ -1648,11 +1736,6 @@ function App() {
     const saved = window.localStorage.getItem(`departure-shift-config:${departureFilters.depotId}`);
     setShiftConfigs(saved ? JSON.parse(saved) : defaultShiftConfig);
     setError(null);
-  }
-
-  function handleShiftSort(column: ShiftSortColumn) {
-    setShiftSortDirection((current) => (shiftSortColumn === column && current === "asc" ? "desc" : "asc"));
-    setShiftSortColumn(column);
   }
 
   function handleTagSort(column: string) {
@@ -1858,95 +1941,14 @@ function App() {
               placeholder="Search SPBU or shipment"
               title="Search SPBU or shipment"
             />
-            <button className="inline-flex items-center justify-center gap-2 bg-mint px-3 py-2 text-sm font-medium text-white disabled:opacity-60" onClick={applyDepartureFilters} disabled={departureLoading} title="Run depot departure time intelligence">
+            <button className="inline-flex items-center justify-center gap-2 bg-mint px-3 py-2 text-sm font-medium text-white disabled:opacity-60" onClick={applyDepartureFilters} disabled={departureLoading || shiftLoading} title="Run departure filters and operational shift analysis">
               <Search size={16} />
-              {departureLoading ? "Running" : "Apply"}
+              {departureLoading || shiftLoading ? "Running" : "Apply"}
             </button>
           </div>
         </section>
 
-        {!departureAnalysis && (
-          <section className="border border-line bg-white p-8 text-center">
-            <div className="mx-auto max-w-2xl text-sm text-slate-600">
-              Select a depot and analysis period, then click Apply to run Depot Departure Time Intelligence.
-            </div>
-          </section>
-        )}
-
-        {departureAnalysis && departureSummary && (
-        <>
-        <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-6">
-          {[
-            ["Observations", departureSummary.observation_count.toLocaleString()],
-            ["SPBU Profiles", departureSummary.profile_count.toLocaleString()],
-            ["Shipments", departureSummary.shipment_count.toLocaleString()],
-            ["Vehicles", departureSummary.vehicle_count.toLocaleString()],
-            ["Quantity", departureSummary.quantity_dispatched.toLocaleString()],
-            ["Missing Timestamps", departureSummary.missing_timestamp_count.toLocaleString()]
-          ].map(([label, value]) => (
-            <div key={label} className="border border-line bg-white p-4">
-              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">{label}</div>
-              <div className="mt-2 text-2xl font-semibold">{value}</div>
-            </div>
-          ))}
-        </section>
-
-        <section className="mt-5 grid gap-4 lg:grid-cols-3">
-          <div className="border border-line bg-white p-4">
-            <div className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-600">Source Data Quality</div>
-            <div className="grid gap-3 text-sm">
-              <div className="flex items-center justify-between border-b border-line pb-2"><span>GPS timestamp coverage</span><span className="font-semibold">{departureSummary.gps_timestamp_coverage_pct}%</span></div>
-              <div className="flex items-center justify-between border-b border-line pb-2"><span>LO gate-out coverage</span><span className="font-semibold">{departureSummary.lo_gate_out_coverage_pct}%</span></div>
-              <div className="flex items-center justify-between border-b border-line pb-2"><span>GPS observations</span><span className="font-semibold">{departureSummary.gps_observation_count.toLocaleString()}</span></div>
-              <div className="flex items-center justify-between border-b border-line pb-2"><span>LO gate-out observations</span><span className="font-semibold">{departureSummary.lo_gate_out_observation_count.toLocaleString()}</span></div>
-              <div className="flex items-center justify-between"><span>Avg GPS vs LO difference</span><span className="font-semibold">{departureSummary.avg_gps_vs_lo_difference_minutes ?? "-"} min</span></div>
-            </div>
-          </div>
-          <div className="border border-line bg-white p-4 lg:col-span-2">
-            <div className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-600">Confidence Mix</div>
-            <div className="grid gap-3 sm:grid-cols-3">
-              {[
-                ["High", departureSummary.high_confidence_profiles, "HIGH"],
-                ["Medium", departureSummary.medium_confidence_profiles, "MEDIUM"],
-                ["Low", departureSummary.low_confidence_profiles, "LOW"]
-              ].map(([label, value, level]) => (
-                <div key={label} className={`border p-4 ${confidenceClass(String(level))}`}>
-                  <div className="text-xs font-semibold uppercase tracking-wide">{label}</div>
-                  <div className="mt-2 text-3xl font-semibold">{Number(value).toLocaleString()}</div>
-                </div>
-              ))}
-            </div>
-            <div className="mt-4 text-xs text-slate-500">Algorithm: {departureAnalysis.algorithm_version}. Peak departure time is the midpoint of the busiest bucket.</div>
-          </div>
-        </section>
-
-        <section className="mt-5 grid gap-4 lg:grid-cols-2">
-          <ChartPanel title="24-Hour Departure Distribution" data={departureAnalysis.distribution} />
-          <section className="min-h-[320px] border border-line bg-white p-4">
-            <div className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-600">Weekday Departure Heatmap</div>
-            {heatmapOption ? <ReactECharts option={heatmapOption} style={{ height: 260 }} /> : <div className="py-20 text-center text-sm text-slate-500">No heatmap data.</div>}
-          </section>
-          <section className="min-h-[360px] border border-line bg-white p-4 lg:col-span-2">
-            <div className="mb-3 flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
-              <div>
-                <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">SPBU Departure Time Box Plot - Current Table Page</div>
-                <div className="mt-1 text-xs text-slate-500">Circular-time scale: labels with +1d are early-morning departures visually shifted after midnight to avoid false 24-hour spread.</div>
-              </div>
-              <label className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
-                Group / Highlight By
-                <select className="border border-line bg-white px-2 py-1 text-xs normal-case tracking-normal" value={boxPlotHighlightBy} onChange={(event) => setBoxPlotHighlightBy(event.target.value as typeof boxPlotHighlightBy)}>
-                  <option value="NONE">None</option>
-                  <option value="PRIMARY_SHIFT">Primary Historical Shift</option>
-                  <option value="ASSIGNMENT_STATUS">Assignment Status</option>
-                  <option value="CONFIDENCE">Confidence</option>
-                </select>
-              </label>
-            </div>
-            {boxPlotOption ? <ReactECharts option={boxPlotOption} style={{ height: 300 }} /> : <div className="py-20 text-center text-sm text-slate-500">No box plot data.</div>}
-          </section>
-        </section>
-
-        <section className="mt-5 border border-line bg-white p-4">
+        <section className="mb-5 border border-line bg-white p-4">
           <div className="mb-4 flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
             <div>
               <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Operational Shift Configuration</div>
@@ -1995,18 +1997,118 @@ function App() {
                 <option value="MEDIAN_BASED">Median-Based</option>
                 <option value="HYBRID_CONFIDENCE_AWARE">Hybrid / Confidence-Aware</option>
               </select>
-              <button
-                className="mt-3 inline-flex w-full items-center justify-center gap-2 bg-mint px-3 py-2 text-sm font-medium text-white disabled:opacity-60"
-                onClick={fetchShiftAnalysis}
-                disabled={shiftLoading || shiftValidationErrors.length > 0 || !departureAnalysis}
-                title="Apply operational shift analysis"
-              >
-                <Search size={15} />
-                {shiftLoading ? "Running" : "Apply Shift Analysis"}
-              </button>
-              <div className="mt-3 text-xs text-slate-500">Input changes are held until Apply Shift Analysis is clicked. This analysis does not prescribe future dispatch schedules.</div>
+              <div className="mt-3 border border-line bg-slate-50 px-3 py-2 text-xs text-slate-500">
+                The main Apply button runs both departure filters and shift analysis. This analysis does not prescribe future dispatch schedules.
+              </div>
             </div>
           </div>
+        </section>
+
+        {!departureAnalysis && (
+          <section className="border border-line bg-white p-8 text-center">
+            <div className="mx-auto max-w-2xl text-sm text-slate-600">
+              Select a depot and analysis period, then click Apply to run Depot Departure Time Intelligence.
+            </div>
+          </section>
+        )}
+
+        {departureAnalysis && departureSummary && (
+        <>
+        <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-6">
+          {[
+            ["Observations", departureSummary.observation_count.toLocaleString()],
+            ["SPBU Profiles", departureSummary.profile_count.toLocaleString()],
+            ["Shipments", departureSummary.shipment_count.toLocaleString()],
+            ["Vehicles", departureSummary.vehicle_count.toLocaleString()],
+            ["Quantity", departureSummary.quantity_dispatched.toLocaleString()],
+            ["Missing Timestamps", departureSummary.missing_timestamp_count.toLocaleString()]
+          ].map(([label, value]) => (
+            <div key={label} className="border border-line bg-white p-4">
+              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">{label}</div>
+              <div className="mt-2 text-2xl font-semibold">{value}</div>
+            </div>
+          ))}
+        </section>
+
+        <section className="mt-5 grid gap-4 lg:grid-cols-3">
+          <div className="border border-line bg-white p-4">
+            <div className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-600">Source Data Quality</div>
+            <div className="grid gap-3 text-sm">
+              <div className="flex items-center justify-between border-b border-line pb-2"><span>GPS timestamp coverage</span><span className="font-semibold">{departureSummary.gps_timestamp_coverage_pct}%</span></div>
+              <div className="flex items-center justify-between border-b border-line pb-2"><span>LO gate-out coverage</span><span className="font-semibold">{departureSummary.lo_gate_out_coverage_pct}%</span></div>
+              <div className="flex items-center justify-between border-b border-line pb-2"><span>GPS observations</span><span className="font-semibold">{departureSummary.gps_observation_count.toLocaleString()}</span></div>
+              <div className="flex items-center justify-between border-b border-line pb-2"><span>LO gate-out observations</span><span className="font-semibold">{departureSummary.lo_gate_out_observation_count.toLocaleString()}</span></div>
+              <div className="flex items-center justify-between"><span>Avg GPS vs LO difference</span><span className="font-semibold">{departureSummary.avg_gps_vs_lo_difference_minutes ?? "-"} min</span></div>
+            </div>
+          </div>
+          <div className="border border-line bg-white p-4 lg:col-span-2">
+            <div className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-600">Confidence Mix</div>
+            <div className="grid gap-3 sm:grid-cols-3">
+              {[
+                ["High", departureSummary.high_confidence_profiles, "HIGH"],
+                ["Medium", departureSummary.medium_confidence_profiles, "MEDIUM"],
+                ["Low", departureSummary.low_confidence_profiles, "LOW"]
+              ].map(([label, value, level]) => {
+                const confidenceLevel = String(level) as "HIGH" | "MEDIUM" | "LOW";
+                const isActive = departureConfidenceFilter === confidenceLevel;
+                return (
+                  <button
+                    key={label}
+                    type="button"
+                    className={`border p-4 text-left transition hover:shadow-sm ${confidenceClass(confidenceLevel)} ${isActive ? "ring-2 ring-petroblue ring-offset-2" : ""}`}
+                    onClick={() => toggleConfidenceProfileFilter(confidenceLevel)}
+                    title={`Filter profiles by ${label} confidence`}
+                    aria-pressed={isActive}
+                  >
+                    <div className="text-xs font-semibold uppercase tracking-wide">{label}</div>
+                    <div className="mt-2 text-3xl font-semibold">{Number(value).toLocaleString()}</div>
+                  </button>
+                );
+              })}
+            </div>
+            <div className="mt-4 text-xs text-slate-500">
+              Algorithm: {departureAnalysis.algorithm_version}. Peak departure time is the midpoint of the busiest bucket.
+              {departureConfidenceFilter !== "ALL" ? ` Active confidence filter: ${departureConfidenceFilter}.` : ""}
+            </div>
+          </div>
+        </section>
+
+        <section className="mt-5 grid gap-4 lg:grid-cols-2">
+          <ChartPanel title="24-Hour Departure Distribution" data={departureAnalysis.distribution} />
+          <section className="min-h-[320px] border border-line bg-white p-4">
+            <div className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-600">Weekday Departure Heatmap</div>
+            {heatmapOption ? <ReactECharts option={heatmapOption} style={{ height: 260 }} /> : <div className="py-20 text-center text-sm text-slate-500">No heatmap data.</div>}
+          </section>
+          <section className="min-h-[360px] border border-line bg-white p-4 lg:col-span-2">
+            <div className="mb-3 flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
+              <div>
+                <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">SPBU Departure Time Box Plot - Current Table Page</div>
+                <div className="mt-1 text-xs text-slate-500">Circular-time scale: labels with +1d are early-morning departures visually shifted after midnight to avoid false 24-hour spread.</div>
+              </div>
+              <label className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                Group / Highlight By
+                <select className="border border-line bg-white px-2 py-1 text-xs normal-case tracking-normal" value={boxPlotHighlightBy} onChange={(event) => setBoxPlotHighlightBy(event.target.value as typeof boxPlotHighlightBy)}>
+                  <option value="NONE">None</option>
+                  <option value="PRIMARY_SHIFT">Primary Historical Shift</option>
+                  <option value="ASSIGNMENT_STATUS">Assignment Status</option>
+                  <option value="CONFIDENCE">Confidence</option>
+                </select>
+              </label>
+            </div>
+            {boxPlotLegendItems.length > 0 && (
+              <div className="mb-3 flex flex-wrap items-center gap-3 border border-line bg-slate-50 px-3 py-2 text-xs text-slate-600">
+                <span className="font-semibold uppercase tracking-wide text-slate-500">Legend</span>
+                {boxPlotLegendItems.map((item) => (
+                  <span key={item.label} className="inline-flex items-center gap-2">
+                    <span className="inline-block h-3 w-5 border-2 bg-[#dfe9e6]" style={{ borderColor: item.color }} />
+                    <span>{item.label}</span>
+                  </span>
+                ))}
+                <span className="text-slate-400">Color applies to box border; fill remains unchanged.</span>
+              </div>
+            )}
+            {boxPlotOption ? <ReactECharts option={boxPlotOption} style={{ height: 300 }} /> : <div className="py-20 text-center text-sm text-slate-500">No box plot data.</div>}
+          </section>
         </section>
 
         {shiftAnalysis && (
@@ -2014,108 +2116,51 @@ function App() {
             <section className="mt-5 border border-line bg-white p-4">
               <div className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-600">Operational Shift Summary</div>
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6">
-                {shiftAnalysis.summary.assigned_by_shift.map((item, index) => (
-                  <div key={item.shift_id} className="border border-line p-3">
-                    <div className="text-xs font-semibold uppercase tracking-wide" style={{ color: shiftPalette(index) }}>{item.shift_name}</div>
-                    <div className="mt-2 text-2xl font-semibold">{item.spbu_count.toLocaleString()} SPBU</div>
-                  </div>
-                ))}
-                {(["AMBIGUOUS", "INSUFFICIENT_DATA"] as const).map((status) => (
-                  <div key={status} className={`border p-3 ${shiftStatusClass(status)}`}>
-                    <div className="text-xs font-semibold uppercase tracking-wide">{status.replace(/_/g, " ")}</div>
-                    <div className="mt-2 text-2xl font-semibold">{shiftAnalysis.summary.status_counts[status].toLocaleString()} SPBU</div>
-                  </div>
-                ))}
+                {shiftAnalysis.summary.assigned_by_shift.map((item, index) => {
+                  const filter = `SHIFT:${item.shift_id}` as ShiftSummaryFilter;
+                  const isActive = shiftSummaryFilter === filter;
+                  return (
+                    <button
+                      key={item.shift_id}
+                      type="button"
+                      className={`border border-line p-3 text-left transition hover:shadow-sm ${isActive ? "ring-2 ring-petroblue ring-offset-2" : ""}`}
+                      onClick={() => toggleShiftSummaryProfileFilter(filter)}
+                      title={`Filter profiles by ${item.shift_name}`}
+                      aria-pressed={isActive}
+                    >
+                      <div className="text-xs font-semibold uppercase tracking-wide" style={{ color: shiftPalette(index) }}>{item.shift_name}</div>
+                      <div className="mt-2 text-2xl font-semibold">{item.spbu_count.toLocaleString()} SPBU</div>
+                    </button>
+                  );
+                })}
+                {(["AMBIGUOUS", "INSUFFICIENT_DATA"] as const).map((status) => {
+                  const filter = `STATUS:${status}` as ShiftSummaryFilter;
+                  const isActive = shiftSummaryFilter === filter;
+                  return (
+                    <button
+                      key={status}
+                      type="button"
+                      className={`border p-3 text-left transition hover:shadow-sm ${shiftStatusClass(status)} ${isActive ? "ring-2 ring-petroblue ring-offset-2" : ""}`}
+                      onClick={() => toggleShiftSummaryProfileFilter(filter)}
+                      title={`Filter profiles by ${status.replace(/_/g, " ")}`}
+                      aria-pressed={isActive}
+                    >
+                      <div className="text-xs font-semibold uppercase tracking-wide">{status.replace(/_/g, " ")}</div>
+                      <div className="mt-2 text-2xl font-semibold">{shiftAnalysis.summary.status_counts[status].toLocaleString()} SPBU</div>
+                    </button>
+                  );
+                })}
               </div>
-              <div className="mt-3 text-xs text-slate-500">Method: {shiftAnalysis.assignment_method_label}. Algorithm: {shiftAnalysis.algorithm_version}.</div>
+              <div className="mt-3 text-xs text-slate-500">
+                Method: {shiftAnalysis.assignment_method_label}. Algorithm: {shiftAnalysis.algorithm_version}.
+                {shiftSummaryFilter !== "ALL" ? " Active shift summary filter applied." : ""}
+              </div>
             </section>
 
             <section className="mt-5 min-h-[360px] border border-line bg-white p-4">
               <div className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-600">SPBU Shift Affinity Heatmap</div>
+              <div className="mb-3 text-xs text-slate-500">Rows are current-page SPBU and columns are configured shifts. Darker cells mean a larger share of historical departures occurred in that shift.</div>
               {shiftAffinityHeatmapOption ? <ReactECharts option={shiftAffinityHeatmapOption} style={{ height: 360 }} /> : <div className="py-20 text-center text-sm text-slate-500">No shift affinity data.</div>}
-            </section>
-
-            <section className="mt-5 border border-line bg-white p-4">
-              <div className="mb-3 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-                <div>
-                  <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">SPBU Shift Assignment Table</div>
-                  <div className="mt-1 text-xs text-slate-500">Raw shift percentages are preserved regardless of assignment method.</div>
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  <input className="border border-line px-3 py-2 text-sm" value={shiftSearch} onChange={(event) => setShiftSearch(event.target.value)} placeholder="Search SPBU" title="Search SPBU" />
-                  <select className="border border-line bg-white px-3 py-2 text-sm" value={shiftFilter} onChange={(event) => setShiftFilter(event.target.value)} title="Filter by primary shift">
-                    <option value="ALL">All shifts</option>
-                    {shiftAnalysis.shift_config.map((shift) => <option key={shift.shift_id} value={shift.shift_id}>{shift.name}</option>)}
-                  </select>
-                  <select className="border border-line bg-white px-3 py-2 text-sm" value={shiftStatusFilter} onChange={(event) => setShiftStatusFilter(event.target.value)} title="Filter by assignment status">
-                    <option value="ALL">All statuses</option>
-                    <option value="CLEAR">Clear</option>
-                    <option value="MODERATE">Moderate</option>
-                    <option value="AMBIGUOUS">Ambiguous</option>
-                    <option value="INSUFFICIENT_DATA">Insufficient Data</option>
-                  </select>
-                </div>
-              </div>
-              <div className="overflow-x-auto border border-line">
-                <table className="w-full border-collapse text-sm">
-                  <thead>
-                    <tr className="border-b border-line bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
-                      {[
-                        ["spbu_code", "SPBU"],
-                        ["primary_shift_share", "Primary Shift"],
-                        ["p50", "Median"],
-                        ["observation_count", "Observations"],
-                        ["confidence_score", "Confidence"]
-                      ].map(([column, label]) => {
-                        const active = shiftSortColumn === column;
-                        return (
-                          <th key={column} className="whitespace-nowrap px-3 py-2">
-                            <button className="inline-flex items-center gap-1 uppercase tracking-wide hover:text-slate-900" onClick={() => handleShiftSort(column as ShiftSortColumn)} title={`Sort by ${label}`}>
-                              {label}
-                              {active ? (shiftSortDirection === "asc" ? <ArrowUp size={14} /> : <ArrowDown size={14} />) : <ArrowUpDown size={14} className="text-slate-300" />}
-                            </button>
-                          </th>
-                        );
-                      })}
-                      <th className="whitespace-nowrap px-3 py-2">Secondary</th>
-                      <th className="whitespace-nowrap px-3 py-2">Gap</th>
-                      <th className="whitespace-nowrap px-3 py-2">Preferred Window</th>
-                      <th className="whitespace-nowrap px-3 py-2">Affinity</th>
-                      <th className="whitespace-nowrap px-3 py-2">Status</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {sortedShiftRows.map((row) => (
-                      <tr key={row.spbu_id} className="cursor-pointer border-b border-line hover:bg-mint/5" onClick={() => setSelectedDepartureSpbuId(row.spbu_id)}>
-                        <td className="whitespace-nowrap px-3 py-2">
-                          <div className="font-medium">{row.spbu_code}</div>
-                          <div className="text-xs text-slate-500">{row.spbu_name ?? "-"}</div>
-                        </td>
-                        <td className="whitespace-nowrap px-3 py-2 font-semibold" title={row.primary_shift_score !== null ? `Assignment score ${row.primary_shift_score}` : undefined}>
-                          {row.primary_shift_name ?? "-"} <span className="text-xs text-slate-500">{row.primary_shift_share}%</span>
-                        </td>
-                        <td className="whitespace-nowrap px-3 py-2">{row.median_departure}</td>
-                        <td className="whitespace-nowrap px-3 py-2">{row.observation_count.toLocaleString()}</td>
-                        <td className="px-3 py-2"><span className={`inline-flex border px-2 py-1 text-xs font-semibold ${confidenceClass(row.confidence_level)}`}>{row.confidence_level} {row.confidence_score}</span></td>
-                        <td className="whitespace-nowrap px-3 py-2">{row.secondary_shift_name ?? "-"} <span className="text-xs text-slate-500">{row.secondary_shift_share}%</span></td>
-                        <td className="whitespace-nowrap px-3 py-2">{row.primary_secondary_gap}%</td>
-                        <td className="whitespace-nowrap px-3 py-2">{row.preferred_historical_departure_window}</td>
-                        <td className="min-w-[220px] px-3 py-2">
-                          <div className="flex flex-wrap gap-1">
-                            {row.shift_distribution.map((item, index) => (
-                              <span key={item.shift_id} className="border px-2 py-1 text-xs" style={{ borderColor: shiftPalette(index), color: shiftPalette(index) }} title={`${item.observation_count} of ${row.observation_count} observations${item.score !== null ? `, score ${item.score}` : ""}`}>
-                                {item.shift_name} {item.share_pct}%
-                              </span>
-                            ))}
-                          </div>
-                        </td>
-                        <td className="px-3 py-2"><span className={`inline-flex border px-2 py-1 text-xs font-semibold ${shiftStatusClass(row.assignment_status)}`}>{row.assignment_status.replace(/_/g, " ")}</span></td>
-                      </tr>
-                    ))}
-                    {sortedShiftRows.length === 0 && <tr><td className="px-3 py-8 text-center text-sm text-slate-500" colSpan={10}>No shift assignments match the filters.</td></tr>}
-                  </tbody>
-                </table>
-              </div>
             </section>
           </>
         )}
@@ -2124,14 +2169,23 @@ function App() {
           <div className="mb-3 flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
             <div>
               <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">SPBU Departure Profiles</div>
-              <div className="mt-1 text-xs text-slate-500">Showing {departureShowingStart}-{departureShowingEnd} of {departureTotal.toLocaleString()} profiles</div>
+              <div className="mt-1 text-xs text-slate-500">
+                Showing {departureShowingStart}-{departureShowingEnd} of {departureTotal.toLocaleString()} profiles
+                {departureConfidenceFilter !== "ALL" ? ` | Confidence: ${departureConfidenceFilter}` : ""}
+                {shiftSummaryFilter !== "ALL" ? " | Shift summary filter active" : ""}
+              </div>
             </div>
-            <select className="border border-line bg-white px-3 py-2 text-sm" value={departureLimit} onChange={(event) => { setDepartureOffset(0); setDepartureLimit(Number(event.target.value)); }} title="Rows per page">
-              <option value={10}>10 rows</option>
-              <option value={25}>25 rows</option>
-              <option value={50}>50 rows</option>
-              <option value={100}>100 rows</option>
-            </select>
+            <div className="flex flex-wrap gap-2">
+              {(departureConfidenceFilter !== "ALL" || shiftSummaryFilter !== "ALL") && (
+                <button className="border border-line px-3 py-2 text-sm" onClick={clearDepartureProfileFilters} title="Clear profile filters">Clear Filters</button>
+              )}
+              <select className="border border-line bg-white px-3 py-2 text-sm" value={departureLimit} onChange={(event) => { setDepartureOffset(0); setDepartureLimit(Number(event.target.value)); }} title="Rows per page">
+                <option value={10}>10 rows</option>
+                <option value={25}>25 rows</option>
+                <option value={50}>50 rows</option>
+                <option value={100}>100 rows</option>
+              </select>
+            </div>
           </div>
           <div className="overflow-x-auto border border-line">
             <table className="w-full border-collapse text-sm">
@@ -2168,34 +2222,65 @@ function App() {
                       </th>
                     );
                   })}
+                  <th className="whitespace-nowrap px-3 py-2">Primary Shift</th>
+                  <th className="whitespace-nowrap px-3 py-2">Secondary Shift</th>
+                  <th className="whitespace-nowrap px-3 py-2">Shift Gap</th>
+                  <th className="whitespace-nowrap px-3 py-2">Shift Affinity</th>
+                  <th className="whitespace-nowrap px-3 py-2">Shift Status</th>
                 </tr>
               </thead>
               <tbody>
-                {departureProfiles.map((profile) => (
-                  <tr
-                    key={profile.spbu_id}
-                    className={`cursor-pointer border-b border-line ${selectedDepartureProfile?.spbu_id === profile.spbu_id ? "bg-mint/10" : ""}`}
-                    onClick={() => setSelectedDepartureSpbuId(profile.spbu_id)}
-                  >
-                    <td className="whitespace-nowrap px-3 py-2">
-                      <div className="font-medium">{profile.spbu_code}</div>
-                      <div className="text-xs text-slate-500">{profile.spbu_name ?? "-"}</div>
-                    </td>
-                    <td className="whitespace-nowrap px-3 py-2 font-semibold">{profile.preferred_historical_departure_window}</td>
-                    <td className="whitespace-nowrap px-3 py-2">{profile.peak_departure_time} <span className="text-xs text-slate-500">({profile.peak_departure_bucket})</span></td>
-                    <td className="whitespace-nowrap px-3 py-2">{profile.p50}</td>
-                    <td className="whitespace-nowrap px-3 py-2">{profile.p80}</td>
-                    <td className="whitespace-nowrap px-3 py-2">{profile.p90}</td>
-                    <td className="whitespace-nowrap px-3 py-2">{profile.p95}</td>
-                    <td className="whitespace-nowrap px-3 py-2">{profile.observation_count.toLocaleString()}</td>
-                    <td className="whitespace-nowrap px-3 py-2">{profile.dispersion_minutes_iqr.toLocaleString()} min</td>
-                    <td className="px-3 py-2">
-                      <span className={`inline-flex border px-2 py-1 text-xs font-semibold ${confidenceClass(profile.confidence_level)}`}>{profile.confidence_level} {profile.confidence_score}</span>
-                    </td>
-                  </tr>
-                ))}
+                {departureProfiles.map((profile) => {
+                  const shiftRow = shiftRowBySpbuId.get(profile.spbu_id);
+                  return (
+                    <tr
+                      key={profile.spbu_id}
+                      className={`cursor-pointer border-b border-line ${selectedDepartureProfile?.spbu_id === profile.spbu_id ? "bg-mint/10" : ""}`}
+                      onClick={() => setSelectedDepartureSpbuId(profile.spbu_id)}
+                    >
+                      <td className="whitespace-nowrap px-3 py-2">
+                        <div className="font-medium">{profile.spbu_code}</div>
+                        <div className="text-xs text-slate-500">{profile.spbu_name ?? "-"}</div>
+                      </td>
+                      <td className="whitespace-nowrap px-3 py-2 font-semibold">{profile.preferred_historical_departure_window}</td>
+                      <td className="whitespace-nowrap px-3 py-2">{profile.peak_departure_time} <span className="text-xs text-slate-500">({profile.peak_departure_bucket})</span></td>
+                      <td className="whitespace-nowrap px-3 py-2">{profile.p50}</td>
+                      <td className="whitespace-nowrap px-3 py-2">{profile.p80}</td>
+                      <td className="whitespace-nowrap px-3 py-2">{profile.p90}</td>
+                      <td className="whitespace-nowrap px-3 py-2">{profile.p95}</td>
+                      <td className="whitespace-nowrap px-3 py-2">{profile.observation_count.toLocaleString()}</td>
+                      <td className="whitespace-nowrap px-3 py-2">{profile.dispersion_minutes_iqr.toLocaleString()} min</td>
+                      <td className="px-3 py-2">
+                        <span className={`inline-flex border px-2 py-1 text-xs font-semibold ${confidenceClass(profile.confidence_level)}`}>{profile.confidence_level} {profile.confidence_score}</span>
+                      </td>
+                      <td className="whitespace-nowrap px-3 py-2 font-semibold" title={shiftRow?.primary_shift_score !== null && shiftRow?.primary_shift_score !== undefined ? `Assignment score ${shiftRow.primary_shift_score}` : undefined}>
+                        {shiftRow?.primary_shift_name ?? "-"} {shiftRow ? <span className="text-xs text-slate-500">{shiftRow.primary_shift_share}%</span> : null}
+                      </td>
+                      <td className="whitespace-nowrap px-3 py-2">
+                        {shiftRow?.secondary_shift_name ?? "-"} {shiftRow ? <span className="text-xs text-slate-500">{shiftRow.secondary_shift_share}%</span> : null}
+                      </td>
+                      <td className="whitespace-nowrap px-3 py-2">{shiftRow ? `${shiftRow.primary_secondary_gap}%` : "-"}</td>
+                      <td className="min-w-[220px] px-3 py-2">
+                        {shiftRow ? (
+                          <div className="flex flex-wrap gap-1">
+                            {shiftRow.shift_distribution.map((item, index) => (
+                              <span key={item.shift_id} className="border px-2 py-1 text-xs" style={{ borderColor: shiftPalette(index), color: shiftPalette(index) }} title={`${item.observation_count} of ${shiftRow.observation_count} observations${item.score !== null ? `, score ${item.score}` : ""}`}>
+                                {item.shift_name} {item.share_pct}%
+                              </span>
+                            ))}
+                          </div>
+                        ) : (
+                          <span className="text-slate-400">-</span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2">
+                        {shiftRow ? <span className={`inline-flex border px-2 py-1 text-xs font-semibold ${shiftStatusClass(shiftRow.assignment_status)}`}>{shiftRow.assignment_status.replace(/_/g, " ")}</span> : <span className="text-slate-400">-</span>}
+                      </td>
+                    </tr>
+                  );
+                })}
                 {departureProfiles.length === 0 && (
-                  <tr><td className="px-3 py-8 text-center text-sm text-slate-500" colSpan={10}>No departure profiles match the selected depot and period.</td></tr>
+                  <tr><td className="px-3 py-8 text-center text-sm text-slate-500" colSpan={15}>No departure profiles match the selected depot and period.</td></tr>
                 )}
               </tbody>
             </table>
