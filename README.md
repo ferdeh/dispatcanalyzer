@@ -65,13 +65,31 @@ Halaman Master Data berisi operasional data-management:
 Halaman Phase 2 - Depot Departure Time Intelligence berisi analisa deskriptif historis keberangkatan Mobil Tangki dari depot:
 
 - filter utama Depot, Start Date, End Date, bucket 30/60 menit, dan Apply
+- tombol Apply menjalankan departure analysis dan Operational Shift Intelligence secara terpadu
 - tidak menjalankan analisa otomatis saat halaman dibuka
 - unit observasi adalah `shipment_id + spbu_id`, sehingga beberapa line Loading Order untuk produk berbeda tidak menggandakan observasi SPBU yang sama
 - timestamp analitik `departure_datetime_used` memprioritaskan GPS depot-exit yang reliabel bila tersedia, lalu fallback ke `fact_shipment.gate_out_datetime`
 - lineage timestamp tetap ditampilkan sebagai LO gate-out, GPS depot exit, timestamp yang dipakai, dan source (`GPS` atau `LO_GATE_OUT`)
-- output meliputi KPI, source coverage, 24-hour distribution, weekday heatmap, SPBU box plot, profile table, confidence, dan source-lineage explorer
+- output meliputi KPI, source coverage, 24-hour distribution, weekday heatmap, SPBU box plot, profile table, confidence, Operational Shift Intelligence, dan source-lineage explorer
+- date picker menandai tanggal yang memiliki data departure berbeda dari tanggal tanpa data
+- SPBU box plot menggunakan circular-time scale agar pola melewati midnight tidak terlihat sebagai outlier 24 jam palsu
+- table pagination `10`, `25`, `50`, dan `100` rows tersinkron dengan box plot dan SPBU Shift Affinity Heatmap
 
 Phase 2 bersifat descriptive intelligence. Halaman ini tidak menghitung arrival SPBU, ETA, route sequence, travel time, route optimization, atau rekomendasi jadwal dispatch.
+
+Operational Shift Intelligence di Phase 2:
+
+- konfigurasi shift operasional per depot melalui Add/Remove Shift, start/end time, Save, dan Load
+- validasi konfigurasi shift: format waktu valid, nama tidak duplikat, tidak overlap, dan menutup 24 jam penuh
+- tiga metode assignment: Dominant Shift, Median-Based, dan Hybrid / Confidence-Aware
+- Operational Shift Summary interaktif: klik shift/status untuk memfilter tabel SPBU Departure Profiles
+- Confidence Mix interaktif: klik HIGH/MEDIUM/LOW untuk memfilter tabel profile
+- tabel SPBU Departure Profiles menggabungkan profile departure dan shift assignment dalam satu tabel paginated
+- SPBU Shift Affinity Heatmap menampilkan SPBU current page yang sama dengan tabel dan box plot
+- warna heatmap memakai skala kontras berdasarkan `Shift Affinity %`, bukan jumlah observasi
+- box plot memiliki legend dinamis untuk pilihan highlight Primary Historical Shift, Assignment Status, atau Confidence
+
+Operational Shift Intelligence tetap berbasis perilaku historis. Output ini tidak memaksa jadwal dispatch masa depan dan tidak melakukan multi-feature SPBU clustering; advanced clustering tetap menjadi tanggung jawab fase lanjutan.
 
 Catatan scope saat ini: fondasi Phase 0 tetap menjadi dasar data utama, dan Phase 2 departure intelligence sudah tersedia sebagai read-only derived analysis. Analisa di luar scope seperti SPBU arrival, ETA, route intelligence, route optimization, dan recommendation workflow belum dikerjakan sebagai fitur aktif.
 
@@ -185,7 +203,7 @@ Progress yang sudah dibuat:
 Progress validasi:
 
 - Container stack healthy.
-- API tests passing: `16 passed`.
+- API tests passing: `17 passed`.
 - Frontend build passing.
 - Browser smoke tests passing untuk dashboard, master-data page, CRUD pagination, select all, dan All records.
 - Web container rebuilt dan healthy setelah update tema Petrofin.
@@ -242,6 +260,18 @@ Target output:
 - SPBU Departure Profile Explorer
 
 Status saat ini: `IMPLEMENTED AS READ-ONLY DERIVED API/UI`.
+
+Progress yang sudah dibuat:
+
+- API `GET /api/v1/departure-intelligence/analysis` dengan pagination, sorting, confidence filter, dan filter daftar SPBU.
+- API `GET /api/v1/departure-intelligence/available-dates` untuk date availability.
+- API `POST /api/v1/departure-intelligence/shift-analysis` untuk Operational Shift Intelligence.
+- Circular-time percentile profile: P20, P25/Q1, P50, P75/Q3, P80, P90, P95, IQR, outlier count, dan Preferred Historical Departure Window.
+- Box plot current table page dengan optional highlight by Primary Historical Shift, Assignment Status, atau Confidence.
+- Operational shift configuration UI dengan validation, save/load per depot, dan help popup.
+- Operational Shift Summary, Shift Affinity Heatmap, dan shift assignment fields digabung ke SPBU Departure Profiles.
+- Interactive filter dari Confidence Mix dan Operational Shift Summary ke tabel, box plot, dan heatmap.
+- Source Lineage explorer dengan sample observasi per visible SPBU profile.
 
 Gating:
 
