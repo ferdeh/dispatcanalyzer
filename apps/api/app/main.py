@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session
 from .compatibility import evaluate_mt_spbu_compatibility
 from .config import get_settings
 from .database import get_db
-from .departure_intelligence import build_departure_date_availability, build_departure_intelligence_payload
+from .departure_intelligence import build_departure_date_availability, build_departure_intelligence_payload, build_shift_intelligence_payload
 from .importer import ImportProcessor
 from .models import (
     BridgeMTTag,
@@ -65,6 +65,25 @@ class CompatibilityRequest(BaseModel):
     mt_id: str
     spbu_id: str
     product_id: str | None = None
+
+
+class OperationalShiftRequest(BaseModel):
+    shift_id: str | None = None
+    name: str
+    start_time: str
+    end_time: str
+
+
+class ShiftAnalysisRequest(BaseModel):
+    depot_id: str
+    start_date: str
+    end_date: str
+    bucket_minutes: int = 30
+    shifts: list[OperationalShiftRequest]
+    assignment_method: str
+    search: str | None = None
+    sort_column: str = "observation_count"
+    sort_direction: str = "desc"
 
 
 IMPORT_TEMPLATE_COLUMNS = {
@@ -608,6 +627,22 @@ def depot_departure_intelligence(
 @app.get("/api/v1/departure-intelligence/available-dates")
 def depot_departure_available_dates(depot_id: str, db: Session = Depends(get_db)) -> dict:
     return build_departure_date_availability(db, depot_id)
+
+
+@app.post("/api/v1/departure-intelligence/shift-analysis")
+def depot_departure_shift_intelligence(request: ShiftAnalysisRequest, db: Session = Depends(get_db)) -> dict:
+    return build_shift_intelligence_payload(
+        db,
+        depot_id=request.depot_id,
+        start_date=parse_iso_date_filter(request.start_date, "start_date"),
+        end_date=parse_iso_date_filter(request.end_date, "end_date"),
+        bucket_minutes=request.bucket_minutes,
+        shifts=[shift.model_dump() for shift in request.shifts],
+        assignment_method=request.assignment_method,
+        search=request.search,
+        sort_column=request.sort_column,
+        sort_direction=request.sort_direction,
+    )
 
 
 @app.get("/api/v1/master/compatibility/summary")

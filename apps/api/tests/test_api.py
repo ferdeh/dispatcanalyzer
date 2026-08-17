@@ -7,7 +7,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.database import get_db
-from app.departure_intelligence import circular_stats
+from app.departure_intelligence import circular_stats, shift_for_minute, validate_shift_config
 from app.importer import ImportProcessor
 from app.main import app
 from app.models import Base, FactLoadingOrderLine, FactShipment, FactShipmentSPBU, MasterDepot, MasterMT, MasterProduct, MasterSPBU, MasterTag
@@ -30,6 +30,31 @@ def test_departure_circular_stats_handle_midnight_cluster() -> None:
         [stats["min_linear"], stats["p25_linear"], stats["p50_linear"], stats["p75_linear"], stats["max_linear"]]
     )
     assert stats["p50_linear"] > 1440
+
+
+def test_shift_config_boundaries_and_validation() -> None:
+    shifts = validate_shift_config(
+        [
+            {"shift_id": "s1", "name": "Shift 1", "start_time": "00:00", "end_time": "05:59"},
+            {"shift_id": "s2", "name": "Shift 2", "start_time": "06:00", "end_time": "11:59"},
+            {"shift_id": "s3", "name": "Shift 3", "start_time": "12:00", "end_time": "17:59"},
+            {"shift_id": "s4", "name": "Shift 4", "start_time": "18:00", "end_time": "23:59"},
+        ]
+    )
+    assert shift_for_minute(5 * 60 + 59, shifts)["shift_id"] == "s1"
+    assert shift_for_minute(6 * 60, shifts)["shift_id"] == "s2"
+
+    try:
+        validate_shift_config(
+            [
+                {"shift_id": "s1", "name": "Shift 1", "start_time": "00:00", "end_time": "07:00"},
+                {"shift_id": "s2", "name": "Shift 2", "start_time": "06:00", "end_time": "12:00"},
+            ]
+        )
+    except Exception as exc:
+        assert "overlap" in str(exc).lower()
+    else:
+        raise AssertionError("overlapping shift ranges should be rejected")
 
 
 def test_dashboard_counts_match_database() -> None:
@@ -185,6 +210,63 @@ def test_dashboard_counts_match_database() -> None:
     assert departure_spbu_sort.status_code == 200
     sorted_departure_codes = [row["spbu_code"] for row in departure_spbu_sort.json()["profiles"]]
     assert sorted_departure_codes == sorted(sorted_departure_codes)
+    shift_config = [
+        {"shift_id": "s1", "name": "Shift 1", "start_time": "00:00", "end_time": "05:59"},
+        {"shift_id": "s2", "name": "Shift 2", "start_time": "06:00", "end_time": "11:59"},
+        {"shift_id": "s3", "name": "Shift 3", "start_time": "12:00", "end_time": "17:59"},
+        {"shift_id": "s4", "name": "Shift 4", "start_time": "18:00", "end_time": "23:59"},
+    ]
+    shift_response = client.post(
+        "/api/v1/departure-intelligence/shift-analysis",
+        json={
+            "depot_id": depot.depot_id,
+            "start_date": str(date_range[0]),
+            "end_date": str(date_range[1]),
+            "bucket_minutes": 30,
+            "shifts": shift_config,
+            "assignment_method": "DOMINANT_SHIFT",
+            "sort_column": "spbu_code",
+            "sort_direction": "asc",
+        },
+    )
+    assert shift_response.status_code == 200
+    shift_payload = shift_response.json()
+    assert shift_payload["section"] == "Operational Shift Intelligence"
+    assert shift_payload["assignment_method"] == "DOMINANT_SHIFT"
+    assert shift_payload["summary"]["profile_count"] == departure_payload["summary"]["profile_count"]
+    assert shift_payload["heatmap"]["x_axis"] == ["Shift 1", "Shift 2", "Shift 3", "Shift 4"]
+    assert shift_payload["rows"]
+    first_shift_row = shift_payload["rows"][0]
+    assert sum(item["observation_count"] for item in first_shift_row["shift_distribution"]) == first_shift_row["observation_count"]
+    assert round(sum(item["share_pct"] for item in first_shift_row["shift_distribution"])) in {99, 100, 101}
+    hybrid_response = client.post(
+        "/api/v1/departure-intelligence/shift-analysis",
+        json={
+            "depot_id": depot.depot_id,
+            "start_date": str(date_range[0]),
+            "end_date": str(date_range[1]),
+            "bucket_minutes": 30,
+            "shifts": shift_config,
+            "assignment_method": "HYBRID_CONFIDENCE_AWARE",
+        },
+    )
+    assert hybrid_response.status_code == 200
+    assert hybrid_response.json()["rows"][0]["shift_distribution"][0]["score"] is not None
+    invalid_shift_response = client.post(
+        "/api/v1/departure-intelligence/shift-analysis",
+        json={
+            "depot_id": depot.depot_id,
+            "start_date": str(date_range[0]),
+            "end_date": str(date_range[1]),
+            "bucket_minutes": 30,
+            "shifts": [
+                {"shift_id": "s1", "name": "Shift 1", "start_time": "00:00", "end_time": "07:00"},
+                {"shift_id": "s2", "name": "Shift 2", "start_time": "06:00", "end_time": "23:59"},
+            ],
+            "assignment_method": "DOMINANT_SHIFT",
+        },
+    )
+    assert invalid_shift_response.status_code == 400
 
     crud_list = client.get(f"/api/v1/master-crud/SPBU?limit=10&offset=0&depot_id={depot.depot_id}&search=SPBU&search_column=spbu_code")
     assert crud_list.status_code == 200

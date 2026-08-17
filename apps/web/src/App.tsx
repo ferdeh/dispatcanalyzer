@@ -258,6 +258,65 @@ type DepartureAnalysis = {
   offset: number;
   notes: string[];
 };
+type ShiftAssignmentMethod = "DOMINANT_SHIFT" | "MEDIAN_BASED" | "HYBRID_CONFIDENCE_AWARE";
+type OperationalShiftConfig = {
+  shift_id: string;
+  name: string;
+  start_time: string;
+  end_time: string;
+};
+type ShiftDistribution = {
+  shift_id: string;
+  shift_name: string;
+  shift_order: number;
+  start_time: string;
+  end_time: string;
+  observation_count: number;
+  share_pct: number;
+  score: number | null;
+};
+type ShiftAssignmentRow = {
+  depot_id: string;
+  spbu_id: string;
+  spbu_code: string;
+  spbu_name: string | null;
+  primary_shift_id: string | null;
+  primary_shift_name: string | null;
+  primary_shift_share: number;
+  primary_shift_score: number | null;
+  secondary_shift_id: string | null;
+  secondary_shift_name: string | null;
+  secondary_shift_share: number;
+  secondary_shift_score: number | null;
+  primary_secondary_gap: number;
+  assignment_score: number;
+  assignment_status: "CLEAR" | "MODERATE" | "AMBIGUOUS" | "INSUFFICIENT_DATA";
+  observation_count: number;
+  median_departure: string;
+  median_departure_minutes: number;
+  peak_departure_time: string;
+  preferred_historical_departure_window: string;
+  confidence_score: number;
+  confidence_level: "HIGH" | "MEDIUM" | "LOW";
+  shift_distribution: ShiftDistribution[];
+};
+type ShiftAnalysis = {
+  assignment_method: ShiftAssignmentMethod;
+  assignment_method_label: string;
+  algorithm_version: string;
+  shift_config_id: string;
+  shift_config: Array<OperationalShiftConfig & { order: number; start_minute: number; end_minute: number; segments: Array<{ start_minute: number; end_exclusive_minute: number }> }>;
+  summary: {
+    profile_count: number;
+    observation_count: number;
+    assigned_by_shift: Array<{ shift_id: string; shift_name: string; spbu_count: number }>;
+    status_counts: Record<"CLEAR" | "MODERATE" | "AMBIGUOUS" | "INSUFFICIENT_DATA", number>;
+  };
+  rows: ShiftAssignmentRow[];
+  heatmap: { x_axis: string[]; y_axis: string[]; data: number[][] };
+  notes: string[];
+};
+type ShiftSortColumn = "spbu_code" | "primary_shift_share" | "p50" | "confidence_score" | "observation_count";
 
 const kpiLabels: Record<string, string> = {
   total_mt: "Total MT",
@@ -543,6 +602,69 @@ function statusLabel(status: string): string {
   return status.replace(/_/g, " ");
 }
 
+const defaultShiftConfig: OperationalShiftConfig[] = [
+  { shift_id: "shift_1", name: "Shift 1", start_time: "00:00", end_time: "05:59" },
+  { shift_id: "shift_2", name: "Shift 2", start_time: "06:00", end_time: "11:59" },
+  { shift_id: "shift_3", name: "Shift 3", start_time: "12:00", end_time: "17:59" },
+  { shift_id: "shift_4", name: "Shift 4", start_time: "18:00", end_time: "23:59" }
+];
+
+const shiftMethodLabels: Record<ShiftAssignmentMethod, string> = {
+  DOMINANT_SHIFT: "Dominant Shift",
+  MEDIAN_BASED: "Median-Based",
+  HYBRID_CONFIDENCE_AWARE: "Hybrid / Confidence-Aware"
+};
+
+function shiftStatusClass(status: string): string {
+  if (status === "CLEAR") return "border-mint bg-mint/10 text-mint";
+  if (status === "MODERATE") return "border-amber bg-amber/10 text-amber";
+  if (status === "AMBIGUOUS") return "border-slate-400 bg-slate-100 text-slate-600";
+  return "border-rust bg-rust/10 text-rust";
+}
+
+function parseTimeToMinute(value: string): number | null {
+  const match = /^([01]\d|2[0-3]):([0-5]\d)$/.exec(value);
+  if (!match) return null;
+  return Number(match[1]) * 60 + Number(match[2]);
+}
+
+function validateOperationalShifts(shifts: OperationalShiftConfig[]): string[] {
+  const errors: string[] = [];
+  if (shifts.length === 0) errors.push("At least one shift is required.");
+  const names = new Set<string>();
+  const covered = Array<number | null>(1440).fill(null);
+  shifts.forEach((shift, index) => {
+    const name = shift.name.trim();
+    if (!name) errors.push(`Shift ${index + 1} needs a name.`);
+    const normalizedName = name.toLowerCase();
+    if (normalizedName && names.has(normalizedName)) errors.push(`Duplicate shift name: ${name}.`);
+    names.add(normalizedName);
+    const start = parseTimeToMinute(shift.start_time);
+    const end = parseTimeToMinute(shift.end_time);
+    if (start === null || end === null) {
+      errors.push(`${name || `Shift ${index + 1}`} needs valid HH:MM start and end times.`);
+      return;
+    }
+    const segments = start <= end ? [[start, end + 1]] : [[start, 1440], [0, end + 1]];
+    segments.forEach(([segmentStart, segmentEnd]) => {
+      for (let minute = segmentStart; minute < segmentEnd; minute += 1) {
+        if (covered[minute] !== null) {
+          errors.push(`Shift ranges overlap around ${minuteAxisLabel(minute)}.`);
+          return;
+        }
+        covered[minute] = index;
+      }
+    });
+  });
+  const gap = covered.findIndex((owner) => owner === null);
+  if (gap >= 0) errors.push(`Shift ranges must cover the full 24-hour day. Gap starts at ${minuteAxisLabel(gap)}.`);
+  return Array.from(new Set(errors));
+}
+
+function shiftPalette(index: number): string {
+  return ["#2f7d6d", "#b87516", "#475569", "#7c3aed", "#0f766e", "#be123c", "#2563eb", "#a16207"][index % 8];
+}
+
 function renderTags(values: string[], variant: "default" | "missing" = "default") {
   if (!values.length) return <span className="text-slate-400">-</span>;
   return (
@@ -798,6 +920,17 @@ function App() {
   const [departureSortColumn, setDepartureSortColumn] = useState<DepartureSortColumn>("observation_count");
   const [departureSortDirection, setDepartureSortDirection] = useState<CrudSortDirection>("desc");
   const [selectedDepartureSpbuId, setSelectedDepartureSpbuId] = useState<string | null>(null);
+  const [shiftConfigs, setShiftConfigs] = useState<OperationalShiftConfig[]>(defaultShiftConfig);
+  const [shiftMethod, setShiftMethod] = useState<ShiftAssignmentMethod>("DOMINANT_SHIFT");
+  const [shiftAnalysis, setShiftAnalysis] = useState<ShiftAnalysis | null>(null);
+  const [shiftLoading, setShiftLoading] = useState(false);
+  const [shiftHelpOpen, setShiftHelpOpen] = useState(false);
+  const [shiftSearch, setShiftSearch] = useState("");
+  const [shiftFilter, setShiftFilter] = useState("ALL");
+  const [shiftStatusFilter, setShiftStatusFilter] = useState("ALL");
+  const [shiftSortColumn, setShiftSortColumn] = useState<ShiftSortColumn>("primary_shift_share");
+  const [shiftSortDirection, setShiftSortDirection] = useState<CrudSortDirection>("desc");
+  const [boxPlotHighlightBy, setBoxPlotHighlightBy] = useState<"NONE" | "PRIMARY_SHIFT" | "ASSIGNMENT_STATUS" | "CONFIDENCE">("NONE");
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const crudRequestRef = useRef(0);
@@ -934,6 +1067,38 @@ function App() {
     }
   }
 
+  async function fetchShiftAnalysis() {
+    if (!appliedDepartureFilters) {
+      setError("Run the main Phase 2 Apply first, then apply shift analysis.");
+      return;
+    }
+    const validationErrors = validateOperationalShifts(shiftConfigs);
+    if (validationErrors.length > 0) {
+      setError(validationErrors[0]);
+      return;
+    }
+    setShiftLoading(true);
+    setError(null);
+    try {
+      const payload = await apiSend<ShiftAnalysis>("/api/v1/departure-intelligence/shift-analysis", "POST", {
+        depot_id: appliedDepartureFilters.depotId,
+        start_date: appliedDepartureFilters.startDate,
+        end_date: appliedDepartureFilters.endDate,
+        bucket_minutes: Number(appliedDepartureFilters.bucketMinutes),
+        shifts: shiftConfigs,
+        assignment_method: shiftMethod,
+        search: appliedDepartureFilters.search,
+        sort_column: departureSortColumn,
+        sort_direction: departureSortDirection
+      });
+      setShiftAnalysis(payload);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load operational shift intelligence");
+    } finally {
+      setShiftLoading(false);
+    }
+  }
+
   async function refresh() {
     setError(null);
     const dashboardParams = dashboardDepotId !== "ALL" ? `?depot_id=${encodeURIComponent(dashboardDepotId)}` : "";
@@ -1054,6 +1219,54 @@ function App() {
   const selectedDepartureObservations = selectedDepartureProfile
     ? departureObservations.filter((row) => row.spbu_id === selectedDepartureProfile.spbu_id).slice(0, 20)
     : [];
+  const shiftValidationErrors = useMemo(() => validateOperationalShifts(shiftConfigs), [shiftConfigs]);
+  const selectedShiftRow = shiftAnalysis?.rows.find((row) => row.spbu_id === selectedDepartureProfile?.spbu_id) ?? null;
+  const sortedShiftRows = useMemo(() => {
+    const keyMap: Record<ShiftSortColumn, (row: ShiftAssignmentRow) => string | number> = {
+      spbu_code: (row) => row.spbu_code,
+      primary_shift_share: (row) => row.primary_shift_share,
+      p50: (row) => row.median_departure_minutes,
+      confidence_score: (row) => row.confidence_score,
+      observation_count: (row) => row.observation_count
+    };
+    return [...(shiftAnalysis?.rows ?? [])]
+      .filter((row) => {
+        const matchesSearch = !shiftSearch.trim() || `${row.spbu_code} ${row.spbu_name ?? ""}`.toLowerCase().includes(shiftSearch.trim().toLowerCase());
+        const matchesShift = shiftFilter === "ALL" || row.primary_shift_id === shiftFilter;
+        const matchesStatus = shiftStatusFilter === "ALL" || row.assignment_status === shiftStatusFilter;
+        return matchesSearch && matchesShift && matchesStatus;
+      })
+      .sort((left, right) => {
+        const leftValue = keyMap[shiftSortColumn](left);
+        const rightValue = keyMap[shiftSortColumn](right);
+        const direction = shiftSortDirection === "asc" ? 1 : -1;
+        if (typeof leftValue === "number" && typeof rightValue === "number") return (leftValue - rightValue) * direction;
+        return String(leftValue).localeCompare(String(rightValue)) * direction;
+      });
+  }, [shiftAnalysis, shiftFilter, shiftSearch, shiftSortColumn, shiftSortDirection, shiftStatusFilter]);
+  const shiftAffinityHeatmapOption = useMemo(() => {
+    if (!shiftAnalysis?.heatmap) return null;
+    const heatmap = shiftAnalysis.heatmap;
+    const rowLookup = new Map(shiftAnalysis.rows.map((row) => [row.spbu_code, row]));
+    return {
+      tooltip: {
+        position: "top",
+        formatter: (params: { data: number[] }) => {
+          const [shiftIndex, rowIndex, share, count, total] = params.data;
+          const spbu = heatmap.y_axis[rowIndex];
+          const shift = heatmap.x_axis[shiftIndex];
+          const name = rowLookup.get(spbu)?.spbu_name ?? "";
+          return `${spbu}${name ? ` - ${name}` : ""}<br />${shift}<br />${count} of ${total} historical observations<br />Shift Affinity = ${share}%`;
+        }
+      },
+      grid: { top: 18, right: 24, bottom: 42, left: 104 },
+      xAxis: { type: "category", data: heatmap.x_axis, axisLabel: { interval: 0, rotate: 0 } },
+      yAxis: { type: "category", data: heatmap.y_axis, axisLabel: { interval: 0 } },
+      visualMap: { min: 0, max: 100, calculable: true, orient: "horizontal", left: "center", bottom: 0, inRange: { color: ["#f1f5f3", "#8fbdb4", "#2f7d6d"] } },
+      dataZoom: heatmap.y_axis.length > 30 ? [{ type: "slider", yAxisIndex: 0, right: 0, width: 14 }, { type: "inside" }] : undefined,
+      series: [{ type: "heatmap", data: heatmap.data, emphasis: { itemStyle: { shadowBlur: 6, shadowColor: "rgba(0,0,0,0.16)" } } }]
+    };
+  }, [shiftAnalysis]);
   const heatmapOption = useMemo(() => {
     const heatmap = departureAnalysis?.weekday_heatmap;
     if (!heatmap) return null;
@@ -1076,19 +1289,48 @@ function App() {
     const flattenedValues = boxPlot.data.flat();
     const yMin = Math.max(0, Math.floor(Math.min(0, ...flattenedValues) / 180) * 180);
     const yMax = Math.max(1440, Math.ceil(Math.max(1440, ...flattenedValues) / 180) * 180);
+    const shiftRowsBySpbu = new Map((shiftAnalysis?.rows ?? []).map((row) => [row.spbu_code, row]));
+    const shiftColorById = new Map((shiftAnalysis?.shift_config ?? []).map((shift, index) => [shift.shift_id, shiftPalette(index)]));
+    const statusColors: Record<string, string> = { CLEAR: "#2f7d6d", MODERATE: "#b87516", AMBIGUOUS: "#64748b", INSUFFICIENT_DATA: "#b64a35" };
+    const confidenceColors: Record<string, string> = { HIGH: "#2f7d6d", MEDIUM: "#b87516", LOW: "#b64a35" };
+    const data = boxPlot.data.map((value, index) => {
+      const row = shiftRowsBySpbu.get(boxPlot.categories[index]);
+      let borderColor = "#2f7d6d";
+      if (row && boxPlotHighlightBy === "PRIMARY_SHIFT" && row.primary_shift_id) borderColor = shiftColorById.get(row.primary_shift_id) ?? borderColor;
+      if (row && boxPlotHighlightBy === "ASSIGNMENT_STATUS") borderColor = statusColors[row.assignment_status] ?? borderColor;
+      if (row && boxPlotHighlightBy === "CONFIDENCE") borderColor = confidenceColors[row.confidence_level] ?? borderColor;
+      return { value, itemStyle: { color: "#dfe9e6", borderColor } };
+    });
+    const boundaryData = (shiftAnalysis?.shift_config ?? [])
+      .flatMap((shift) => [shift.start_minute, shift.start_minute + 1440])
+      .filter((minute) => minute > yMin && minute < yMax)
+      .map((minute) => ({ yAxis: minute, label: { formatter: shiftedMinuteAxisLabel(minute) } }));
     return {
       tooltip: {
         trigger: "item",
-        formatter: (params: { name: string; data: number[] }) =>
-          `${params.name}<br />Min ${shiftedMinuteAxisLabel(params.data[1])}<br />Q1 ${shiftedMinuteAxisLabel(params.data[2])}<br />P50 ${shiftedMinuteAxisLabel(params.data[3])}<br />Q3 ${shiftedMinuteAxisLabel(params.data[4])}<br />Max ${shiftedMinuteAxisLabel(params.data[5])}`
+        formatter: (params: { name: string; data: number[] | { value: number[] } }) => {
+          const values = Array.isArray(params.data) ? params.data : params.data.value;
+          const row = shiftRowsBySpbu.get(params.name);
+          return `${params.name}<br />Min ${shiftedMinuteAxisLabel(values[1])}<br />Q1 ${shiftedMinuteAxisLabel(values[2])}<br />P50 ${shiftedMinuteAxisLabel(values[3])}<br />Q3 ${shiftedMinuteAxisLabel(values[4])}<br />Max ${shiftedMinuteAxisLabel(values[5])}${row ? `<br />Primary Shift ${row.primary_shift_name ?? "-"}` : ""}`;
+        }
       },
       grid: { top: 16, right: 24, bottom: 76, left: 52 },
       xAxis: { type: "category", data: boxPlot.categories, axisLabel: { interval: 0, rotate: 45 } },
       yAxis: { type: "value", min: yMin, max: yMax, interval: 180, axisLabel: { formatter: (value: number) => shiftedMinuteAxisLabel(value) } },
       dataZoom: boxPlot.categories.length > 30 ? [{ type: "slider", bottom: 18, height: 18 }, { type: "inside" }] : undefined,
-      series: [{ name: "Departure time", type: "boxplot", data: boxPlot.data, itemStyle: { color: "#dfe9e6", borderColor: "#2f7d6d" } }]
+      series: [
+        {
+          name: "Departure time",
+          type: "boxplot",
+          data,
+          itemStyle: { color: "#dfe9e6", borderColor: "#2f7d6d" },
+          markLine: boundaryData.length
+            ? { silent: true, symbol: "none", lineStyle: { color: "#94a3b8", type: "dashed", width: 1 }, data: boundaryData }
+            : undefined
+        }
+      ]
     };
-  }, [departureAnalysis]);
+  }, [boxPlotHighlightBy, departureAnalysis, shiftAnalysis]);
   const allSpbuMismatchRows = useMemo(
     () => sortedMismatchRows(tagSummary.top_spbu_mismatch, "spbu", spbuMismatchSortColumn, spbuMismatchSortDirection),
     [tagSummary.top_spbu_mismatch, spbuMismatchSortColumn, spbuMismatchSortDirection]
@@ -1351,11 +1593,15 @@ function App() {
     }));
     if (key === "depotId") {
       setDepartureDateAvailability(null);
+      setShiftAnalysis(null);
+      const saved = window.localStorage.getItem(`departure-shift-config:${value}`);
+      setShiftConfigs(saved ? JSON.parse(saved) : defaultShiftConfig);
     }
   }
 
   function applyDepartureFilters() {
     setDepartureOffset(0);
+    setShiftAnalysis(null);
     fetchDepartureAnalysis(0, departureFilters);
   }
 
@@ -1363,6 +1609,50 @@ function App() {
     setDepartureOffset(0);
     setDepartureSortDirection((current) => (departureSortColumn === column && current === "asc" ? "desc" : "asc"));
     setDepartureSortColumn(column);
+  }
+
+  function updateShiftConfig(index: number, key: keyof OperationalShiftConfig, value: string) {
+    setShiftConfigs((current) => current.map((shift, shiftIndex) => (shiftIndex === index ? { ...shift, [key]: value } : shift)));
+  }
+
+  function addShiftConfig() {
+    setShiftConfigs((current) => [
+      ...current,
+      { shift_id: `shift_${current.length + 1}`, name: `Shift ${current.length + 1}`, start_time: "00:00", end_time: "23:59" }
+    ]);
+  }
+
+  function removeShiftConfig(index: number) {
+    setShiftConfigs((current) => current.filter((_, shiftIndex) => shiftIndex !== index));
+  }
+
+  function saveShiftConfig() {
+    if (!departureFilters.depotId) {
+      setError("Select a depot before saving a shift configuration.");
+      return;
+    }
+    const validationErrors = validateOperationalShifts(shiftConfigs);
+    if (validationErrors.length > 0) {
+      setError(validationErrors[0]);
+      return;
+    }
+    window.localStorage.setItem(`departure-shift-config:${departureFilters.depotId}`, JSON.stringify(shiftConfigs));
+    setError(null);
+  }
+
+  function loadShiftConfig() {
+    if (!departureFilters.depotId) {
+      setError("Select a depot before loading a shift configuration.");
+      return;
+    }
+    const saved = window.localStorage.getItem(`departure-shift-config:${departureFilters.depotId}`);
+    setShiftConfigs(saved ? JSON.parse(saved) : defaultShiftConfig);
+    setError(null);
+  }
+
+  function handleShiftSort(column: ShiftSortColumn) {
+    setShiftSortDirection((current) => (shiftSortColumn === column && current === "asc" ? "desc" : "asc"));
+    setShiftSortColumn(column);
   }
 
   function handleTagSort(column: string) {
@@ -1467,6 +1757,49 @@ function App() {
 
       <div className="mx-auto max-w-7xl px-5 py-5">
         {error && <div className="mb-4 border border-rust bg-white px-4 py-3 text-sm text-rust">{error}</div>}
+        {shiftHelpOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/35 px-4">
+            <div className="max-h-[90vh] w-full max-w-3xl overflow-y-auto border border-line bg-white p-5 shadow-card">
+              <div className="mb-4 flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Shift Assignment Method</div>
+                  <div className="mt-1 text-xs text-slate-500">Historical and descriptive only. Hybrid does not create an optimized shift schedule.</div>
+                </div>
+                <button className="inline-flex h-8 w-8 items-center justify-center border border-line" onClick={() => setShiftHelpOpen(false)} title="Close help">
+                  <X size={16} />
+                </button>
+              </div>
+              <div className="grid gap-4 text-sm text-slate-700">
+                <div className="border border-line p-3">
+                  <div className="font-semibold text-petroink">Dominant Shift</div>
+                  <p className="mt-1">Assigns an SPBU to the shift containing the largest percentage of its historical shipment departures.</p>
+                  <p className="mt-1 text-xs text-slate-500">Example: Shift 1 = 70%, Shift 2 = 20%, Shift 3 = 8%, Shift 4 = 2%. Result: Primary Historical Shift = Shift 1.</p>
+                  <p className="mt-1 text-xs text-slate-500">Best for a simple operational view when one shift clearly dominates historical data.</p>
+                </div>
+                <div className="border border-line p-3">
+                  <div className="font-semibold text-petroink">Median-Based</div>
+                  <p className="mt-1">Assigns an SPBU to the shift containing its historical median departure time, or P50.</p>
+                  <p className="mt-1 text-xs text-slate-500">Example: Historical Median Departure = 07:15 and Shift 2 = 06:00-11:59. Result: Primary Historical Shift = Shift 2.</p>
+                  <p className="mt-1 text-xs text-slate-500">This is robust to isolated extreme departure times, but it can hide multi-shift behavior.</p>
+                </div>
+                <div className="border border-line p-3">
+                  <div className="font-semibold text-petroink">Hybrid / Confidence-Aware</div>
+                  <p className="mt-1">Combines historical shift share, median departure, preferred-window overlap, peak departure time, observation count, and Phase 2 confidence.</p>
+                  <p className="mt-1 text-xs text-slate-500">The system treats assignment as strong only when several historical signals point toward the same shift.</p>
+                  <p className="mt-1 text-xs text-slate-500">When behavior is split or the sample is too small, the SPBU may be marked MODERATE, AMBIGUOUS, or INSUFFICIENT DATA.</p>
+                </div>
+                <div className="border border-line bg-slate-50 p-3 text-xs">
+                  <div className="font-semibold uppercase tracking-wide text-slate-500">Recommended usage</div>
+                  <div className="mt-2 grid gap-1">
+                    <div>Dominant Shift: simplest operational view.</div>
+                    <div>Median-Based: robust single-point historical classification.</div>
+                    <div>Hybrid / Confidence-Aware: recommended when a more reliable historical classification is required.</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
         {!hasData && (
           <section className="mb-5 border border-line bg-white p-5">
             <div className="flex items-start gap-3">
@@ -1594,11 +1927,198 @@ function App() {
             {heatmapOption ? <ReactECharts option={heatmapOption} style={{ height: 260 }} /> : <div className="py-20 text-center text-sm text-slate-500">No heatmap data.</div>}
           </section>
           <section className="min-h-[360px] border border-line bg-white p-4 lg:col-span-2">
-            <div className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-600">SPBU Departure Time Box Plot - Current Table Page</div>
-            <div className="mb-3 text-xs text-slate-500">Circular-time scale: labels with +1d are early-morning departures visually shifted after midnight to avoid false 24-hour spread.</div>
+            <div className="mb-3 flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
+              <div>
+                <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">SPBU Departure Time Box Plot - Current Table Page</div>
+                <div className="mt-1 text-xs text-slate-500">Circular-time scale: labels with +1d are early-morning departures visually shifted after midnight to avoid false 24-hour spread.</div>
+              </div>
+              <label className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                Group / Highlight By
+                <select className="border border-line bg-white px-2 py-1 text-xs normal-case tracking-normal" value={boxPlotHighlightBy} onChange={(event) => setBoxPlotHighlightBy(event.target.value as typeof boxPlotHighlightBy)}>
+                  <option value="NONE">None</option>
+                  <option value="PRIMARY_SHIFT">Primary Historical Shift</option>
+                  <option value="ASSIGNMENT_STATUS">Assignment Status</option>
+                  <option value="CONFIDENCE">Confidence</option>
+                </select>
+              </label>
+            </div>
             {boxPlotOption ? <ReactECharts option={boxPlotOption} style={{ height: 300 }} /> : <div className="py-20 text-center text-sm text-slate-500">No box plot data.</div>}
           </section>
         </section>
+
+        <section className="mt-5 border border-line bg-white p-4">
+          <div className="mb-4 flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
+            <div>
+              <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Operational Shift Configuration</div>
+              <div className="mt-1 text-xs text-slate-500">Descriptive historical shift affinity based on the already applied depot/date range.</div>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button className="inline-flex items-center gap-2 border border-line px-3 py-2 text-sm" onClick={loadShiftConfig} title="Load active shift configuration for this depot">
+                <RefreshCw size={14} /> Load
+              </button>
+              <button className="inline-flex items-center gap-2 border border-line px-3 py-2 text-sm" onClick={saveShiftConfig} title="Save active shift configuration for this depot">
+                <Save size={14} /> Save
+              </button>
+            </div>
+          </div>
+          <div className="grid gap-4 xl:grid-cols-[1fr_0.8fr]">
+            <div>
+              <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Number of Shifts: {shiftConfigs.length}</div>
+              <div className="grid gap-2">
+                {shiftConfigs.map((shift, index) => (
+                  <div key={`${shift.shift_id}-${index}`} className="grid gap-2 md:grid-cols-[1fr_130px_130px_auto]">
+                    <input className="border border-line px-3 py-2 text-sm" value={shift.name} onChange={(event) => updateShiftConfig(index, "name", event.target.value)} title={`Shift ${index + 1} name`} />
+                    <input className="border border-line px-3 py-2 text-sm" type="time" value={shift.start_time} onChange={(event) => updateShiftConfig(index, "start_time", event.target.value)} title={`Shift ${index + 1} start time`} />
+                    <input className="border border-line px-3 py-2 text-sm" type="time" value={shift.end_time} onChange={(event) => updateShiftConfig(index, "end_time", event.target.value)} title={`Shift ${index + 1} end time`} />
+                    <button className="inline-flex items-center justify-center border border-line px-3 py-2 text-sm disabled:opacity-40" onClick={() => removeShiftConfig(index)} disabled={shiftConfigs.length <= 1} title="Remove shift">
+                      <Trash2 size={15} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <div className="mt-3 flex flex-wrap gap-2">
+                <button className="inline-flex items-center gap-2 border border-line px-3 py-2 text-sm" onClick={addShiftConfig} title="Add operational shift">
+                  <Plus size={15} /> Add Shift
+                </button>
+              </div>
+              {shiftValidationErrors.length > 0 && (
+                <div className="mt-3 border border-rust bg-rust/5 px-3 py-2 text-xs text-rust">{shiftValidationErrors[0]}</div>
+              )}
+            </div>
+            <div className="border border-line p-3">
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <label className="text-xs font-semibold uppercase tracking-wide text-slate-500">Shift Assignment Method</label>
+                <button className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-line text-xs font-semibold" onClick={() => setShiftHelpOpen(true)} title="Explain shift assignment methods">?</button>
+              </div>
+              <select className="w-full border border-line bg-white px-3 py-2 text-sm" value={shiftMethod} onChange={(event) => setShiftMethod(event.target.value as ShiftAssignmentMethod)}>
+                <option value="DOMINANT_SHIFT">Dominant Shift</option>
+                <option value="MEDIAN_BASED">Median-Based</option>
+                <option value="HYBRID_CONFIDENCE_AWARE">Hybrid / Confidence-Aware</option>
+              </select>
+              <button
+                className="mt-3 inline-flex w-full items-center justify-center gap-2 bg-mint px-3 py-2 text-sm font-medium text-white disabled:opacity-60"
+                onClick={fetchShiftAnalysis}
+                disabled={shiftLoading || shiftValidationErrors.length > 0 || !departureAnalysis}
+                title="Apply operational shift analysis"
+              >
+                <Search size={15} />
+                {shiftLoading ? "Running" : "Apply Shift Analysis"}
+              </button>
+              <div className="mt-3 text-xs text-slate-500">Input changes are held until Apply Shift Analysis is clicked. This analysis does not prescribe future dispatch schedules.</div>
+            </div>
+          </div>
+        </section>
+
+        {shiftAnalysis && (
+          <>
+            <section className="mt-5 border border-line bg-white p-4">
+              <div className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-600">Operational Shift Summary</div>
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6">
+                {shiftAnalysis.summary.assigned_by_shift.map((item, index) => (
+                  <div key={item.shift_id} className="border border-line p-3">
+                    <div className="text-xs font-semibold uppercase tracking-wide" style={{ color: shiftPalette(index) }}>{item.shift_name}</div>
+                    <div className="mt-2 text-2xl font-semibold">{item.spbu_count.toLocaleString()} SPBU</div>
+                  </div>
+                ))}
+                {(["AMBIGUOUS", "INSUFFICIENT_DATA"] as const).map((status) => (
+                  <div key={status} className={`border p-3 ${shiftStatusClass(status)}`}>
+                    <div className="text-xs font-semibold uppercase tracking-wide">{status.replace(/_/g, " ")}</div>
+                    <div className="mt-2 text-2xl font-semibold">{shiftAnalysis.summary.status_counts[status].toLocaleString()} SPBU</div>
+                  </div>
+                ))}
+              </div>
+              <div className="mt-3 text-xs text-slate-500">Method: {shiftAnalysis.assignment_method_label}. Algorithm: {shiftAnalysis.algorithm_version}.</div>
+            </section>
+
+            <section className="mt-5 min-h-[360px] border border-line bg-white p-4">
+              <div className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-600">SPBU Shift Affinity Heatmap</div>
+              {shiftAffinityHeatmapOption ? <ReactECharts option={shiftAffinityHeatmapOption} style={{ height: 360 }} /> : <div className="py-20 text-center text-sm text-slate-500">No shift affinity data.</div>}
+            </section>
+
+            <section className="mt-5 border border-line bg-white p-4">
+              <div className="mb-3 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                <div>
+                  <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">SPBU Shift Assignment Table</div>
+                  <div className="mt-1 text-xs text-slate-500">Raw shift percentages are preserved regardless of assignment method.</div>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <input className="border border-line px-3 py-2 text-sm" value={shiftSearch} onChange={(event) => setShiftSearch(event.target.value)} placeholder="Search SPBU" title="Search SPBU" />
+                  <select className="border border-line bg-white px-3 py-2 text-sm" value={shiftFilter} onChange={(event) => setShiftFilter(event.target.value)} title="Filter by primary shift">
+                    <option value="ALL">All shifts</option>
+                    {shiftAnalysis.shift_config.map((shift) => <option key={shift.shift_id} value={shift.shift_id}>{shift.name}</option>)}
+                  </select>
+                  <select className="border border-line bg-white px-3 py-2 text-sm" value={shiftStatusFilter} onChange={(event) => setShiftStatusFilter(event.target.value)} title="Filter by assignment status">
+                    <option value="ALL">All statuses</option>
+                    <option value="CLEAR">Clear</option>
+                    <option value="MODERATE">Moderate</option>
+                    <option value="AMBIGUOUS">Ambiguous</option>
+                    <option value="INSUFFICIENT_DATA">Insufficient Data</option>
+                  </select>
+                </div>
+              </div>
+              <div className="overflow-x-auto border border-line">
+                <table className="w-full border-collapse text-sm">
+                  <thead>
+                    <tr className="border-b border-line bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+                      {[
+                        ["spbu_code", "SPBU"],
+                        ["primary_shift_share", "Primary Shift"],
+                        ["p50", "Median"],
+                        ["observation_count", "Observations"],
+                        ["confidence_score", "Confidence"]
+                      ].map(([column, label]) => {
+                        const active = shiftSortColumn === column;
+                        return (
+                          <th key={column} className="whitespace-nowrap px-3 py-2">
+                            <button className="inline-flex items-center gap-1 uppercase tracking-wide hover:text-slate-900" onClick={() => handleShiftSort(column as ShiftSortColumn)} title={`Sort by ${label}`}>
+                              {label}
+                              {active ? (shiftSortDirection === "asc" ? <ArrowUp size={14} /> : <ArrowDown size={14} />) : <ArrowUpDown size={14} className="text-slate-300" />}
+                            </button>
+                          </th>
+                        );
+                      })}
+                      <th className="whitespace-nowrap px-3 py-2">Secondary</th>
+                      <th className="whitespace-nowrap px-3 py-2">Gap</th>
+                      <th className="whitespace-nowrap px-3 py-2">Preferred Window</th>
+                      <th className="whitespace-nowrap px-3 py-2">Affinity</th>
+                      <th className="whitespace-nowrap px-3 py-2">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {sortedShiftRows.map((row) => (
+                      <tr key={row.spbu_id} className="cursor-pointer border-b border-line hover:bg-mint/5" onClick={() => setSelectedDepartureSpbuId(row.spbu_id)}>
+                        <td className="whitespace-nowrap px-3 py-2">
+                          <div className="font-medium">{row.spbu_code}</div>
+                          <div className="text-xs text-slate-500">{row.spbu_name ?? "-"}</div>
+                        </td>
+                        <td className="whitespace-nowrap px-3 py-2 font-semibold" title={row.primary_shift_score !== null ? `Assignment score ${row.primary_shift_score}` : undefined}>
+                          {row.primary_shift_name ?? "-"} <span className="text-xs text-slate-500">{row.primary_shift_share}%</span>
+                        </td>
+                        <td className="whitespace-nowrap px-3 py-2">{row.median_departure}</td>
+                        <td className="whitespace-nowrap px-3 py-2">{row.observation_count.toLocaleString()}</td>
+                        <td className="px-3 py-2"><span className={`inline-flex border px-2 py-1 text-xs font-semibold ${confidenceClass(row.confidence_level)}`}>{row.confidence_level} {row.confidence_score}</span></td>
+                        <td className="whitespace-nowrap px-3 py-2">{row.secondary_shift_name ?? "-"} <span className="text-xs text-slate-500">{row.secondary_shift_share}%</span></td>
+                        <td className="whitespace-nowrap px-3 py-2">{row.primary_secondary_gap}%</td>
+                        <td className="whitespace-nowrap px-3 py-2">{row.preferred_historical_departure_window}</td>
+                        <td className="min-w-[220px] px-3 py-2">
+                          <div className="flex flex-wrap gap-1">
+                            {row.shift_distribution.map((item, index) => (
+                              <span key={item.shift_id} className="border px-2 py-1 text-xs" style={{ borderColor: shiftPalette(index), color: shiftPalette(index) }} title={`${item.observation_count} of ${row.observation_count} observations${item.score !== null ? `, score ${item.score}` : ""}`}>
+                                {item.shift_name} {item.share_pct}%
+                              </span>
+                            ))}
+                          </div>
+                        </td>
+                        <td className="px-3 py-2"><span className={`inline-flex border px-2 py-1 text-xs font-semibold ${shiftStatusClass(row.assignment_status)}`}>{row.assignment_status.replace(/_/g, " ")}</span></td>
+                      </tr>
+                    ))}
+                    {sortedShiftRows.length === 0 && <tr><td className="px-3 py-8 text-center text-sm text-slate-500" colSpan={10}>No shift assignments match the filters.</td></tr>}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          </>
+        )}
 
         <section className="mt-5 border border-line bg-white p-4">
           <div className="mb-3 flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
@@ -1709,6 +2229,51 @@ function App() {
                   <div className="mt-1 font-semibold">{selectedDepartureProfile.quantity_dispatched.toLocaleString()}</div>
                 </div>
               </div>
+              {shiftAnalysis && (
+                <div className="mb-3 border border-line p-3">
+                  <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Operational Shift Intelligence</div>
+                  {selectedShiftRow ? (
+                    <div className="grid gap-3 text-sm lg:grid-cols-3">
+                      <div>
+                        <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Assignment Method</div>
+                        <div className="mt-1 font-semibold">{shiftAnalysis.assignment_method_label}</div>
+                      </div>
+                      <div>
+                        <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Primary Historical Shift</div>
+                        <div className="mt-1 font-semibold">{selectedShiftRow.primary_shift_name ?? "-"}</div>
+                      </div>
+                      <div>
+                        <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Secondary Shift</div>
+                        <div className="mt-1 font-semibold">{selectedShiftRow.secondary_shift_name ?? "-"}</div>
+                      </div>
+                      <div>
+                        <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Status</div>
+                        <div className="mt-1"><span className={`inline-flex border px-2 py-1 text-xs font-semibold ${shiftStatusClass(selectedShiftRow.assignment_status)}`}>{selectedShiftRow.assignment_status.replace(/_/g, " ")}</span></div>
+                      </div>
+                      <div>
+                        <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Median / Peak</div>
+                        <div className="mt-1 font-semibold">{selectedShiftRow.median_departure} / {selectedShiftRow.peak_departure_time}</div>
+                      </div>
+                      <div>
+                        <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Preferred Window</div>
+                        <div className="mt-1 font-semibold">{selectedShiftRow.preferred_historical_departure_window}</div>
+                      </div>
+                      <div className="lg:col-span-3">
+                        <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Shift Affinity</div>
+                        <div className="mt-2 flex flex-wrap gap-2">
+                          {selectedShiftRow.shift_distribution.map((item, index) => (
+                            <span key={item.shift_id} className="border px-2 py-1 text-xs" style={{ borderColor: shiftPalette(index), color: shiftPalette(index) }}>
+                              {item.shift_name} {item.share_pct}%
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="text-sm text-slate-500">No shift profile for the selected SPBU.</div>
+                  )}
+                </div>
+              )}
               <div className="overflow-x-auto border border-line">
                 <table className="w-full border-collapse text-sm">
                   <thead>

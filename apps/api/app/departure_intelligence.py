@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 from collections import Counter, defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from math import floor
 
 from fastapi import HTTPException
@@ -12,8 +13,28 @@ from .models import FactGPSEvent, FactLoadingOrderLine, FactShipment, FactShipme
 
 
 ALGORITHM_VERSION = "departure_profile.circular_gap_v1"
+SHIFT_ASSIGNMENT_ALGORITHM_VERSION = "shift_assignment.descriptive_v1"
 GPS_SOURCE_TYPES = {"DEPOT_EXIT", "DEPOT_GEOFENCE_EXIT", "ACTUAL_DEPOT_EXIT", "GPS_DEPOT_EXIT"}
 DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+SHIFT_ASSIGNMENT_METHODS = {"DOMINANT_SHIFT", "MEDIAN_BASED", "HYBRID_CONFIDENCE_AWARE"}
+SHIFT_CONFIDENCE_FACTORS = {"HIGH": 1.0, "MEDIUM": 0.8, "LOW": 0.6}
+SHIFT_HYBRID_WEIGHTS = {
+    "historical_shift_share": 0.40,
+    "preferred_window_overlap": 0.25,
+    "median_alignment": 0.20,
+    "peak_alignment": 0.15,
+}
+SHIFT_STATUS_THRESHOLDS = {
+    "minimum_observations": 5,
+    "dominant_clear_share": 60.0,
+    "dominant_clear_gap": 15.0,
+    "dominant_moderate_share": 45.0,
+    "dominant_ambiguous_gap": 10.0,
+    "hybrid_clear_score": 60.0,
+    "hybrid_clear_gap": 15.0,
+    "hybrid_moderate_score": 45.0,
+    "hybrid_moderate_gap": 8.0,
+}
 
 
 def build_departure_intelligence_payload(
@@ -99,6 +120,84 @@ def build_departure_date_availability(db: Session, depot_id: str) -> dict:
         "dates": dates,
         "min_date": dates[0]["date"] if dates else None,
         "max_date": dates[-1]["date"] if dates else None,
+    }
+
+
+def build_shift_intelligence_payload(
+    db: Session,
+    depot_id: str,
+    start_date: date,
+    end_date: date,
+    shifts: list[dict],
+    assignment_method: str,
+    bucket_minutes: int = 30,
+    search: str | None = None,
+    sort_column: str = "observation_count",
+    sort_direction: str = "desc",
+) -> dict:
+    if bucket_minutes not in {30, 60}:
+        raise HTTPException(status_code=400, detail="bucket_minutes must be 30 or 60.")
+    if end_date < start_date:
+        raise HTTPException(status_code=400, detail="end_date must be greater than or equal to start_date.")
+    method = assignment_method.upper()
+    if method not in SHIFT_ASSIGNMENT_METHODS:
+        raise HTTPException(status_code=400, detail="assignment_method must be DOMINANT_SHIFT, MEDIAN_BASED, or HYBRID_CONFIDENCE_AWARE.")
+    depot = db.get(MasterDepot, depot_id)
+    if not depot:
+        raise HTTPException(status_code=404, detail="Depot not found.")
+    shift_config = validate_shift_config(shifts)
+
+    raw_rows = load_departure_rows(db, depot_id, start_date, end_date, search)
+    gps_lookup = load_gps_departure_lookup(db, depot_id, raw_rows)
+    quantity_lookup = load_quantity_lookup(db, raw_rows)
+    observations = build_observations(raw_rows, gps_lookup, quantity_lookup)
+    valid_observations = [row for row in observations if row["departure_datetime_used"]]
+    profiles = sort_profiles(build_profiles(valid_observations, bucket_minutes), sort_column, sort_direction)
+    observations_by_spbu: dict[str, list[dict]] = defaultdict(list)
+    for row in valid_observations:
+        observations_by_spbu[row["spbu_id"]].append(row)
+
+    rows = [
+        build_shift_profile(profile, observations_by_spbu.get(profile["spbu_id"], []), shift_config, method, start_date, end_date)
+        for profile in profiles
+    ]
+    rows = sort_shift_profiles(rows, sort_column, sort_direction)
+
+    return {
+        "phase": 2,
+        "section": "Operational Shift Intelligence",
+        "assignment_method": method,
+        "assignment_method_label": shift_assignment_label(method),
+        "algorithm_version": SHIFT_ASSIGNMENT_ALGORITHM_VERSION,
+        "departure_profile_algorithm_version": ALGORITHM_VERSION,
+        "shift_assignment_algorithm_version": SHIFT_ASSIGNMENT_ALGORITHM_VERSION,
+        "effective_filters": {
+            "depot_id": depot.depot_id,
+            "depot_name": depot.depot_name,
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+            "bucket_minutes": bucket_minutes,
+            "search": search or "",
+            "sort_column": sort_column,
+            "sort_direction": "desc" if sort_direction == "desc" else "asc",
+        },
+        "shift_config_id": shift_config_id(depot_id, shift_config),
+        "shift_config": shift_config,
+        "summary": build_shift_summary(rows, shift_config),
+        "rows": rows,
+        "heatmap": build_shift_affinity_heatmap(rows, shift_config),
+        "traceability": {
+            "depot_id": depot.depot_id,
+            "source_period_start": start_date.isoformat(),
+            "source_period_end": end_date.isoformat(),
+            "calculated_at": utc_now_label(),
+            "algorithm_version": SHIFT_ASSIGNMENT_ALGORITHM_VERSION,
+        },
+        "notes": [
+            "Operational Shift Intelligence is descriptive historical classification, not dispatch scheduling.",
+            "Shift affinity percentages always use the raw historical distribution, regardless of assignment method.",
+            "The unit of analysis remains unique shipment_id + spbu_id using the same departure_datetime_used as Phase 2 profiles.",
+        ],
     }
 
 
@@ -344,6 +443,327 @@ def sort_profiles(profiles: list[dict], sort_column: str, sort_direction: str) -
     return sorted(profiles, key=lambda item: (key_fn(item), item.get("spbu_code") or item.get("spbu_id") or ""), reverse=reverse)
 
 
+def validate_shift_config(shifts: list[dict]) -> list[dict]:
+    if not shifts:
+        raise HTTPException(status_code=400, detail="At least one operational shift is required.")
+    if len(shifts) > 12:
+        raise HTTPException(status_code=400, detail="At most 12 operational shifts are supported.")
+
+    names: set[str] = set()
+    covered = [None] * 1440
+    normalized_shifts = []
+    for index, raw_shift in enumerate(shifts):
+        name = str(raw_shift.get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail=f"Shift {index + 1} must have a name.")
+        normalized_name = name.lower()
+        if normalized_name in names:
+            raise HTTPException(status_code=400, detail=f"Duplicate shift name: {name}.")
+        names.add(normalized_name)
+        start_time = str(raw_shift.get("start_time") or "")
+        end_time = str(raw_shift.get("end_time") or "")
+        start_minute = parse_shift_time(start_time, f"{name} start_time")
+        end_minute = parse_shift_time(end_time, f"{name} end_time")
+        segments = shift_segments(start_minute, end_minute)
+        shift_id = str(raw_shift.get("shift_id") or f"shift_{index + 1}").strip() or f"shift_{index + 1}"
+        for segment_start, segment_end in segments:
+            for minute in range(segment_start, segment_end):
+                if covered[minute] is not None:
+                    overlap = normalized_shifts[int(covered[minute])]["name"]
+                    raise HTTPException(status_code=400, detail=f"Shift ranges overlap around {minute_label(minute)}: {overlap} and {name}.")
+                covered[minute] = len(normalized_shifts)
+        normalized_shifts.append(
+            {
+                "shift_id": shift_id,
+                "name": name,
+                "order": index + 1,
+                "start_time": minute_label(start_minute),
+                "end_time": minute_label(end_minute),
+                "start_minute": start_minute,
+                "end_minute": end_minute,
+                "segments": [{"start_minute": segment_start, "end_exclusive_minute": segment_end} for segment_start, segment_end in segments],
+            }
+        )
+
+    gap_minute = next((minute for minute, owner in enumerate(covered) if owner is None), None)
+    if gap_minute is not None:
+        raise HTTPException(status_code=400, detail=f"Shift ranges must cover the full 24-hour day. Gap starts at {minute_label(gap_minute)}.")
+    return normalized_shifts
+
+
+def parse_shift_time(value: str, field_name: str) -> int:
+    parts = value.split(":")
+    if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+        raise HTTPException(status_code=400, detail=f"{field_name} must use HH:MM format.")
+    hour = int(parts[0])
+    minute = int(parts[1])
+    if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+        raise HTTPException(status_code=400, detail=f"{field_name} must be a valid time between 00:00 and 23:59.")
+    return hour * 60 + minute
+
+
+def shift_segments(start_minute: int, end_minute: int) -> list[tuple[int, int]]:
+    end_exclusive = end_minute + 1
+    if start_minute <= end_minute:
+        return [(start_minute, end_exclusive)]
+    return [(start_minute, 1440), (0, end_exclusive)]
+
+
+def shift_config_id(depot_id: str, shift_config: list[dict]) -> str:
+    signature = "|".join(f"{item['order']}:{item['name']}:{item['start_time']}:{item['end_time']}" for item in shift_config)
+    digest = hashlib.sha1(signature.encode("utf-8")).hexdigest()[:12]
+    return f"{depot_id}:{digest}"
+
+
+def build_shift_profile(profile: dict, observations: list[dict], shift_config: list[dict], method: str, start_date: date, end_date: date) -> dict:
+    distribution = build_shift_distribution(observations, shift_config)
+    if method == "DOMINANT_SHIFT":
+        assignment = assign_dominant_shift(distribution, profile)
+    elif method == "MEDIAN_BASED":
+        assignment = assign_median_based_shift(distribution, profile, shift_config)
+    else:
+        assignment = assign_hybrid_shift(distribution, profile, shift_config)
+    return {
+        "depot_id": profile["depot_id"],
+        "spbu_id": profile["spbu_id"],
+        "spbu_code": profile["spbu_code"],
+        "spbu_name": profile["spbu_name"],
+        "shift_config_id": shift_config_id(profile["depot_id"], shift_config),
+        "assignment_method": method,
+        "primary_shift_id": assignment["primary_shift_id"],
+        "primary_shift_name": assignment["primary_shift_name"],
+        "primary_shift_share": assignment["primary_shift_share"],
+        "primary_shift_score": assignment["primary_shift_score"],
+        "secondary_shift_id": assignment["secondary_shift_id"],
+        "secondary_shift_name": assignment["secondary_shift_name"],
+        "secondary_shift_share": assignment["secondary_shift_share"],
+        "secondary_shift_score": assignment["secondary_shift_score"],
+        "primary_secondary_gap": assignment["primary_secondary_gap"],
+        "assignment_score": assignment["assignment_score"],
+        "assignment_status": assignment["assignment_status"],
+        "assignment_confidence": assignment["assignment_confidence"],
+        "leading_shift_ids": assignment["leading_shift_ids"],
+        "leading_shift_names": assignment["leading_shift_names"],
+        "shift_distribution": assignment.get("scored_distribution") or distribution,
+        "observation_count": profile["observation_count"],
+        "median_departure": profile["p50"],
+        "median_departure_minutes": profile["p50_minutes"],
+        "peak_departure_time": profile["peak_departure_time"],
+        "peak_departure_minutes": profile["peak_departure_minutes"],
+        "preferred_historical_departure_window": profile["preferred_historical_departure_window"],
+        "confidence_score": profile["confidence_score"],
+        "confidence_level": profile["confidence_level"],
+        "source_period_start": start_date.isoformat(),
+        "source_period_end": end_date.isoformat(),
+        "calculated_at": utc_now_label(),
+        "algorithm_version": SHIFT_ASSIGNMENT_ALGORITHM_VERSION,
+    }
+
+
+def build_shift_distribution(observations: list[dict], shift_config: list[dict]) -> list[dict]:
+    total = len(observations)
+    counts = Counter(shift_for_minute(int(row["departure_minute"]), shift_config)["shift_id"] for row in observations if row["departure_minute"] is not None)
+    return [
+        {
+            "shift_id": shift["shift_id"],
+            "shift_name": shift["name"],
+            "shift_order": shift["order"],
+            "start_time": shift["start_time"],
+            "end_time": shift["end_time"],
+            "observation_count": counts.get(shift["shift_id"], 0),
+            "share_pct": percentage(counts.get(shift["shift_id"], 0), total),
+            "score": None,
+        }
+        for shift in shift_config
+    ]
+
+
+def assign_dominant_shift(distribution: list[dict], profile: dict) -> dict:
+    ranked = rank_shift_values(distribution, "share_pct")
+    primary = ranked[0]
+    secondary = ranked[1] if len(ranked) > 1 else empty_shift_value()
+    gap = round(primary["share_pct"] - secondary["share_pct"], 1)
+    leading = [item for item in ranked if item["share_pct"] == primary["share_pct"]]
+    status = assignment_status_from_share(profile["observation_count"], primary["share_pct"], gap)
+    if len(leading) > 1 and status != "INSUFFICIENT_DATA":
+        status = "AMBIGUOUS"
+    return assignment_payload(primary, secondary, gap, primary["share_pct"], status, leading)
+
+
+def assign_median_based_shift(distribution: list[dict], profile: dict, shift_config: list[dict]) -> dict:
+    median_shift = shift_for_minute(int(round(profile["p50_minutes"])), shift_config)
+    ranked = rank_shift_values(distribution, "share_pct")
+    primary = next((item for item in distribution if item["shift_id"] == median_shift["shift_id"]), ranked[0])
+    secondary = next((item for item in ranked if item["shift_id"] != primary["shift_id"]), empty_shift_value())
+    gap = round(primary["share_pct"] - secondary["share_pct"], 1)
+    status = assignment_status_from_share(profile["observation_count"], primary["share_pct"], gap)
+    return assignment_payload(primary, secondary, gap, primary["share_pct"], status, [primary])
+
+
+def assign_hybrid_shift(distribution: list[dict], profile: dict, shift_config: list[dict]) -> dict:
+    confidence_factor = SHIFT_CONFIDENCE_FACTORS.get(profile["confidence_level"], 0.6)
+    scored = []
+    for item in distribution:
+        shift = next(config for config in shift_config if config["shift_id"] == item["shift_id"])
+        score = (
+            SHIFT_HYBRID_WEIGHTS["historical_shift_share"] * (item["share_pct"] / 100)
+            + SHIFT_HYBRID_WEIGHTS["preferred_window_overlap"] * preferred_window_overlap(profile, shift)
+            + SHIFT_HYBRID_WEIGHTS["median_alignment"] * minute_alignment(profile["p50_minutes"], shift)
+            + SHIFT_HYBRID_WEIGHTS["peak_alignment"] * minute_alignment(profile["peak_departure_minutes"], shift)
+        ) * confidence_factor
+        scored.append({**item, "score": round(score * 100, 1)})
+    ranked = rank_shift_values(scored, "score")
+    primary = ranked[0]
+    secondary = ranked[1] if len(ranked) > 1 else empty_shift_value()
+    gap = round((primary.get("score") or 0) - (secondary.get("score") or 0), 1)
+    status = assignment_status_from_score(profile["observation_count"], primary.get("score") or 0, gap)
+    if profile["confidence_level"] == "LOW" and status == "CLEAR":
+        status = "MODERATE"
+    return assignment_payload(primary, secondary, gap, primary.get("score") or 0, status, [primary], scored)
+
+
+def assignment_status_from_share(observation_count: int, primary_share: float, gap: float) -> str:
+    if observation_count < SHIFT_STATUS_THRESHOLDS["minimum_observations"]:
+        return "INSUFFICIENT_DATA"
+    if primary_share >= SHIFT_STATUS_THRESHOLDS["dominant_clear_share"] and gap >= SHIFT_STATUS_THRESHOLDS["dominant_clear_gap"]:
+        return "CLEAR"
+    if primary_share < SHIFT_STATUS_THRESHOLDS["dominant_moderate_share"] or gap < SHIFT_STATUS_THRESHOLDS["dominant_ambiguous_gap"]:
+        return "AMBIGUOUS"
+    return "MODERATE"
+
+
+def assignment_status_from_score(observation_count: int, primary_score: float, gap: float) -> str:
+    if observation_count < SHIFT_STATUS_THRESHOLDS["minimum_observations"]:
+        return "INSUFFICIENT_DATA"
+    if primary_score >= SHIFT_STATUS_THRESHOLDS["hybrid_clear_score"] and gap >= SHIFT_STATUS_THRESHOLDS["hybrid_clear_gap"]:
+        return "CLEAR"
+    if primary_score >= SHIFT_STATUS_THRESHOLDS["hybrid_moderate_score"] and gap >= SHIFT_STATUS_THRESHOLDS["hybrid_moderate_gap"]:
+        return "MODERATE"
+    return "AMBIGUOUS"
+
+
+def assignment_payload(primary: dict, secondary: dict, gap: float, score: float, status: str, leading: list[dict], scored_distribution: list[dict] | None = None) -> dict:
+    distribution_by_id = {item["shift_id"]: item for item in scored_distribution or []}
+    return {
+        "primary_shift_id": primary.get("shift_id"),
+        "primary_shift_name": primary.get("shift_name"),
+        "primary_shift_share": primary.get("share_pct", 0),
+        "primary_shift_score": distribution_by_id.get(primary.get("shift_id"), primary).get("score"),
+        "secondary_shift_id": secondary.get("shift_id"),
+        "secondary_shift_name": secondary.get("shift_name"),
+        "secondary_shift_share": secondary.get("share_pct", 0),
+        "secondary_shift_score": distribution_by_id.get(secondary.get("shift_id"), secondary).get("score"),
+        "primary_secondary_gap": gap,
+        "assignment_score": round(score, 1),
+        "assignment_status": status,
+        "assignment_confidence": status,
+        "leading_shift_ids": [item["shift_id"] for item in leading],
+        "leading_shift_names": [item["shift_name"] for item in leading],
+        "scored_distribution": scored_distribution,
+    }
+
+
+def empty_shift_value() -> dict:
+    return {"shift_id": None, "shift_name": None, "share_pct": 0, "score": 0}
+
+
+def rank_shift_values(distribution: list[dict], key: str) -> list[dict]:
+    return sorted(distribution, key=lambda item: (-(item.get(key) or 0), item.get("shift_order") or 0, item.get("shift_name") or ""))
+
+
+def shift_for_minute(minute: int, shift_config: list[dict]) -> dict:
+    normalized = minute % 1440
+    for shift in shift_config:
+        for segment in shift["segments"]:
+            if segment["start_minute"] <= normalized < segment["end_exclusive_minute"]:
+                return shift
+    raise HTTPException(status_code=500, detail=f"No operational shift found for minute {minute_label(normalized)}.")
+
+
+def minute_alignment(minute: float, shift: dict) -> float:
+    return 1.0 if any(segment["start_minute"] <= minute % 1440 < segment["end_exclusive_minute"] for segment in shift["segments"]) else 0.0
+
+
+def preferred_window_overlap(profile: dict, shift: dict) -> float:
+    start = float(profile["p20_minutes"])
+    end = float(profile["p80_minutes"])
+    window_segments = circular_range_segments(start, end)
+    duration = sum(segment_end - segment_start for segment_start, segment_end in window_segments)
+    if duration <= 0:
+        return minute_alignment(profile["p50_minutes"], shift)
+    overlap = 0.0
+    shift_segment_tuples = [(segment["start_minute"], segment["end_exclusive_minute"]) for segment in shift["segments"]]
+    for window_start, window_end in window_segments:
+        for shift_start, shift_end in shift_segment_tuples:
+            overlap += max(0.0, min(window_end, shift_end) - max(window_start, shift_start))
+    return min(1.0, overlap / duration)
+
+
+def circular_range_segments(start: float, end: float) -> list[tuple[float, float]]:
+    start = start % 1440
+    end = end % 1440
+    if start < end:
+        return [(start, end)]
+    if start > end:
+        return [(start, 1440.0), (0.0, end)]
+    return [(start, start + 1.0)]
+
+
+def build_shift_summary(rows: list[dict], shift_config: list[dict]) -> dict:
+    assigned_by_shift = Counter(row["primary_shift_id"] for row in rows if row["assignment_status"] not in {"AMBIGUOUS", "INSUFFICIENT_DATA"})
+    statuses = Counter(row["assignment_status"] for row in rows)
+    return {
+        "profile_count": len(rows),
+        "observation_count": sum(row["observation_count"] for row in rows),
+        "assigned_by_shift": [
+            {
+                "shift_id": shift["shift_id"],
+                "shift_name": shift["name"],
+                "spbu_count": assigned_by_shift.get(shift["shift_id"], 0),
+            }
+            for shift in shift_config
+        ],
+        "status_counts": {
+            "CLEAR": statuses.get("CLEAR", 0),
+            "MODERATE": statuses.get("MODERATE", 0),
+            "AMBIGUOUS": statuses.get("AMBIGUOUS", 0),
+            "INSUFFICIENT_DATA": statuses.get("INSUFFICIENT_DATA", 0),
+        },
+    }
+
+
+def build_shift_affinity_heatmap(rows: list[dict], shift_config: list[dict]) -> dict:
+    return {
+        "x_axis": [shift["name"] for shift in shift_config],
+        "y_axis": [row["spbu_code"] for row in rows],
+        "data": [
+            [shift_index, row_index, distribution["share_pct"], distribution["observation_count"], row["observation_count"]]
+            for row_index, row in enumerate(rows)
+            for shift_index, distribution in enumerate(row["shift_distribution"])
+        ],
+    }
+
+
+def sort_shift_profiles(rows: list[dict], sort_column: str, sort_direction: str) -> list[dict]:
+    sort_keys = {
+        "spbu_code": lambda item: item.get("spbu_code") or "",
+        "primary_shift_share": lambda item: item.get("primary_shift_share") or 0,
+        "p50": lambda item: item.get("median_departure_minutes") or 0,
+        "confidence_score": lambda item: item.get("confidence_score") or 0,
+        "observation_count": lambda item: item.get("observation_count") or 0,
+    }
+    key_fn = sort_keys.get(sort_column, sort_keys["observation_count"])
+    return sorted(rows, key=lambda item: (key_fn(item), item.get("spbu_code") or ""), reverse=sort_direction == "desc")
+
+
+def shift_assignment_label(method: str) -> str:
+    return {
+        "DOMINANT_SHIFT": "Dominant Shift",
+        "MEDIAN_BASED": "Median-Based",
+        "HYBRID_CONFIDENCE_AWARE": "Hybrid / Confidence-Aware",
+    }.get(method, method)
+
+
 def circular_stats(minutes: list[int]) -> dict:
     values = unwrap_circular_minutes(minutes)
     return {
@@ -525,3 +945,7 @@ def percentage(numerator: int, denominator: int) -> float:
     if denominator == 0:
         return 0.0
     return round(numerator * 100 / denominator, 1)
+
+
+def utc_now_label() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
