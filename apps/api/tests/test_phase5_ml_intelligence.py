@@ -1,0 +1,307 @@
+from __future__ import annotations
+
+import uuid
+from datetime import date, datetime
+
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from app.config import get_settings
+from app.database import get_db
+from app.main import app
+from app.models import (
+    Base,
+    BridgeMTTag,
+    BridgeSPBUTag,
+    FactLoadingOrderLine,
+    FactShipment,
+    FactShipmentSPBU,
+    MLBehavioralModel,
+    MLSPBUClusterAssignment,
+    MLTrainingRun,
+    MasterDepot,
+    MasterMT,
+    MasterSPBU,
+    MasterTag,
+    MasterTagType,
+)
+from app.phase5_behavioral import (
+    create_pairing_graph,
+    prepare_training_dataset,
+    train_behavioral_model,
+    validate_feature_weights,
+)
+from app.phase5_concentration import (
+    concentration_statistics,
+    run_concentration_analysis,
+    score_feature_rows,
+    transform_anomaly_scores,
+    utilization_breadth,
+)
+from app.phase5_readiness import build_phase5_readiness
+from app.phase5_registry import (
+    activate_behavioral_model,
+    compare_behavioral_models,
+    duplicate_behavioral_configuration,
+    save_behavioral_model,
+)
+
+
+def make_session():
+    engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    return sessionmaker(bind=engine)
+
+
+def seed_compatible_master(session, spbu_ids: list[str], *, tags: bool = False) -> None:
+    session.add(MasterDepot(depot_id="D1", depot_code="D1", depot_name="Depot One"))
+    session.add(MasterMT(mt_id="T1", vehicle_name_raw="Truck 1", vehicle_registration="T-001", vehicle_type_tag=1, depot_id="D1"))
+    if tags:
+        session.add(MasterTagType(tag_type_id="TYPE_PROJECT", code="PROJECT", name="Project"))
+        for tag_id in ("TAG_A", "TAG_B"):
+            session.add(MasterTag(tag_id=tag_id, tag_type_id="TYPE_PROJECT", tag_value=tag_id, normalized_tag=tag_id))
+            session.add(BridgeMTTag(mt_id="T1", tag_id=tag_id))
+    for index, spbu_id in enumerate(spbu_ids):
+        session.add(
+            MasterSPBU(
+                spbu_id=spbu_id,
+                spbu_code=spbu_id,
+                spbu_name=f"SPBU {spbu_id}",
+                vehicle_type_tag=1,
+                primary_depot_id="D1",
+            )
+        )
+        if tags:
+            session.add(BridgeSPBUTag(spbu_id=spbu_id, tag_id="TAG_A" if index < len(spbu_ids) / 2 else "TAG_B"))
+    session.commit()
+
+
+def add_shipment(session, shipment_id: str, spbu_ids: list[str], day: int, hour: int) -> None:
+    operation_date = date(2026, 1, day)
+    session.add(
+        FactShipment(
+            shipment_id=shipment_id,
+            source_shipment_id=shipment_id,
+            depot_id="D1",
+            mt_id="T1",
+            vehicle_registration="T-001",
+            operating_date=operation_date,
+            gate_out_datetime=datetime(2026, 1, day, hour, 0),
+        )
+    )
+    for spbu_id in spbu_ids:
+        session.add(FactShipmentSPBU(shipment_id=shipment_id, spbu_id=spbu_id))
+
+
+def test_concentration_math_score_transform_and_directional_synthetic_example() -> None:
+    concentrated = concentration_statistics([95, 5])
+    broad = concentration_statistics([10] * 10)
+    assert concentrated["hhi"] > broad["hhi"]
+    assert concentrated["normalized_entropy"] < broad["normalized_entropy"]
+    assert concentration_statistics([10])["normalized_entropy"] == 0
+    assert utilization_breadth(3, 24) == 0.125
+    assert utilization_breadth(0, 0) == 0
+    assert transform_anomaly_scores([0.1, 0.3, 0.2]) == [0.0, 100.0, 50.0]
+
+    broad_features = [[20, 17 + (index % 2), 0.85 + (index % 2) * 0.05, 0.08 + index * 0.002, 0.06, 0.98] for index in range(10)]
+    concentrated_features = [20, 2, 0.1, 0.95, 0.905, 0.286]
+    _raw, normalized, _metadata = score_feature_rows(
+        [*broad_features, concentrated_features],
+        {"n_estimators": 200, "contamination": "auto", "random_seed": 42},
+    )
+    assert normalized[-1] > max(normalized[:-1])
+
+
+def test_readiness_is_exact_and_engine_a_deduplicates_canonical_assignment() -> None:
+    Session = make_session()
+    with Session() as session:
+        seed_compatible_master(session, ["A", "B"])
+        readiness = build_phase5_readiness(session, "D1")
+        assert readiness["is_ready"] is True
+        assert readiness["master_compatibility_pass_percentage"] == 100.0
+
+        add_shipment(session, "S1", ["A"], 1, 6)
+        session.add(
+            FactLoadingOrderLine(
+                loading_order_number="LO-1",
+                source_depot_name="Depot One",
+                shipment_id="S1",
+                spbu_id="A",
+                source_product_name="P1",
+                quantity=8,
+            )
+        )
+        session.add(
+            FactLoadingOrderLine(
+                loading_order_number="LO-2",
+                source_depot_name="Depot One",
+                shipment_id="S1",
+                spbu_id="A",
+                source_product_name="P2",
+                quantity=8,
+            )
+        )
+        session.commit()
+        result = run_concentration_analysis(
+            session,
+            depot_id="D1",
+            baseline_start_date=date(2026, 1, 1),
+            baseline_end_date=date(2026, 1, 1),
+            minimum_shipment_observation=1,
+            parameters={"random_seed": 42},
+            created_by="tester",
+        )
+        assert result["profiles"][0]["shipment_observation_count"] == 1
+        assert result["methodology"]["observation_key"] == ["depot_id", "shipment_id", "spbu_id", "mt_id"]
+
+        session.add(MasterSPBU(spbu_id="BAD", spbu_code="BAD", vehicle_type_tag=2, primary_depot_id="D1"))
+        session.commit()
+        blocked = build_phase5_readiness(session, "D1")
+        assert blocked["is_ready"] is False
+        assert blocked["master_compatibility_pass_percentage"] < 100
+
+
+def test_pairing_graph_isolated_nodes_and_feature_weight_validation() -> None:
+    graph = create_pairing_graph(
+        ["A", "B", "ISOLATED"],
+        [{"spbu_a_id": "A", "spbu_b_id": "B", "probability_b_given_a": 0.8, "probability_a_given_b": 0.4, "pair_count": 5}],
+    )
+    assert graph.number_of_nodes() == 3
+    assert graph.degree["ISOLATED"] == 0
+    assert abs(graph["A"]["B"]["weight"] - 0.6) < 1e-9
+    assert validate_feature_weights({"tag": 0.4, "shift": 0.25, "pairing": 0.35})["pairing"] == 0.35
+    try:
+        validate_feature_weights({"tag": 0.5, "shift": 0.5, "pairing": 0.5})
+    except Exception as exc:
+        assert "sum" in str(exc).lower()
+    else:
+        raise AssertionError("Invalid feature weights must be rejected.")
+
+
+def test_engine_b_dataset_training_artifacts_versioning_activation_and_comparison(tmp_path) -> None:
+    get_settings().ml_artifact_dir = tmp_path
+    Session = make_session()
+    spbu_ids = [f"A{index}" for index in range(4)] + [f"B{index}" for index in range(4)]
+    with Session() as session:
+        seed_compatible_master(session, spbu_ids, tags=True)
+        for day in range(1, 13):
+            add_shipment(session, f"A-{day}", spbu_ids[:4], day, 2)
+            add_shipment(session, f"B-{day}", spbu_ids[4:], day, 14)
+        session.commit()
+        prepared = prepare_training_dataset(
+            session,
+            depot_id="D1",
+            training_start_date=date(2026, 1, 1),
+            training_end_date=date(2026, 1, 12),
+            minimum_shipment_observation=5,
+            shift_definitions=None,
+            created_by="tester",
+        )
+        assert prepared["status"] == "DATASET_READY"
+        assert prepared["dataset_summary"]["sufficient_history_spbu_count"] == 8
+        assert len(prepared["shift_definition_snapshot"]) == 4
+        training_run_id = prepared["training_run_id"]
+        trained = train_behavioral_model(
+            session,
+            training_run_id,
+            {
+                "feature_weights": {"tag": 0.4, "shift": 0.25, "pairing": 0.35},
+                "node2vec_parameters": {"dimensions": 4, "walk_length": 6, "num_walks": 8, "window": 3, "seed": 42},
+                "umap_parameters": {"n_neighbors": 3, "n_components": 2, "min_dist": 0.05, "metric": "euclidean", "random_state": 42},
+                "hdbscan_parameters": {"min_cluster_size": 2, "min_samples": 1, "metric": "euclidean", "cluster_selection_method": "eom"},
+                "random_seed": 42,
+            },
+        )
+        assert trained["status"] == "COMPLETED"
+        assert len(trained["result"]["assignments"]) == 8
+        model_v1 = save_behavioral_model(session, training_run_id, model_name="Behavior 2026", description="v1", created_by="tester")
+        assert model_v1["model_version"] == 1
+        assert model_v1["artifacts"]
+        assert model_v1["shift_definition_snapshot"] == prepared["shift_definition_snapshot"]
+
+        first_run = session.get(MLTrainingRun, training_run_id)
+        copied_run_id = uuid.uuid4().hex
+        session.add(
+            MLTrainingRun(
+                training_run_id=copied_run_id,
+                depot_id=first_run.depot_id,
+                training_start_date=first_run.training_start_date,
+                training_end_date=first_run.training_end_date,
+                minimum_shipment_observation=first_run.minimum_shipment_observation,
+                status="COMPLETED",
+                training_configuration=first_run.training_configuration,
+                dataset_summary=first_run.dataset_summary,
+                dataset_payload=first_run.dataset_payload,
+                result_payload={**first_run.result_payload, "saved": False, "saved_model_id": None},
+                shift_definition_snapshot=first_run.shift_definition_snapshot,
+                master_compatibility_snapshot=first_run.master_compatibility_snapshot,
+                algorithm_version=first_run.algorithm_version,
+                library_versions=first_run.library_versions,
+                artifact_temp_path=first_run.artifact_temp_path,
+                created_by="tester",
+            )
+        )
+        session.commit()
+        model_v2 = save_behavioral_model(session, copied_run_id, model_name="Behavior 2026", description="v2", created_by="tester")
+        assert model_v2["model_version"] == 2
+
+        # Cluster numbers are deliberately unrelated between versions. Comparison
+        # must recover the same memberships through Jaccard matching.
+        assignments_v1 = session.scalars(select(MLSPBUClusterAssignment).where(MLSPBUClusterAssignment.model_id == model_v1["model_id"])).all()
+        assignments_v2 = session.scalars(select(MLSPBUClusterAssignment).where(MLSPBUClusterAssignment.model_id == model_v2["model_id"])).all()
+        for assignment in assignments_v1:
+            assignment.is_noise = False
+            assignment.cluster_id = 0 if assignment.spbu_id.startswith("A") else 1
+            assignment.cluster_label = f"Cluster {assignment.cluster_id + 1}"
+            assignment.membership_probability = 0.9
+        for assignment in assignments_v2:
+            assignment.is_noise = False
+            assignment.cluster_id = 11 if assignment.spbu_id.startswith("A") else 10
+            assignment.cluster_label = f"Cluster {assignment.cluster_id + 1}"
+            assignment.membership_probability = 0.9
+        session.commit()
+        comparison = compare_behavioral_models(session, model_v1["model_id"], model_v2["model_id"])
+        assert len(comparison["stable_cluster_neighborhood_spbu_ids"]) == 8
+        assert all(match["jaccard_similarity"] == 1.0 for match in comparison["cluster_matches"])
+
+        activated_v1 = activate_behavioral_model(session, model_v1["model_id"])
+        assert activated_v1["model_status"] == "ACTIVE"
+        activated_v2 = activate_behavioral_model(session, model_v2["model_id"])
+        assert activated_v2["model_status"] == "ACTIVE"
+        assert session.get(MLBehavioralModel, model_v1["model_id"]).model_status == "SAVED"
+        draft = duplicate_behavioral_configuration(session, model_v2["model_id"])
+        assert "artifact" not in draft
+        assert draft["feature_weights"] == {"tag": 0.4, "shift": 0.25, "pairing": 0.35}
+
+
+def test_phase5_api_permission_seam() -> None:
+    Session = make_session()
+    with Session() as session:
+        seed_compatible_master(session, ["A"])
+
+    def override_db():
+        with Session() as test_session:
+            yield test_session
+
+    previous = dict(app.dependency_overrides)
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        ready = client.get("/api/v1/phase5/readiness?depot_id=D1", headers={"X-User": "viewer", "X-Permissions": "phase5:view"})
+        assert ready.status_code == 200
+        forbidden = client.post(
+            "/api/v1/phase5/engine-a/analyze",
+            headers={"X-User": "viewer", "X-Permissions": "phase5:view"},
+            json={
+                "depot_id": "D1",
+                "baseline_start_date": "2026-01-01",
+                "baseline_end_date": "2026-01-01",
+                "minimum_shipment_observation": 1,
+            },
+        )
+        assert forbidden.status_code == 403
+        assert "phase5:run" in forbidden.text
+    finally:
+        app.dependency_overrides = previous

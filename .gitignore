@@ -9,4 +9,5 @@ node_modules/
 dist/
 .vite/
 coverage/
+ml_artifacts/
 example data/~$*.xlsx

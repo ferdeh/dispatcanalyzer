@@ -22,9 +22,11 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://dispatch:dispatch@db:5432/dispatch_intelligence}
       EXAMPLE_DATA_DIR: /app/example data
+      ML_ARTIFACT_DIR: /app/ml_artifacts
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:3001,http://localhost:5173}
     volumes:
       - ./example data:/app/example data:ro
+      - ml_artifacts:/app/ml_artifacts
     ports:
       - "${API_PORT:-8000}:8000"
     depends_on:
@@ -54,3 +56,4 @@ services:
 
 volumes:
   postgres_data:
+  ml_artifacts:

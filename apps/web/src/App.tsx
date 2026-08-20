@@ -5,6 +5,8 @@ import "./index.css";
 import { apiGet, apiSend, downloadFromApi, importSampleData, uploadImportFile, type SeriesPoint } from "./lib/api";
 import { ChartPanel } from "./components/ChartPanel";
 import { AffinityIntelligencePage } from "./components/AffinityIntelligencePage";
+import { MachineLearningIntelligencePage } from "./components/MachineLearningIntelligencePage";
+import { PredictionAssignmentPage } from "./components/PredictionAssignmentPage";
 
 type Overview = Record<string, number>;
 type Charts = Record<string, SeriesPoint[]>;
@@ -72,7 +74,7 @@ type CrudDomainConfig = {
   depotFilter?: boolean;
   statusFilter?: boolean;
 };
-type Page = "dashboard" | "master-data" | "tag-consistency" | "departure-intelligence" | "pairing-intelligence" | "affinity-intelligence";
+type Page = "dashboard" | "master-data" | "tag-consistency" | "departure-intelligence" | "pairing-intelligence" | "affinity-intelligence" | "machine-learning-intelligence" | "prediction-assignment";
 type CrudPageSize = 10 | 50 | 100 | "ALL";
 type CrudSortDirection = "asc" | "desc";
 type CrudModalMode = "add" | "edit" | null;
@@ -695,6 +697,8 @@ function pageFromPath(pathname: string): Page {
   if (pathname === "/departure-intelligence") return "departure-intelligence";
   if (pathname === "/pairing-intelligence") return "pairing-intelligence";
   if (pathname === "/affinity-intelligence") return "affinity-intelligence";
+  if (pathname === "/machine-learning-intelligence") return "machine-learning-intelligence";
+  if (pathname === "/prediction-assignment") return "prediction-assignment";
   return "dashboard";
 }
 
@@ -2124,6 +2128,10 @@ function App() {
               ? "/pairing-intelligence"
               : page === "affinity-intelligence"
                 ? "/affinity-intelligence"
+                : page === "machine-learning-intelligence"
+                  ? "/machine-learning-intelligence"
+                  : page === "prediction-assignment"
+                    ? "/prediction-assignment"
               : "/";
     if (window.location.pathname !== path) {
       window.history.pushState({}, "", path);
@@ -2159,6 +2167,10 @@ function App() {
                       ? "Phase 3 same-shipment SPBU relationship intelligence."
                       : currentPage === "affinity-intelligence"
                         ? "Phase 4 historical SPBU–MT affinity and temporal stability intelligence."
+                        : currentPage === "machine-learning-intelligence"
+                          ? "Phase 5 historical concentration anomaly detection and SPBU behavioral clustering."
+                          : currentPage === "prediction-assignment"
+                            ? "Phase 6 shipment prediction and globally optimized MT assignment."
                   : "Data Foundation Overview"}
             </p>
           </div>
@@ -2180,6 +2192,12 @@ function App() {
             </button>
             <button className={pageNavButtonClass("affinity-intelligence")} onClick={() => navigate("affinity-intelligence")} title="Open Phase 4 SPBU-MT historical affinity and stability intelligence">
               Phase 4 - SPBU–MT Affinity & Stability
+            </button>
+            <button className={pageNavButtonClass("machine-learning-intelligence")} onClick={() => navigate("machine-learning-intelligence")} title="Open Phase 5 Machine Learning Intelligence">
+              Phase 5 - Machine Learning Intelligence
+            </button>
+            <button className={pageNavButtonClass("prediction-assignment")} onClick={() => navigate("prediction-assignment")} title="Open Phase 6 Prediction and Assignment">
+              Phase 6 - Prediction & Assignment
             </button>
           </div>
         </div>
@@ -2244,6 +2262,14 @@ function App() {
 
         {currentPage === "affinity-intelligence" && (
           <AffinityIntelligencePage depots={depots} products={products} />
+        )}
+
+        {currentPage === "machine-learning-intelligence" && (
+          <MachineLearningIntelligencePage depots={depots} />
+        )}
+
+        {currentPage === "prediction-assignment" && (
+          <PredictionAssignmentPage depots={depots} />
         )}
 
         {currentPage === "pairing-intelligence" && (

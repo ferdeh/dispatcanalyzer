@@ -41,3 +41,25 @@ Phase 4 derived facts:
 - The analytical observation is unique `depot_id + shipment_id + spbu_id + mt_id`.
 - Product is a filter on eligible LO rows, not part of the final observation key.
 - Phase 4 tables contain no future-assignment or optimization fields.
+
+Phase 5 ML persistence:
+
+- `ml_concentration_analysis_run`: depot, baseline period, minimum evidence, exact compatibility snapshot, Isolation Forest parameters/version, status, creator, and timestamps.
+- `ml_spbu_concentration_profile`: concentration features, raw/0–100 score, classification, sufficiency, deterministic peer context, and used/unused compatible-MT distribution for one run/SPBU.
+- `ml_training_run`: staged dataset summary/payload, shift snapshot, model configuration, review result, library versions, temporary artifact reference, status, and audit fields. Training runs are not Model Registry entries.
+- `ml_behavioral_model`: one immutable named/versioned saved package with depot, training window, feature configs/weights, algorithm configs, dependency metadata, quality summary, status, and audit fields.
+- `ml_model_artifact`: relative storage URI, type, SHA-256, and byte size. Serialized binaries are not stored in relational JSON/BLOB columns.
+- `ml_spbu_cluster_assignment`: saved cluster, membership probability, noise flag, operational display context, and 2D visualization coordinates per model/SPBU.
+- `ml_cluster_profile`: interpretable cluster size, tag/shift/pairing profile, membership quality, and low-confidence count.
+
+All Phase 5 run/model facts retain `depot_id`. Unique/index constraints cover run-SPBU, model-SPBU, model-cluster, depot/status, depot/date range, model/version, and score lookup paths.
+
+Phase 6 prediction persistence:
+
+- `prediction_run`: human-readable/UUID identity, depot/model/version, filenames, normalized LO/MT input, validation, parameter/model/original-prediction snapshots, algorithm version, status, duration metrics, creator, timestamps, and failure diagnostic.
+- `prediction_shipment`: current final shipment structure per run/shift with model score, confidence, explanation, and manual flag.
+- `prediction_shipment_line`: canonical LO/SPBU membership plus `model_predicted_shipment_id`, which preserves the original model grouping when the dispatcher moves a line.
+- `prediction_mt_candidate`: available-shift candidates including historical score, compatibility pass/fail, rank, exclusion reason, and structured evidence. Failed master compatibility may be retained for explainability but cannot be optimized.
+- `prediction_assignment`: original and final vehicle/score, assigned/unassigned/manual status, unassigned reason, and override user/reason/time.
+
+Frequently filtered run/model/depot/shift/shipment/vehicle/SPBU/time fields are indexed. Run children cascade on run deletion, but the model foreign key is intentionally restrictive so an audited prediction cannot silently lose model lineage. The original prediction snapshot remains immutable while current shipment and final assignment rows support dispatcher overrides.

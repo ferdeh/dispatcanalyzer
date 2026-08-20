@@ -35,6 +35,8 @@ WEB_PORT=3001 docker compose up -d web
 - Phase 2 - Depot Departure Time Intelligence: `/departure-intelligence`
 - Phase 3 - SPBU Pairing Probability Intelligence: `/pairing-intelligence`
 - Phase 4 - SPBU–MT Historical Affinity & Stability Intelligence: `/affinity-intelligence`
+- Phase 5 - Machine Learning Intelligence: `/machine-learning-intelligence`
+- Phase 6 - Shipment & MT Assignment Prediction: `/prediction-assignment`
 
 Tema UI saat ini diselaraskan dengan aplikasi `vrp_planner` dan palet Petrofin:
 
@@ -514,7 +516,7 @@ Progress yang sudah dibuat:
 - Master Data CRUD untuk MT, SPBU, Loading Order, Depot, Product, Tag, dan Tag Type.
 - CRUD supports add, view, update, soft delete, search, status filter, depot filter, pagination, select all, select per row.
 - Frontend theme sudah diselaraskan dengan `vrp_planner` menggunakan palet Petrofin untuk background, header, navigation, panel, focus state, dan chart.
-- Phase gating placeholder untuk Phase 1 dan Phase 6 endpoints.
+- Phase 6 inference, global MT assignment, audit/override/history/export API dan UI tersedia sebagai extension modular.
 
 Progress validasi:
 
@@ -641,86 +643,135 @@ Gating:
 
 - acceptance tests, UI build, documentation, dan visual validation harus tetap lulus sebelum Phase 5.
 
-### Phase 5: Operational Cluster Intelligence
+### Phase 5 — Machine Learning Intelligence
 
-Tujuan:
+Status saat ini: `IMPLEMENTED`.
 
-- membangun cluster SPBU operasional yang explainable
-- tidak hanya berdasarkan geografi, tetapi juga hard constraints dan historical operation signals
+Tujuan Phase 5 adalah historical pattern discovery dan reusable behavioral clustering. Phase ini tidak melakukan route optimization, tidak merekomendasikan MT untuk assignment berikutnya, tidak menilai dispatcher salah, dan tidak mengubah master data.
 
-Target signals:
+Readiness gate:
 
-- depot
-- vehicle/product restrictions
-- tag similarity
-- geography
-- master travel time
-- actual travel time
-- same-shipment pair strength
-- directed transition strength
-- route-pattern similarity
-- time-window similarity
+- scope selalu satu `depot_id`; data antardepot tidak pernah dicampur
+- seluruh active MT × active SPBU master assignment space pada depot dievaluasi oleh rule source yang sama dengan API compatibility, yaitu `app.compatibility.evaluate_compatibility_entities`
+- execution hanya diizinkan jika `master_compatibility_pass_percentage == 100.00` dan numerator benar-benar sama dengan denominator
+- gate tidak dapat dibypass melalui UI maupun API
 
-Target output:
+Engine A — Historical MT–SPBU Concentration Anomaly:
 
-- `dim_operational_cluster`
-- `bridge_cluster_spbu`
-- `fact_cluster_profile`
-- Cluster Explorer
-- cluster map/network
-- strongest internal pairs
-- bridge SPBU
-- inter-cluster connections
+- memakai istilah **Baseline Period**, bukan training period
+- tidak memakai train/test split
+- memakai canonical observation unik `depot_id + shipment_id + spbu_id + mt_id` dari Phase 4; repeated LO, product, atau compartment line tidak menambah count
+- menghitung compatible MT count, historically used compatible MT count, utilization breadth, dominant MT/share, HHI, Shannon entropy, normalized entropy, dan shipment observation count
+- SPBU di bawah minimum observation disimpan sebagai `INSUFFICIENT_DATA` dan tidak ikut model scoring
+- fitur cukup-data distandardisasi lalu dianalisis dengan Isolation Forest
+- raw severity adalah negatif `IsolationForest.score_samples`; 0–100 score memakai deterministic within-run min-max transform. Run dengan semua raw score sama mendapat score 0 karena model tidak menemukan relative anomaly evidence
+- peer statistics memakai deterministic log2 band dari compatible fleet count
+- hasil tersimpan pada `ml_concentration_analysis_run` dan `ml_spbu_concentration_profile`, dapat dibuka kembali tanpa recompute
+- Engine A mendeteksi unusual historical concentration, bukan future assignment deviation
 
-Status saat ini: `NOT STARTED`.
+Engine B — SPBU Behavioral Clustering:
 
-Gating:
+- memakai workflow `Prepare Dataset → Validate → Configure → Train → Review → Save`
+- tag features mempertahankan tag-type boundary melalui typed multi-hot encoding; Vehicle Class disimpan sebagai feature ordinal
+- shift feature memakai seluruh historical shift distribution dan menyimpan exact shift-definition snapshot pada training run/model
+- Phase 3 same-shipment relationship dibentuk sebagai weighted graph; edge weight adalah mean dari dua directional conditional probabilities
+- pairing graph diubah menjadi embedding dengan Node2Vec memakai seed dan single worker; isolated nodes menerima zero pairing vector, dan graph tanpa edge menghasilkan zero vector untuk seluruh node
+- feature group Tag, Shift, Pairing distandardisasi sendiri-sendiri, dikalikan `sqrt(weight / group_dimension)`, lalu digabung agar group lebar tidak dominan hanya karena memiliki lebih banyak kolom
+- pipeline utama adalah **Node2Vec + UMAP + HDBSCAN**. HDBSCAN noise tetap noise dan ditampilkan sebagai `Noise / Unique Behavioral Pattern`
+- training result harus direview sebelum diberi nama dan disimpan; training tidak otomatis membuat registry model atau mengaktifkannya
+- saved package berisi encoder/configuration, scaler metadata, Node2Vec embeddings, internal/visualization UMAP model, HDBSCAN model, vectors, assignments, profiles, dependency versions, manifest, dan checksum
+- binary package berada pada persistent `ML_ARTIFACT_DIR`; relational table hanya menyimpan artifact metadata/path/checksum
 
-- membutuhkan Phase 2, Phase 3, dan Phase 4 analytics.
+Model lifecycle:
 
-### Phase 6: Interactive Network Intelligence Explorer
+- status: `SAVED`, `ACTIVE`, `ARCHIVED`
+- hanya satu model `ACTIVE` per depot; aktivasi menurunkan model aktif lama menjadi `SAVED`
+- retraining tidak overwrite version lama; nama yang sama pada depot yang sama menghasilkan `v1`, `v2`, dan seterusnya
+- Duplicate hanya menyalin configuration ke training draft baru, bukan trained artifact
+- Compare mengabaikan arbitrary HDBSCAN cluster IDs. Cluster antar-model dipasangkan secara optimal berdasarkan Jaccard similarity membership set menggunakan Hungarian assignment
+- active-model API menyediakan version, period, assignments, membership probability, dan cluster profiles untuk phase berikutnya
 
-Tujuan:
+Local ML setup di luar Docker:
 
-- membangun aplikasi analitik network utama
-- node = SPBU
-- edges = co-shipment relationship dan actual directed transition
-- memberikan side panel intelligence ketika SPBU atau edge diklik
+```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -r apps/api/requirements.txt
+export PYTHONPATH="$PWD/apps/api"
+export ML_ARTIFACT_DIR="$PWD/ml_artifacts"
+```
 
-Target frontend:
+Dependency penting dipin pada `apps/api/requirements.txt`: NumPy, SciPy, scikit-learn (termasuk maintained HDBSCAN implementation), umap-learn, NetworkX, node2vec, gensim, dan joblib. Docker Compose membuat named volume `ml_artifacts` sehingga package model tetap ada setelah API container direstart.
 
-- Cytoscape.js atau graph library yang setara
-- Graph View
-- Map View
-- synchronized filters
-- ego network
-- node click interaction
-- edge click interaction
-- cluster highlighting
-- SPBU intelligence side panel
+Detail teknis lengkap: `docs/PHASE_5_MACHINE_LEARNING_INTELLIGENCE.md`.
 
-Target node insight:
+### Phase 6 — Shipment & MT Assignment Prediction
 
-- SPBU code
-- depot
-- tags
-- vehicle type
-- cluster
-- shipment count
-- GPS visit count
-- compatible MT count
-- historically observed MT count
-- official/observed/preferred time window
-- top paired SPBU
-- incoming/outgoing edges
-- route-pattern participation
-- data-quality status
+Status saat ini: `IMPLEMENTED`.
 
-Status saat ini: `NOT STARTED`.
+Phase 6 adalah inference, bukan training dan bukan route optimization. Satu run menggabungkan saved Phase 5 model, Loading Order aktual, dan daftar MT available untuk menghasilkan struktur `Shift → Predicted Shipment → Loading Order/SPBU → Assigned MT` yang auditable dan dapat menjadi warm start Phase 7.
 
-Gating:
+Input workbook:
 
-- membutuhkan seluruh output Phase 1-5.
+- Loading Order: `loading_order_no`, `shift_gate_out`, `spbu_no`
+- MT Availability: `shift`, `vehicle_registration_no`
+- template dapat diunduh dari page atau API; `.xlsx` dibatasi 10 MB
+- shift divalidasi terhadap exact shift-definition snapshot model, bukan daftar Shift 1–4 yang di-hardcode
+- SPBU/MT harus ada di canonical master dan compatible dengan depot run
+
+Prediction flow:
+
+```text
+Phase 5 Saved Model
+        +
+Loading Order
+        +
+MT Availability
+        ↓
+Shipment Prediction per Shift
+        ↓
+Phase 4 MT Candidate Score
+        ↓
+Phase 1 Master Compatibility Hard Filter
+        ↓
+Global Maximum-Weight Assignment
+        ↓
+Predicted Dispatch Structure
+        ↓
+Phase 7 Warm Start
+```
+
+Shipment inference memakai immutable Phase 5 artifact/normalized model registry: cluster membership probability, same-cluster evidence, model feature weights, dominant-shift match, dan saved historical pairing strength. Score adalah normalized combination dari metric yang benar-benar ada. Pairing di bawah configurable `minimum_prediction_confidence` tetap menjadi valid single-SPBU shipment; LOW confidence ditampilkan dan tidak otomatis dihapus kecuali optional blocking threshold disetel backend.
+
+MT ranking memakai Phase 4 historical `P(MT|SPBU)` dengan deterministic Laplace smoothing. Historical affinity hanya score/ranking; rule Phase 1 dari `app.compatibility.evaluate_compatibility_entities` tetap hard filter terpisah. Untuk multi-SPBU shipment, MT harus lulus rule untuk seluruh SPBU (intersection). Candidate yang gagal disimpan sebagai diagnostic `MASTER_COMPATIBILITY_FAIL` tetapi tidak masuk optimizer.
+
+Assignment memakai exact global maximum-weight bipartite matching per shift melalui NetworkX. Satu MT hanya dapat dipakai satu shipment dalam shift dan satu shipment maksimal mendapat satu MT. Run tidak memaksa assignment: `NO_AVAILABLE_MT`, `NO_COMPATIBLE_MT`, `ALL_COMPATIBLE_MT_ALLOCATED`, dan `LOW_CONFIDENCE` disimpan sebagai reason code.
+
+Dispatcher dapat:
+
+- mengganti MT hanya ke candidate yang available dan compatible
+- move LO/SPBU ke shipment same-shift, membuat shipment baru/single, atau combine same-shift shipment
+- memicu ulang candidate scoring, compatibility filter, dan global assignment untuk shift terkait tanpa training ulang
+- membandingkan immutable model prediction dengan final dispatch plan melalui original snapshot dan `model_predicted_shipment_id`
+
+Persistence migration `0010_phase6_prediction` menambah `prediction_run`, `prediction_shipment`, `prediction_shipment_line`, `prediction_mt_candidate`, dan `prediction_assignment`. Run menyimpan normalized input, validation, model/configuration/algorithm snapshots, duration metrics, original model result, user, timestamps, candidates, exclusions, optimizer result, dan override audit.
+
+History menyediakan View, Download, dan Duplicate/Re-run. Export `.xlsx` berisi sheets Summary, Shipment Result, MT Assignment, MT Candidates, dan Validation. UI juga menyediakan shipment network (bukan route map), MT assignment matrix, alternative candidate ranking, excluded diagnostics, structured explanation, dynamic shift tabs, dan per-shift KPI.
+
+Authorization mengikuti seam existing melalui `X-User` dan `X-Permissions`: `phase6:view`, `phase6:run`, `phase6:export`, `phase6:override`. Local requests tetap permissive sampai identity provider production menggantikan dependency ini.
+
+Phase 6 secara eksplisit tidak menghitung route sequence, distance, travel time, VRP, cost, driver hours, congestion, atau multi-trip feasibility. Semua tanggung jawab tersebut tetap Phase 7.
+
+Verification terakhir:
+
+- migration PostgreSQL berhasil sampai revision `0010_phase6_prediction`
+- seluruh **44 backend tests** lulus pada deployment image
+- **6 focused Phase 6 tests** lulus pada local test runtime
+- TypeScript type checking dan Vite production build lulus
+- API health, 12 Phase 6 route contracts, template `.xlsx`, dan lima tabel persistence telah di-smoke-test
+- page `/prediction-assignment` telah diverifikasi melalui browser tanpa console error atau warning
+- Vite masih memberi non-blocking warning untuk application chunk sekitar 1.52 MB; code splitting ECharts/page modules menjadi technical debt performance
+- host Python tanpa dependency ML lengkap tidak dapat menjalankan dua training tests Phase 5; deployment image adalah verification environment canonical dan membutuhkan `NUMBA_CPU_NAME=generic` serta `NUMBA_DISABLE_JIT=1` pada ARM untuk menghindari illegal-instruction dari Numba/UMAP
 
 ## Phase Quality Gate
 
@@ -765,8 +816,30 @@ Setiap phase harus melewati gate berikut sebelum phase berikutnya dimulai:
 - `GET /api/v1/network/edges`
 - `GET /api/v1/affinity-intelligence/analysis?depot_id=...&start_date=...&end_date=...`
 - `GET /api/v1/affinity-intelligence/available-dates?depot_id=...`
+- `GET /api/v1/phase5/readiness?depot_id=...`
+- `POST /api/v1/phase5/engine-a/analyze`
+- `GET /api/v1/phase5/engine-a/runs`
+- `GET /api/v1/phase5/engine-a/runs/{run_id}`
+- `POST /api/v1/phase5/engine-b/prepare-dataset`
+- `POST /api/v1/phase5/engine-b/training-runs/{run_id}/train`
+- `POST /api/v1/phase5/engine-b/training-runs/{run_id}/save`
+- `GET /api/v1/phase5/models`
+- `GET /api/v1/phase5/models/active?depot_id=...`
+- `POST /api/v1/phase5/models/compare`
+- `GET /api/v1/phase6/models?depot_id=...`
+- `GET /api/v1/phase6/templates/loading-order`
+- `GET /api/v1/phase6/templates/mt-availability`
+- `POST /api/v1/phase6/validate/loading-order`
+- `POST /api/v1/phase6/validate/mt-availability`
+- `POST /api/v1/phase6/predictions`
+- `GET /api/v1/phase6/predictions`
+- `GET /api/v1/phase6/predictions/{run_id}`
+- `POST /api/v1/phase6/predictions/{run_id}/recalculate`
+- `PATCH /api/v1/phase6/predictions/{run_id}/shipments/{shipment_id}`
+- `PATCH /api/v1/phase6/predictions/{run_id}/assignments/{assignment_id}`
+- `GET /api/v1/phase6/predictions/{run_id}/export`
 
-Phase 1 dan Phase 6 endpoints masih gated dan mengembalikan status `NOT_STARTED`.
+Route optimization / VRP endpoints belum diimplementasikan dan tetap menjadi scope Phase 7.
 
 ## Important Design Principles
 
@@ -794,5 +867,6 @@ Dokumen pendukung:
 - `docs/PHASES.md`
 - `docs/PHASE_0_STATUS.md`
 - `docs/PHASE_4_SPBU_MT_AFFINITY.md`
+- `docs/PHASE_5_MACHINE_LEARNING_INTELLIGENCE.md`
 - `docs/FUTURE_VRP_INTEGRATION.md`
 - `docs/FUTURE_AI_ASSISTANT.md`

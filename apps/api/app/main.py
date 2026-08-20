@@ -50,6 +50,8 @@ from .models import (
 )
 from .normalization import clean_str, infer_tag_type, make_id, normalize_key, normalize_product, parse_mt_name, source_int, source_number, split_project_tags
 from .pairing_intelligence import build_pairing_date_availability, build_pairing_intelligence_payload
+from .phase5_routes import router as phase5_router
+from .phase6_routes import router as phase6_router
 from .tag_consistency import build_tag_consistency_payload, get_tag_consistency_detail
 
 settings = get_settings()
@@ -61,6 +63,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(phase5_router)
+app.include_router(phase6_router)
 
 
 class CompatibilityRequest(BaseModel):

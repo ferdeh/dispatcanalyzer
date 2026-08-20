@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     default_geofence_radius_m: float = 125.0
     minimum_gps_dwell_minutes: float = 5.0
     minimum_gps_event_count: int = 2
+    ml_artifact_dir: Path = Path("./ml_artifacts")
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

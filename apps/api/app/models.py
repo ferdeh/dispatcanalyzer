@@ -546,6 +546,294 @@ class FactSPBUMTTemporalProfile(Base):
     algorithm_version: Mapped[str] = mapped_column(String(80), default="spbu_mt_affinity.jsd_v1")
 
 
+class MLConcentrationAnalysisRun(Base):
+    __tablename__ = "ml_concentration_analysis_run"
+    __table_args__ = (
+        Index("ix_ml_concentration_run_depot_dates", "depot_id", "baseline_start_date", "baseline_end_date"),
+        Index("ix_ml_concentration_run_status_created", "status", "created_at"),
+    )
+
+    analysis_run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    depot_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_depot.depot_id"), index=True)
+    baseline_start_date = mapped_column(Date, nullable=False)
+    baseline_end_date = mapped_column(Date, nullable=False)
+    minimum_shipment_observation: Mapped[int] = mapped_column(Integer, default=10)
+    algorithm_name: Mapped[str] = mapped_column(String(80), default="IsolationForest")
+    algorithm_version: Mapped[str] = mapped_column(String(80), default="phase5.concentration.iforest.v1")
+    algorithm_parameters: Mapped[dict] = mapped_column(JSON, default=dict)
+    master_compatibility_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(40), default="PENDING", index=True)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[str] = mapped_column(String(120), default="local-user")
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class MLSPBUConcentrationProfile(Base):
+    __tablename__ = "ml_spbu_concentration_profile"
+    __table_args__ = (
+        UniqueConstraint("analysis_run_id", "spbu_id", name="uq_ml_concentration_profile_run_spbu"),
+        Index("ix_ml_concentration_profile_run_score", "analysis_run_id", "concentration_anomaly_score"),
+        Index("ix_ml_concentration_profile_depot_spbu", "depot_id", "spbu_id"),
+    )
+
+    profile_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    analysis_run_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("ml_concentration_analysis_run.analysis_run_id", ondelete="CASCADE"), index=True
+    )
+    depot_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_depot.depot_id"), index=True)
+    spbu_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_spbu.spbu_id"), index=True)
+    shipment_observation_count: Mapped[int] = mapped_column(Integer, default=0)
+    compatible_mt_count: Mapped[int] = mapped_column(Integer, default=0)
+    historically_used_mt_count: Mapped[int] = mapped_column(Integer, default=0)
+    utilization_breadth: Mapped[float] = mapped_column(Float, default=0.0)
+    dominant_mt_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("master_mt.mt_id"))
+    dominant_mt_share: Mapped[float] = mapped_column(Float, default=0.0)
+    hhi: Mapped[float] = mapped_column(Float, default=0.0)
+    entropy: Mapped[float] = mapped_column(Float, default=0.0)
+    normalized_entropy: Mapped[float] = mapped_column(Float, default=0.0)
+    raw_ml_anomaly_score: Mapped[float | None] = mapped_column(Float)
+    concentration_anomaly_score: Mapped[float | None] = mapped_column(Float, index=True)
+    concentration_classification: Mapped[str] = mapped_column(String(50), default="INSUFFICIENT_DATA")
+    data_sufficiency_status: Mapped[str] = mapped_column(String(40), default="INSUFFICIENT_DATA")
+    peer_statistics: Mapped[dict] = mapped_column(JSON, default=dict)
+    mt_distribution: Mapped[list] = mapped_column(JSON, default=list)
+
+
+class MLTrainingRun(Base):
+    __tablename__ = "ml_training_run"
+    __table_args__ = (
+        Index("ix_ml_training_run_depot_dates", "depot_id", "training_start_date", "training_end_date"),
+        Index("ix_ml_training_run_status_created", "status", "created_at"),
+    )
+
+    training_run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    depot_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_depot.depot_id"), index=True)
+    training_start_date = mapped_column(Date, nullable=False)
+    training_end_date = mapped_column(Date, nullable=False)
+    minimum_shipment_observation: Mapped[int] = mapped_column(Integer, default=10)
+    status: Mapped[str] = mapped_column(String(40), default="PENDING", index=True)
+    training_configuration: Mapped[dict] = mapped_column(JSON, default=dict)
+    dataset_summary: Mapped[dict] = mapped_column(JSON, default=dict)
+    dataset_payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    result_payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    shift_definition_snapshot: Mapped[list] = mapped_column(JSON, default=list)
+    master_compatibility_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    algorithm_version: Mapped[str] = mapped_column(String(80), default="phase5.behavioral.n2v_umap_hdbscan.v1")
+    library_versions: Mapped[dict] = mapped_column(JSON, default=dict)
+    artifact_temp_path: Mapped[str | None] = mapped_column(Text)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_by: Mapped[str] = mapped_column(String(120), default="local-user")
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class MLBehavioralModel(Base):
+    __tablename__ = "ml_behavioral_model"
+    __table_args__ = (
+        UniqueConstraint("depot_id", "model_name", "model_version", name="uq_ml_behavioral_model_name_version"),
+        Index("ix_ml_behavioral_model_depot_status", "depot_id", "model_status"),
+        Index("ix_ml_behavioral_model_created", "created_at"),
+    )
+
+    model_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    model_name: Mapped[str] = mapped_column(String(255), index=True)
+    model_description: Mapped[str | None] = mapped_column(Text)
+    model_version: Mapped[int] = mapped_column(Integer, default=1)
+    depot_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_depot.depot_id"), index=True)
+    source_training_run_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("ml_training_run.training_run_id"))
+    training_start_date = mapped_column(Date, nullable=False)
+    training_end_date = mapped_column(Date, nullable=False)
+    training_shipment_count: Mapped[int] = mapped_column(Integer, default=0)
+    training_spbu_count: Mapped[int] = mapped_column(Integer, default=0)
+    minimum_shipment_observation: Mapped[int] = mapped_column(Integer, default=10)
+    tag_feature_configuration: Mapped[dict] = mapped_column(JSON, default=dict)
+    tag_encoder_reference: Mapped[dict] = mapped_column(JSON, default=dict)
+    shift_definition_snapshot: Mapped[list] = mapped_column(JSON, default=list)
+    feature_weights: Mapped[dict] = mapped_column(JSON, default=dict)
+    node2vec_parameters: Mapped[dict] = mapped_column(JSON, default=dict)
+    umap_parameters: Mapped[dict] = mapped_column(JSON, default=dict)
+    hdbscan_parameters: Mapped[dict] = mapped_column(JSON, default=dict)
+    dependency_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
+    cluster_count: Mapped[int] = mapped_column(Integer, default=0)
+    noise_spbu_count: Mapped[int] = mapped_column(Integer, default=0)
+    average_membership_probability: Mapped[float] = mapped_column(Float, default=0.0)
+    algorithm_version: Mapped[str] = mapped_column(String(80), default="phase5.behavioral.n2v_umap_hdbscan.v1")
+    library_versions: Mapped[dict] = mapped_column(JSON, default=dict)
+    random_seed: Mapped[int] = mapped_column(Integer, default=42)
+    model_status: Mapped[str] = mapped_column(String(30), default="SAVED", index=True)
+    created_by: Mapped[str] = mapped_column(String(120), default="local-user")
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class MLModelArtifact(Base):
+    __tablename__ = "ml_model_artifact"
+    __table_args__ = (UniqueConstraint("model_id", "artifact_type", name="uq_ml_model_artifact_type"),)
+
+    artifact_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    model_id: Mapped[str] = mapped_column(String(64), ForeignKey("ml_behavioral_model.model_id", ondelete="CASCADE"), index=True)
+    artifact_type: Mapped[str] = mapped_column(String(60))
+    storage_uri: Mapped[str] = mapped_column(Text)
+    checksum_sha256: Mapped[str] = mapped_column(String(64))
+    byte_size: Mapped[int] = mapped_column(Integer, default=0)
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class MLSPBUClusterAssignment(Base):
+    __tablename__ = "ml_spbu_cluster_assignment"
+    __table_args__ = (
+        UniqueConstraint("model_id", "spbu_id", name="uq_ml_cluster_assignment_model_spbu"),
+        Index("ix_ml_cluster_assignment_depot_spbu", "depot_id", "spbu_id"),
+        Index("ix_ml_cluster_assignment_model_cluster", "model_id", "cluster_id"),
+    )
+
+    assignment_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    model_id: Mapped[str] = mapped_column(String(64), ForeignKey("ml_behavioral_model.model_id", ondelete="CASCADE"), index=True)
+    depot_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_depot.depot_id"), index=True)
+    spbu_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_spbu.spbu_id"), index=True)
+    cluster_id: Mapped[int | None] = mapped_column(Integer)
+    cluster_label: Mapped[str] = mapped_column(String(120))
+    membership_probability: Mapped[float] = mapped_column(Float, default=0.0)
+    is_noise: Mapped[bool] = mapped_column(Boolean, default=False)
+    dominant_shift: Mapped[str | None] = mapped_column(String(120))
+    key_tags: Mapped[list] = mapped_column(JSON, default=list)
+    visualization_x: Mapped[float | None] = mapped_column(Float)
+    visualization_y: Mapped[float | None] = mapped_column(Float)
+
+
+class MLClusterProfile(Base):
+    __tablename__ = "ml_cluster_profile"
+    __table_args__ = (UniqueConstraint("model_id", "cluster_id", name="uq_ml_cluster_profile_model_cluster"),)
+
+    cluster_profile_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    model_id: Mapped[str] = mapped_column(String(64), ForeignKey("ml_behavioral_model.model_id", ondelete="CASCADE"), index=True)
+    cluster_id: Mapped[int] = mapped_column(Integer)
+    cluster_label: Mapped[str] = mapped_column(String(120))
+    cluster_size: Mapped[int] = mapped_column(Integer, default=0)
+    training_spbu_percentage: Mapped[float] = mapped_column(Float, default=0.0)
+    common_tags: Mapped[list] = mapped_column(JSON, default=list)
+    shift_distribution: Mapped[list] = mapped_column(JSON, default=list)
+    dominant_shift: Mapped[str | None] = mapped_column(String(120))
+    top_internal_pairings: Mapped[list] = mapped_column(JSON, default=list)
+    average_membership_probability: Mapped[float] = mapped_column(Float, default=0.0)
+    low_confidence_member_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class PredictionRun(Base):
+    __tablename__ = "prediction_run"
+    __table_args__ = (
+        Index("ix_prediction_run_depot_created", "depot_id", "created_at"),
+        Index("ix_prediction_run_model_created", "model_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    prediction_run_no: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    depot_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_depot.depot_id"), index=True)
+    model_id: Mapped[str] = mapped_column(String(64), ForeignKey("ml_behavioral_model.model_id"), index=True)
+    model_version: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(40), default="PENDING", index=True)
+    created_by: Mapped[str] = mapped_column(String(120), default="local-user")
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at = mapped_column(DateTime(timezone=True), nullable=True)
+    input_loading_order_filename: Mapped[str] = mapped_column(String(255))
+    input_mt_availability_filename: Mapped[str] = mapped_column(String(255))
+    input_loading_order_snapshot: Mapped[list] = mapped_column(JSON, default=list)
+    input_mt_availability_snapshot: Mapped[list] = mapped_column(JSON, default=list)
+    validation_snapshot: Mapped[list] = mapped_column(JSON, default=list)
+    parameter_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    model_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    original_prediction_snapshot: Mapped[list] = mapped_column(JSON, default=list)
+    algorithm_version: Mapped[str] = mapped_column(String(100))
+    validation_duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    shipment_prediction_duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    mt_prediction_duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    assignment_optimization_duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    total_prediction_duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    error_code: Mapped[str | None] = mapped_column(String(80))
+    error_message: Mapped[str | None] = mapped_column(Text)
+
+
+class PredictionShipment(Base):
+    __tablename__ = "prediction_shipment"
+    __table_args__ = (
+        UniqueConstraint("prediction_run_id", "predicted_shipment_id", name="uq_prediction_shipment_run_number"),
+        Index("ix_prediction_shipment_run_shift", "prediction_run_id", "shift_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    prediction_run_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("prediction_run.id", ondelete="CASCADE"), index=True
+    )
+    predicted_shipment_id: Mapped[str] = mapped_column(String(120), index=True)
+    shift_id: Mapped[str] = mapped_column(String(80), index=True)
+    shift_name: Mapped[str] = mapped_column(String(120))
+    shipment_prediction_score: Mapped[float] = mapped_column(Float, default=0.0)
+    confidence_level: Mapped[str] = mapped_column(String(20), default="LOW")
+    low_confidence: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_manual_override: Mapped[bool] = mapped_column(Boolean, default=False)
+    explanation: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class PredictionShipmentLine(Base):
+    __tablename__ = "prediction_shipment_line"
+    __table_args__ = (
+        UniqueConstraint("prediction_run_id", "loading_order_no", name="uq_prediction_line_run_lo"),
+        Index("ix_prediction_line_shipment_spbu", "prediction_shipment_id", "spbu_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    prediction_run_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("prediction_run.id", ondelete="CASCADE"), index=True
+    )
+    prediction_shipment_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("prediction_shipment.id", ondelete="CASCADE"), index=True
+    )
+    loading_order_no: Mapped[str] = mapped_column(String(120), index=True)
+    spbu_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_spbu.spbu_id"), index=True)
+    spbu_no: Mapped[str] = mapped_column(String(120))
+    model_predicted_shipment_id: Mapped[str] = mapped_column(String(120))
+
+
+class PredictionMTCandidate(Base):
+    __tablename__ = "prediction_mt_candidate"
+    __table_args__ = (
+        UniqueConstraint("prediction_shipment_id", "vehicle_id", name="uq_prediction_candidate_shipment_vehicle"),
+        Index("ix_prediction_candidate_shipment_rank", "prediction_shipment_id", "candidate_rank"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    prediction_shipment_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("prediction_shipment.id", ondelete="CASCADE"), index=True
+    )
+    vehicle_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_mt.mt_id"), index=True)
+    prediction_score: Mapped[float] = mapped_column(Float, default=0.0)
+    compatibility_status: Mapped[str] = mapped_column(String(20))
+    candidate_rank: Mapped[int | None] = mapped_column(Integer)
+    exclusion_reason: Mapped[str | None] = mapped_column(String(120))
+    explanation: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class PredictionAssignment(Base):
+    __tablename__ = "prediction_assignment"
+    __table_args__ = (UniqueConstraint("prediction_shipment_id", name="uq_prediction_assignment_shipment"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    prediction_shipment_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("prediction_shipment.id", ondelete="CASCADE"), index=True
+    )
+    original_vehicle_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("master_mt.mt_id"))
+    original_assignment_score: Mapped[float | None] = mapped_column(Float)
+    final_vehicle_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("master_mt.mt_id"), index=True)
+    final_assignment_score: Mapped[float | None] = mapped_column(Float)
+    assignment_status: Mapped[str] = mapped_column(String(40), default="UNASSIGNED")
+    unassigned_reason: Mapped[str | None] = mapped_column(String(80))
+    override_reason: Mapped[str | None] = mapped_column(Text)
+    override_user: Mapped[str | None] = mapped_column(String(120))
+    override_timestamp = mapped_column(DateTime(timezone=True), nullable=True)
+
+
 class DataQualityIssue(Base):
     __tablename__ = "data_quality_issue"
 

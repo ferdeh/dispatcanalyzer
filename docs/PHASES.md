@@ -12,9 +12,9 @@ Phase 4: SPBU–MT historical affinity and stability intelligence.
 
 Phase 5: operational cluster intelligence.
 
-Phase 6: interactive network intelligence explorer.
+Phase 6: shipment and MT assignment prediction.
 
-The repository includes read-only Phase 2, Phase 3, and Phase 4 pages/APIs. They describe historical operations and do not perform route optimization or future dispatch assignment.
+The repository includes read-only Phase 2–4 intelligence, persisted Phase 5 ML workflows, and Phase 6 inference/assignment. No phase through Phase 6 performs route sequencing or VRP.
 
 ## Phase 2
 
@@ -47,3 +47,37 @@ The repository includes read-only Phase 2, Phase 3, and Phase 4 pages/APIs. They
 - Algorithm: `spbu_mt_affinity.jsd_v1`
 - Schema: `fact_spbu_mt_pair`, `fact_spbu_mt_profile`, `fact_spbu_mt_temporal_profile`
 - Output is historical evidence only; no future assignment or optimization is produced
+
+## Phase 5
+
+- API prefix: `/api/v1/phase5`
+- UI: `/machine-learning-intelligence`
+- Hard gate: exact 100% canonical master compatibility within one depot
+- Engine A: baseline-period historical concentration using Isolation Forest; no train/test split
+- Engine A observation: unique `depot_id + shipment_id + spbu_id + mt_id`
+- Engine B features: typed master-tag vector + full shift distribution + Phase 3 pairing Node2Vec embedding
+- Engine B pipeline: independently scaled/weighted feature fusion → UMAP → HDBSCAN
+- Isolated pairing nodes: deterministic zero embedding; HDBSCAN noise remains unassigned
+- Lifecycle: prepare, validate, train, review, name, save, activate/archive/version, compare
+- Comparison: optimal Jaccard membership matching; cluster numbers are never treated as stable identities
+- Schema: `ml_concentration_analysis_run`, `ml_spbu_concentration_profile`, `ml_training_run`, `ml_behavioral_model`, `ml_model_artifact`, `ml_spbu_cluster_assignment`, `ml_cluster_profile`
+- Artifact storage: filesystem/volume under `ML_ARTIFACT_DIR`, relational metadata and SHA-256 only
+- Algorithm versions: `phase5.concentration.iforest.v1`, `phase5.behavioral.n2v_umap_hdbscan.v1`
+
+## Phase 6
+
+- API prefix: `/api/v1/phase6`
+- UI: `/prediction-assignment`
+- Scope: exactly one depot and one `SAVED`/`ACTIVE` Phase 5 model per run
+- Inputs: Loading Order and shift-scoped available MT `.xlsx` workbooks
+- Validation: required/empty/duplicate fields, canonical master, depot, and model shift snapshot
+- Shipment inference: deterministic, independent per shift, allows single-SPBU shipment, retains normalized confidence evidence
+- MT score: Phase 4 historical affinity; master compatibility remains a separate Phase 1 hard filter
+- Multi-SPBU compatibility: intersection across all shipment SPBU
+- Assignment: exact global maximum-weight one-to-one matching per shift, not greedy
+- Persistence: run, shipment, line, candidate/diagnostic, assignment/original/final layers, snapshots, durations, audit
+- Overrides: compatible MT change and same-shift shipment restructure; affected shift is rescored/reassigned without training
+- Export: Summary, Shipment Result, MT Assignment, MT Candidates, Validation
+- Visualization: predicted same-shipment network and assignment matrix; neither is route sequencing
+- Algorithm: `phase6.shipment_mt_prediction.v1`
+- Phase 7 boundary: output is a warm start only; distance/time/VRP/multi-trip remain out of scope
