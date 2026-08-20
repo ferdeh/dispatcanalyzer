@@ -4,6 +4,7 @@ import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
 import "./index.css";
 import { apiGet, apiSend, downloadFromApi, importSampleData, uploadImportFile, type SeriesPoint } from "./lib/api";
 import { ChartPanel } from "./components/ChartPanel";
+import { AffinityIntelligencePage } from "./components/AffinityIntelligencePage";
 
 type Overview = Record<string, number>;
 type Charts = Record<string, SeriesPoint[]>;
@@ -71,7 +72,7 @@ type CrudDomainConfig = {
   depotFilter?: boolean;
   statusFilter?: boolean;
 };
-type Page = "dashboard" | "master-data" | "tag-consistency" | "departure-intelligence";
+type Page = "dashboard" | "master-data" | "tag-consistency" | "departure-intelligence" | "pairing-intelligence" | "affinity-intelligence";
 type CrudPageSize = 10 | 50 | 100 | "ALL";
 type CrudSortDirection = "asc" | "desc";
 type CrudModalMode = "add" | "edit" | null;
@@ -318,6 +319,95 @@ type ShiftAnalysis = {
 };
 type DepartureConfidenceFilter = "ALL" | "HIGH" | "MEDIUM" | "LOW";
 type ShiftSummaryFilter = "ALL" | `SHIFT:${string}` | `STATUS:${"AMBIGUOUS" | "INSUFFICIENT_DATA"}`;
+type PairingFilters = {
+  depotId: string;
+  rangePreset: "7" | "14" | "30" | "CUSTOM";
+  startDate: string;
+  endDate: string;
+  productId: string;
+  search: string;
+};
+type PairingSortColumn =
+  | "evidence_strength"
+  | "pair_count"
+  | "probability_b_given_a"
+  | "probability_a_given_b"
+  | "support"
+  | "lift"
+  | "confidence_score"
+  | "spbu_a_code"
+  | "spbu_b_code";
+type PairingPair = {
+  spbu_a_id: string;
+  spbu_b_id: string;
+  spbu_a_code: string;
+  spbu_a_name: string | null;
+  spbu_b_code: string;
+  spbu_b_name: string | null;
+  pair_count: number;
+  shipment_a_count: number;
+  shipment_b_count: number;
+  total_shipment_count: number;
+  probability_b_given_a: number;
+  probability_a_given_b: number;
+  support: number;
+  lift: number;
+  confidence_score: number;
+  confidence_level: "HIGH" | "MEDIUM" | "LOW" | "INSUFFICIENT_DATA";
+  observation_count: number;
+  evidence_count: number;
+};
+type PairingAnalysis = {
+  algorithm_version: string;
+  effective_filters: Record<string, string | number | null>;
+  summary: {
+    total_shipments: number;
+    source_shipments: number;
+    multi_spbu_shipments: number;
+    unique_spbu: number;
+    unique_spbu_pairs: number;
+    high_confidence_pairs: number;
+    average_spbu_per_shipment: number;
+  };
+  data_quality: {
+    source_shipments: number;
+    eligible_shipments: number;
+    excluded_shipments: number;
+    exclusion_reasons: Array<{ reason: string; count: number }>;
+  };
+  distribution: SeriesPoint[];
+  pairs: PairingPair[];
+  total: number;
+  limit: number;
+  offset: number;
+  matrix: { spbu_ids: string[]; x_axis: string[]; y_axis: string[]; data: Array<[number, number, number, number, number, number, number, number, string]>; selected_spbu_id: string | null };
+  network: { nodes: Array<{ id: string; name: string; value: number; symbolSize: number }>; edges: Array<{ source: string; target: string; value: number; label: string; metrics: PairingPair }> };
+  detail: {
+    spbu_id: string;
+    spbu_code: string;
+    spbu_name: string | null;
+    depot_name: string;
+    historical_shipments: number;
+    top_pairs: Array<PairingPair & { candidate_spbu_id: string; candidate_spbu_code: string; pair_probability: number; reverse_probability: number }>;
+  } | null;
+  evidence: {
+    pair: { spbu_a_id: string; spbu_a_code: string; spbu_b_id: string; spbu_b_code: string } | null;
+    distinct_shipment_count: number;
+    rows: Array<{
+      shipment_id: string;
+      source_shipment_id: string;
+      date: string | null;
+      vehicle_registration: string | null;
+      gate_out: string | null;
+      spbu_in_shipment: string[];
+      products: string[];
+      quantity: number;
+    }>;
+  };
+  transitions: Array<{ from_spbu_code: string; to_spbu_code: string; transition_count: number; transition_probability: number; confidence_level: string }>;
+  traceability: Record<string, string | number>;
+  notes: string[];
+};
 type DepartureProfileFilterOptions = {
   confidenceLevel?: DepartureConfidenceFilter;
   shiftSummaryFilter?: ShiftSummaryFilter;
@@ -555,6 +645,16 @@ function formatDateTime(value: string | null): string {
   }).format(date);
 }
 
+function formatPercent(value: number | null | undefined): string {
+  if (value === null || value === undefined || Number.isNaN(value)) return "-";
+  return `${(value * 100).toLocaleString(undefined, { maximumFractionDigits: 1 })}%`;
+}
+
+function formatMetric(value: number | null | undefined, maximumFractionDigits = 2): string {
+  if (value === null || value === undefined || Number.isNaN(value)) return "-";
+  return value.toLocaleString(undefined, { maximumFractionDigits });
+}
+
 function minuteAxisLabel(value: number): string {
   const rounded = Math.round(value) % 1440;
   return `${String(Math.floor(rounded / 60)).padStart(2, "0")}:${String(rounded % 60).padStart(2, "0")}`;
@@ -579,6 +679,12 @@ function isoDateFromDate(value: Date): string {
   return isoDateFromParts(value.getFullYear(), value.getMonth(), value.getDate());
 }
 
+function addDays(value: Date, days: number): Date {
+  const next = new Date(value);
+  next.setDate(next.getDate() + days);
+  return next;
+}
+
 function monthLabel(value: Date): string {
   return new Intl.DateTimeFormat("en-US", { month: "short", year: "numeric" }).format(value);
 }
@@ -587,6 +693,8 @@ function pageFromPath(pathname: string): Page {
   if (pathname === "/master-data") return "master-data";
   if (pathname === "/tag-consistency") return "tag-consistency";
   if (pathname === "/departure-intelligence") return "departure-intelligence";
+  if (pathname === "/pairing-intelligence") return "pairing-intelligence";
+  if (pathname === "/affinity-intelligence") return "affinity-intelligence";
   return "dashboard";
 }
 
@@ -946,11 +1054,31 @@ function App() {
   const [departureConfidenceFilter, setDepartureConfidenceFilter] = useState<DepartureConfidenceFilter>("ALL");
   const [shiftSummaryFilter, setShiftSummaryFilter] = useState<ShiftSummaryFilter>("ALL");
   const [boxPlotHighlightBy, setBoxPlotHighlightBy] = useState<"NONE" | "PRIMARY_SHIFT" | "ASSIGNMENT_STATUS" | "CONFIDENCE">("NONE");
+  const [pairingFilters, setPairingFilters] = useState<PairingFilters>({
+    depotId: "",
+    rangePreset: "30",
+    startDate: "",
+    endDate: "",
+    productId: "",
+    search: ""
+  });
+  const [pairingAnalysis, setPairingAnalysis] = useState<PairingAnalysis | null>(null);
+  const [appliedPairingFilters, setAppliedPairingFilters] = useState<PairingFilters | null>(null);
+  const [pairingDateAvailability, setPairingDateAvailability] = useState<DepartureDateAvailability | null>(null);
+  const [pairingDateLoading, setPairingDateLoading] = useState(false);
+  const [pairingLoading, setPairingLoading] = useState(false);
+  const [pairingOffset, setPairingOffset] = useState(0);
+  const [pairingLimit, setPairingLimit] = useState(25);
+  const [pairingSortColumn, setPairingSortColumn] = useState<PairingSortColumn>("evidence_strength");
+  const [pairingSortDirection, setPairingSortDirection] = useState<CrudSortDirection>("desc");
+  const [selectedPairingSpbuId, setSelectedPairingSpbuId] = useState<string | null>(null);
+  const [selectedPairingPair, setSelectedPairingPair] = useState<{ spbu_a_id: string; spbu_b_id: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const crudRequestRef = useRef(0);
   const tagRequestRef = useRef(0);
   const departureRequestRef = useRef(0);
+  const pairingRequestRef = useRef(0);
   const configs = useMemo(() => crudConfigs(depots, tagTypes), [depots, tagTypes]);
   const activeCrudConfig = configs[crudDomain];
 
@@ -1109,6 +1237,81 @@ function App() {
     }
   }
 
+  async function fetchPairingDateAvailability(depotId: string) {
+    if (!depotId) {
+      setPairingDateAvailability(null);
+      return;
+    }
+    setPairingDateLoading(true);
+    try {
+      const payload = await apiGet<DepartureDateAvailability>(`/api/v1/pairing-intelligence/available-dates?depot_id=${encodeURIComponent(depotId)}`);
+      setPairingDateAvailability(payload);
+      setPairingFilters((current) => {
+        if (current.startDate || current.endDate || !payload.max_date) return current;
+        const end = parseIsoDate(payload.max_date);
+        return { ...current, endDate: payload.max_date, startDate: isoDateFromDate(addDays(end, -29)) };
+      });
+    } catch (err) {
+      setPairingDateAvailability(null);
+      setError(err instanceof Error ? err.message : "Failed to load pairing date availability");
+    } finally {
+      setPairingDateLoading(false);
+    }
+  }
+
+  async function fetchPairingAnalysis(
+    nextOffset = pairingOffset,
+    filters = pairingFilters,
+    selectedSpbuId = selectedPairingSpbuId,
+    selectedPair = selectedPairingPair
+  ): Promise<PairingAnalysis | null> {
+    if (!filters.depotId || !filters.startDate || !filters.endDate) {
+      setError("Select a depot, date range, and product scope before running Phase 3.");
+      return null;
+    }
+    const requestId = pairingRequestRef.current + 1;
+    pairingRequestRef.current = requestId;
+    setPairingLoading(true);
+    setError(null);
+    try {
+      const params = new URLSearchParams({
+        depot_id: filters.depotId,
+        start_date: filters.startDate,
+        end_date: filters.endDate,
+        limit: String(pairingLimit),
+        offset: String(nextOffset),
+        sort_column: pairingSortColumn,
+        sort_direction: pairingSortDirection,
+        matrix_limit: "30",
+        network_limit: "40"
+      });
+      if (filters.productId) params.set("product_id", filters.productId);
+      if (filters.search.trim()) params.set("search", filters.search.trim());
+      if (selectedSpbuId) params.set("selected_spbu_id", selectedSpbuId);
+      if (selectedPair) {
+        params.set("evidence_spbu_a_id", selectedPair.spbu_a_id);
+        params.set("evidence_spbu_b_id", selectedPair.spbu_b_id);
+      }
+      const payload = await apiGet<PairingAnalysis>(`/api/v1/pairing-intelligence/analysis?${params.toString()}`);
+      if (pairingRequestRef.current === requestId) {
+        setPairingAnalysis(payload);
+        setAppliedPairingFilters(filters);
+        setSelectedPairingSpbuId(payload.detail?.spbu_id ?? null);
+        setSelectedPairingPair(payload.evidence.pair ? { spbu_a_id: payload.evidence.pair.spbu_a_id, spbu_b_id: payload.evidence.pair.spbu_b_id } : null);
+      }
+      return payload;
+    } catch (err) {
+      if (pairingRequestRef.current === requestId) {
+        setError(err instanceof Error ? err.message : "Failed to load SPBU pairing intelligence");
+      }
+      return null;
+    } finally {
+      if (pairingRequestRef.current === requestId) {
+        setPairingLoading(false);
+      }
+    }
+  }
+
   async function fetchShiftAnalysis(filters = appliedDepartureFilters) {
     if (!filters) return;
     const validationErrors = validateOperationalShifts(shiftConfigs);
@@ -1196,6 +1399,18 @@ function App() {
   }, [currentPage, departureFilters.depotId]);
 
   useEffect(() => {
+    if (currentPage === "pairing-intelligence" && pairingAnalysis && appliedPairingFilters) {
+      fetchPairingAnalysis(pairingOffset, appliedPairingFilters);
+    }
+  }, [currentPage, pairingOffset, pairingLimit, pairingSortColumn, pairingSortDirection]);
+
+  useEffect(() => {
+    if (currentPage === "pairing-intelligence") {
+      fetchPairingDateAvailability(pairingFilters.depotId);
+    }
+  }, [currentPage, pairingFilters.depotId]);
+
+  useEffect(() => {
     const handlePopState = () => setCurrentPage(pageFromPath(window.location.pathname));
     window.addEventListener("popstate", handlePopState);
     return () => window.removeEventListener("popstate", handlePopState);
@@ -1265,6 +1480,63 @@ function App() {
     [departureProfiles, shiftRowBySpbuId]
   );
   const selectedShiftRow = shiftAnalysis?.rows.find((row) => row.spbu_id === selectedDepartureProfile?.spbu_id) ?? null;
+  const pairingRows = pairingAnalysis?.pairs ?? [];
+  const pairingSummary = pairingAnalysis?.summary;
+  const pairingTotal = pairingAnalysis?.total ?? 0;
+  const pairingShowingStart = pairingTotal === 0 ? 0 : pairingOffset + 1;
+  const pairingShowingEnd = Math.min(pairingOffset + pairingLimit, pairingTotal);
+  const pairingPageNumber = Math.floor(pairingOffset / pairingLimit) + 1;
+  const pairingPageCount = Math.max(1, Math.ceil(pairingTotal / pairingLimit));
+  const canPreviousPairingPage = pairingOffset > 0 && !pairingLoading;
+  const canNextPairingPage = pairingOffset + pairingLimit < pairingTotal && !pairingLoading;
+  const selectedPairingDetail = pairingAnalysis?.detail ?? null;
+  const pairingMatrixOption = useMemo(() => {
+    const matrix = pairingAnalysis?.matrix;
+    if (!matrix || matrix.x_axis.length === 0) return null;
+    return {
+      tooltip: {
+        position: "top",
+        formatter: (params: { data: [number, number, number, number, number, number, number, number, string] }) => {
+          const [x, y, probability, pairCount, reverseProbability, support, lift, observationCount, confidence] = params.data;
+          return `${matrix.y_axis[y]} -> ${matrix.x_axis[x]}<br />Pair Count: ${pairCount}<br />P(candidate|anchor): ${formatPercent(probability)}<br />Reverse Probability: ${formatPercent(reverseProbability)}<br />Support: ${formatPercent(support)}<br />Lift: ${formatMetric(lift)}<br />Observation Count: ${observationCount}<br />Confidence: ${confidence}`;
+        }
+      },
+      grid: { top: 20, right: 24, bottom: 84, left: 96 },
+      xAxis: { type: "category", data: matrix.x_axis, axisLabel: { interval: 0, rotate: 45 } },
+      yAxis: { type: "category", data: matrix.y_axis, axisLabel: { interval: 0 } },
+      visualMap: { min: 0, max: 1, dimension: 2, calculable: true, orient: "horizontal", left: "center", bottom: 0, inRange: { color: ["#f8fafc", "#dbeafe", "#93c5fd", "#0b73bf"] } },
+      series: [{ type: "heatmap", data: matrix.data, itemStyle: { borderColor: "#ffffff", borderWidth: 1 } }]
+    };
+  }, [pairingAnalysis]);
+  const pairingNetworkOption = useMemo(() => {
+    const network = pairingAnalysis?.network;
+    if (!network || network.nodes.length === 0) return null;
+    return {
+      tooltip: {
+        formatter: (params: { dataType?: string; data?: { name?: string; value?: number; metrics?: PairingPair; label?: string } }) => {
+          if (params.dataType === "edge" && params.data?.metrics) {
+            const row = params.data.metrics;
+            return `${params.data.label}<br />Pair Count: ${row.pair_count}<br />P(B|A): ${formatPercent(row.probability_b_given_a)}<br />P(A|B): ${formatPercent(row.probability_a_given_b)}<br />Support: ${formatPercent(row.support)}<br />Lift: ${formatMetric(row.lift)}<br />Confidence: ${row.confidence_level}`;
+          }
+          return `${params.data?.name ?? ""}<br />Shipments: ${params.data?.value ?? 0}`;
+        }
+      },
+      series: [
+        {
+          type: "graph",
+          layout: "force",
+          roam: true,
+          draggable: true,
+          data: network.nodes,
+          edges: network.edges,
+          label: { show: true, position: "right", formatter: "{b}" },
+          force: { repulsion: 180, edgeLength: 96 },
+          lineStyle: { color: "#0b73bf", curveness: 0.08 },
+          emphasis: { focus: "adjacency" }
+        }
+      ]
+    };
+  }, [pairingAnalysis]);
   const shiftAffinityHeatmapOption = useMemo(() => {
     if (!shiftAnalysis || currentPageShiftRows.length === 0) return null;
     const xAxis = shiftAnalysis.shift_config.map((shift) => shift.name);
@@ -1699,6 +1971,60 @@ function App() {
     setDepartureSortColumn(column);
   }
 
+  function updatePairingFilter(key: keyof PairingFilters, value: string) {
+    setPairingFilters((current) => {
+      const next = { ...current, [key]: value };
+      if (key === "depotId") {
+        next.startDate = "";
+        next.endDate = "";
+      }
+      if (key === "rangePreset" && value !== "CUSTOM" && pairingDateAvailability?.max_date) {
+        const days = Number(value);
+        const end = parseIsoDate(pairingDateAvailability.max_date);
+        next.endDate = pairingDateAvailability.max_date;
+        next.startDate = isoDateFromDate(addDays(end, -(days - 1)));
+      }
+      if ((key === "startDate" || key === "endDate") && current.rangePreset !== "CUSTOM") {
+        next.rangePreset = "CUSTOM";
+      }
+      return next;
+    });
+    if (key === "depotId") {
+      setPairingDateAvailability(null);
+      setSelectedPairingSpbuId(null);
+      setSelectedPairingPair(null);
+    }
+  }
+
+  async function applyPairingFilters() {
+    setPairingOffset(0);
+    setSelectedPairingSpbuId(null);
+    setSelectedPairingPair(null);
+    await fetchPairingAnalysis(0, pairingFilters, null, null);
+  }
+
+  function handlePairingSort(column: PairingSortColumn) {
+    setPairingOffset(0);
+    setPairingSortDirection((current) => (pairingSortColumn === column && current === "asc" ? "desc" : "asc"));
+    setPairingSortColumn(column);
+  }
+
+  function selectPairingSpbu(spbuId: string | null) {
+    setSelectedPairingSpbuId(spbuId);
+    if (appliedPairingFilters) {
+      fetchPairingAnalysis(0, appliedPairingFilters, spbuId, selectedPairingPair);
+    }
+  }
+
+  function selectPairingPair(row: PairingPair) {
+    const nextPair = { spbu_a_id: row.spbu_a_id, spbu_b_id: row.spbu_b_id };
+    setSelectedPairingPair(nextPair);
+    setSelectedPairingSpbuId(row.spbu_a_id);
+    if (appliedPairingFilters) {
+      fetchPairingAnalysis(pairingOffset, appliedPairingFilters, row.spbu_a_id, nextPair);
+    }
+  }
+
   function updateShiftConfig(index: number, key: keyof OperationalShiftConfig, value: string) {
     setShiftConfigs((current) => current.map((shift, shiftIndex) => (shiftIndex === index ? { ...shift, [key]: value } : shift)));
   }
@@ -1787,7 +2113,18 @@ function App() {
   }
 
   function navigate(page: Page) {
-    const path = page === "master-data" ? "/master-data" : page === "tag-consistency" ? "/tag-consistency" : page === "departure-intelligence" ? "/departure-intelligence" : "/";
+    const path =
+      page === "master-data"
+        ? "/master-data"
+        : page === "tag-consistency"
+          ? "/tag-consistency"
+          : page === "departure-intelligence"
+            ? "/departure-intelligence"
+            : page === "pairing-intelligence"
+              ? "/pairing-intelligence"
+              : page === "affinity-intelligence"
+                ? "/affinity-intelligence"
+              : "/";
     if (window.location.pathname !== path) {
       window.history.pushState({}, "", path);
     }
@@ -1818,6 +2155,10 @@ function App() {
                   ? "Evaluate daily Loading Order assignments against MT-SPBU tagging rules."
                   : currentPage === "departure-intelligence"
                     ? "Phase 2 historical depot departure profiles by SPBU."
+                    : currentPage === "pairing-intelligence"
+                      ? "Phase 3 same-shipment SPBU relationship intelligence."
+                      : currentPage === "affinity-intelligence"
+                        ? "Phase 4 historical SPBU–MT affinity and temporal stability intelligence."
                   : "Data Foundation Overview"}
             </p>
           </div>
@@ -1833,6 +2174,12 @@ function App() {
             </button>
             <button className={pageNavButtonClass("departure-intelligence")} onClick={() => navigate("departure-intelligence")} title="Open Phase 2 departure intelligence">
               Phase 2 - Depot Departure Time Intelligence
+            </button>
+            <button className={pageNavButtonClass("pairing-intelligence")} onClick={() => navigate("pairing-intelligence")} title="Open Phase 3 SPBU pairing probability intelligence">
+              Phase 3 - SPBU Pairing Probability Intelligence
+            </button>
+            <button className={pageNavButtonClass("affinity-intelligence")} onClick={() => navigate("affinity-intelligence")} title="Open Phase 4 SPBU-MT historical affinity and stability intelligence">
+              Phase 4 - SPBU–MT Affinity & Stability
             </button>
           </div>
         </div>
@@ -1893,6 +2240,283 @@ function App() {
               </div>
             </div>
           </section>
+        )}
+
+        {currentPage === "affinity-intelligence" && (
+          <AffinityIntelligencePage depots={depots} products={products} />
+        )}
+
+        {currentPage === "pairing-intelligence" && (
+        <>
+        <section className="mb-5 border border-line bg-white p-4">
+          <div className="mb-3 flex flex-col gap-1">
+            <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Phase 3 - SPBU Pairing Probability Intelligence</div>
+            <div className="text-xs text-slate-500">Same-shipment SPBU pairing. Consecutive GPS transition is kept as separate directional evidence.</div>
+          </div>
+          <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-[1.4fr_0.7fr_0.8fr_0.8fr_1fr_1fr_auto]">
+            <select className="border border-line bg-white px-3 py-2 text-sm" value={pairingFilters.depotId} onChange={(event) => updatePairingFilter("depotId", event.target.value)} title="Depot">
+              <option value="">Select Depot</option>
+              {depots.map((depot) => (
+                <option key={depot.depot_id} value={depot.depot_id}>{depot.depot_name}</option>
+              ))}
+            </select>
+            <select className="border border-line bg-white px-3 py-2 text-sm" value={pairingFilters.rangePreset} onChange={(event) => updatePairingFilter("rangePreset", event.target.value)} disabled={!pairingFilters.depotId || pairingDateLoading} title="Date range preset">
+              <option value="7">7 Days</option>
+              <option value="14">14 Days</option>
+              <option value="30">30 Days</option>
+              <option value="CUSTOM">Custom Range</option>
+            </select>
+            <input className="border border-line px-3 py-2 text-sm" type="date" value={pairingFilters.startDate} onChange={(event) => updatePairingFilter("startDate", event.target.value)} disabled={!pairingFilters.depotId || pairingDateLoading} title="Start date" />
+            <input className="border border-line px-3 py-2 text-sm" type="date" value={pairingFilters.endDate} onChange={(event) => updatePairingFilter("endDate", event.target.value)} disabled={!pairingFilters.depotId || pairingDateLoading} title="End date" />
+            <select className="border border-line bg-white px-3 py-2 text-sm" value={pairingFilters.productId} onChange={(event) => updatePairingFilter("productId", event.target.value)} title="Product">
+              <option value="">All Products</option>
+              {products.map((product) => (
+                <option key={product.product_id} value={product.product_id}>{product.product_name}</option>
+              ))}
+            </select>
+            <input
+              className="border border-line px-3 py-2 text-sm"
+              value={pairingFilters.search}
+              onChange={(event) => updatePairingFilter("search", event.target.value)}
+              onKeyDown={(event) => { if (event.key === "Enter") applyPairingFilters(); }}
+              placeholder="Search SPBU pair"
+              title="Search SPBU pair"
+            />
+            <button className="inline-flex items-center justify-center gap-2 bg-mint px-3 py-2 text-sm font-medium text-white disabled:opacity-60" onClick={applyPairingFilters} disabled={pairingLoading} title="Run SPBU pairing analysis">
+              <Search size={16} />
+              {pairingLoading ? "Running" : "Apply"}
+            </button>
+          </div>
+          <div className="mt-3 text-xs text-slate-500">
+            {pairingDateAvailability?.min_date && pairingDateAvailability?.max_date
+              ? `Available shipment dates: ${formatDate(pairingDateAvailability.min_date)} - ${formatDate(pairingDateAvailability.max_date)}.`
+              : pairingFilters.depotId
+                ? "Date availability will load for the selected depot."
+                : "Choose a depot before running analysis."}
+          </div>
+        </section>
+
+        {!pairingAnalysis && (
+          <section className="border border-line bg-white p-8 text-center">
+            <div className="mx-auto max-w-2xl text-sm text-slate-600">
+              Select a depot, date range, and product scope, then click Apply to run SPBU Pairing Probability Intelligence.
+            </div>
+          </section>
+        )}
+
+        {pairingAnalysis && pairingSummary && (
+        <>
+        <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-6">
+          {[
+            ["Total Shipments", pairingSummary.total_shipments.toLocaleString()],
+            ["Multi-SPBU Shipments", pairingSummary.multi_spbu_shipments.toLocaleString()],
+            ["Unique SPBU", pairingSummary.unique_spbu.toLocaleString()],
+            ["Unique SPBU Pairs", pairingSummary.unique_spbu_pairs.toLocaleString()],
+            ["High-Confidence Pairs", pairingSummary.high_confidence_pairs.toLocaleString()],
+            ["Avg SPBU / Shipment", formatMetric(pairingSummary.average_spbu_per_shipment)]
+          ].map(([label, value]) => (
+            <div key={label} className="border border-line bg-white p-4">
+              <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">{label}</div>
+              <div className="mt-2 text-2xl font-semibold">{value}</div>
+            </div>
+          ))}
+        </section>
+
+        <section className="mt-5 grid gap-4 lg:grid-cols-3">
+          <div className="border border-line bg-white p-4">
+            <div className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-600">Data Quality</div>
+            <div className="grid gap-3 text-sm">
+              <div className="flex items-center justify-between border-b border-line pb-2"><span>Source Shipments</span><span className="font-semibold">{pairingAnalysis.data_quality.source_shipments.toLocaleString()}</span></div>
+              <div className="flex items-center justify-between border-b border-line pb-2"><span>Eligible Shipments</span><span className="font-semibold">{pairingAnalysis.data_quality.eligible_shipments.toLocaleString()}</span></div>
+              <div className="flex items-center justify-between border-b border-line pb-2"><span>Excluded Shipments</span><span className="font-semibold">{pairingAnalysis.data_quality.excluded_shipments.toLocaleString()}</span></div>
+              <div className="grid gap-1 text-xs text-slate-500">
+                {pairingAnalysis.data_quality.exclusion_reasons.length > 0
+                  ? pairingAnalysis.data_quality.exclusion_reasons.map((item) => <div key={item.reason}>{item.reason}: {item.count.toLocaleString()}</div>)
+                  : <div>No exclusions in the active filter.</div>}
+              </div>
+            </div>
+          </div>
+          <section className="min-h-[320px] border border-line bg-white p-4 lg:col-span-2">
+            <div className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-600">Pairing Probability Distribution</div>
+            <ReactECharts option={{
+              tooltip: { trigger: "axis" },
+              grid: { top: 16, right: 16, bottom: 42, left: 48 },
+              xAxis: { type: "category", data: pairingAnalysis.distribution.map((item) => item.name) },
+              yAxis: { type: "value" },
+              series: [{ type: "bar", data: pairingAnalysis.distribution.map((item) => item.value), itemStyle: { color: "#0b73bf" } }]
+            }} style={{ height: 260 }} />
+          </section>
+        </section>
+
+        <section className="mt-5 border border-line bg-white p-4">
+          <div className="mb-3 flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
+            <div>
+              <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Top SPBU Pairings</div>
+              <div className="mt-1 text-xs text-slate-500">Showing {pairingShowingStart}-{pairingShowingEnd} of {pairingTotal.toLocaleString()} pairs. Default ranking prioritizes evidence strength.</div>
+            </div>
+            <select className="border border-line bg-white px-3 py-2 text-sm" value={pairingLimit} onChange={(event) => { setPairingOffset(0); setPairingLimit(Number(event.target.value)); }} title="Rows per page">
+              <option value={10}>10 rows</option>
+              <option value={25}>25 rows</option>
+              <option value={50}>50 rows</option>
+              <option value={100}>100 rows</option>
+            </select>
+          </div>
+          <div className="overflow-x-auto border border-line">
+            <table className="w-full border-collapse text-sm">
+              <thead>
+                <tr className="border-b border-line bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+                  {[
+                    ["spbu_a_code", "SPBU A"],
+                    ["spbu_b_code", "SPBU B"],
+                    ["pair_count", "Pair Count"],
+                    ["probability_b_given_a", "P(B|A)"],
+                    ["probability_a_given_b", "P(A|B)"],
+                    ["support", "Support"],
+                    ["lift", "Lift"],
+                    ["confidence_score", "Confidence"]
+                  ].map(([column, label]) => (
+                    <th key={column} className="whitespace-nowrap px-3 py-2">
+                      <button className="inline-flex items-center gap-1 uppercase tracking-wide" onClick={() => handlePairingSort(column as PairingSortColumn)} title={`Sort by ${label}`}>
+                        <span>{label}</span>
+                        {pairingSortColumn === column ? (pairingSortDirection === "asc" ? <ArrowUp size={14} /> : <ArrowDown size={14} />) : <ArrowUpDown size={14} className="text-slate-300" />}
+                      </button>
+                    </th>
+                  ))}
+                  <th className="whitespace-nowrap px-3 py-2">Evidence Count</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pairingRows.map((row) => (
+                  <tr key={`${row.spbu_a_id}-${row.spbu_b_id}`} className="cursor-pointer border-b border-line hover:bg-petrocloud/40" onClick={() => selectPairingPair(row)}>
+                    <td className="whitespace-nowrap px-3 py-2"><div className="font-medium">{row.spbu_a_code}</div><div className="text-xs text-slate-500">{row.spbu_a_name ?? "-"}</div></td>
+                    <td className="whitespace-nowrap px-3 py-2"><div className="font-medium">{row.spbu_b_code}</div><div className="text-xs text-slate-500">{row.spbu_b_name ?? "-"}</div></td>
+                    <td className="whitespace-nowrap px-3 py-2 font-semibold">{row.pair_count.toLocaleString()}</td>
+                    <td className="whitespace-nowrap px-3 py-2">{formatPercent(row.probability_b_given_a)}</td>
+                    <td className="whitespace-nowrap px-3 py-2">{formatPercent(row.probability_a_given_b)}</td>
+                    <td className="whitespace-nowrap px-3 py-2">{formatPercent(row.support)}</td>
+                    <td className="whitespace-nowrap px-3 py-2">{formatMetric(row.lift)}</td>
+                    <td className="px-3 py-2"><span className={`inline-flex border px-2 py-1 text-xs font-semibold ${confidenceClass(row.confidence_level)}`}>{row.confidence_level.replace(/_/g, " ")} {formatMetric(row.confidence_score, 2)}</span></td>
+                    <td className="whitespace-nowrap px-3 py-2">{row.evidence_count.toLocaleString()}</td>
+                  </tr>
+                ))}
+                {pairingRows.length === 0 && (
+                  <tr><td className="px-3 py-8 text-center text-sm text-slate-500" colSpan={9}>No SPBU pairs match the active filter.</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+          <div className="mt-4 flex items-center justify-between gap-3 text-sm">
+            <button className="border border-line px-3 py-2 disabled:opacity-50" onClick={() => setPairingOffset(Math.max(0, pairingOffset - pairingLimit))} disabled={!canPreviousPairingPage}>Previous</button>
+            <span className="text-slate-500">Page {pairingPageNumber} of {pairingPageCount}</span>
+            <button className="border border-line px-3 py-2 disabled:opacity-50" onClick={() => setPairingOffset(pairingOffset + pairingLimit)} disabled={!canNextPairingPage}>Next</button>
+          </div>
+        </section>
+
+        <section className="mt-5 grid gap-4 lg:grid-cols-2">
+          <section className="min-h-[420px] border border-line bg-white p-4">
+            <div className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-600">SPBU Pairing Matrix</div>
+            {pairingMatrixOption ? <ReactECharts option={pairingMatrixOption} style={{ height: 360 }} /> : <div className="py-20 text-center text-sm text-slate-500">No matrix data.</div>}
+          </section>
+          <section className="min-h-[420px] border border-line bg-white p-4">
+            <div className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-600">Pairing Network Prototype</div>
+            {pairingNetworkOption ? (
+              <ReactECharts
+                option={pairingNetworkOption}
+                style={{ height: 360 }}
+                onEvents={{ click: (params: { dataType?: string; data?: { id?: string } }) => { if (params.dataType === "node" && params.data?.id) selectPairingSpbu(params.data.id); } }}
+              />
+            ) : <div className="py-20 text-center text-sm text-slate-500">No network data.</div>}
+          </section>
+        </section>
+
+        <section className="mt-5 grid gap-4 lg:grid-cols-[0.9fr_1.1fr]">
+          <section className="border border-line bg-white p-4">
+            <div className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-600">SPBU Pairing Detail</div>
+            {selectedPairingDetail ? (
+              <>
+                <div className="mb-3 grid gap-3 sm:grid-cols-2">
+                  <div className="border border-line p-3"><div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Selected SPBU</div><div className="mt-1 font-semibold">{selectedPairingDetail.spbu_code}</div></div>
+                  <div className="border border-line p-3"><div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Historical Shipments</div><div className="mt-1 font-semibold">{selectedPairingDetail.historical_shipments.toLocaleString()}</div></div>
+                </div>
+                <div className="grid gap-2">
+                  {selectedPairingDetail.top_pairs.map((row) => (
+                    <button key={`${row.spbu_a_id}-${row.spbu_b_id}`} className="border border-line p-3 text-left hover:bg-petrocloud/40" onClick={() => selectPairingPair(row)} title="Open pair evidence">
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <div className="font-semibold">{row.candidate_spbu_code}</div>
+                          <div className="text-xs text-slate-500">Pair Count {row.pair_count.toLocaleString()} | Lift {formatMetric(row.lift)}</div>
+                        </div>
+                        <span className={`border px-2 py-1 text-xs font-semibold ${confidenceClass(row.confidence_level)}`}>{row.confidence_level.replace(/_/g, " ")}</span>
+                      </div>
+                      <div className="mt-2 text-sm">Pair Probability {formatPercent(row.pair_probability)} | Reverse {formatPercent(row.reverse_probability)}</div>
+                    </button>
+                  ))}
+                  {selectedPairingDetail.top_pairs.length === 0 && <div className="py-8 text-center text-sm text-slate-500">No same-shipment pair for the selected SPBU.</div>}
+                </div>
+              </>
+            ) : (
+              <div className="py-8 text-center text-sm text-slate-500">Select a pair or network node to inspect SPBU detail.</div>
+            )}
+          </section>
+          <section className="border border-line bg-white p-4">
+            <div className="mb-3 flex flex-col gap-1">
+              <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Historical Evidence</div>
+              <div className="text-xs text-slate-500">
+                {pairingAnalysis.evidence.pair
+                  ? `${pairingAnalysis.evidence.pair.spbu_a_code} - ${pairingAnalysis.evidence.pair.spbu_b_code}: ${pairingAnalysis.evidence.distinct_shipment_count.toLocaleString()} distinct shipments`
+                  : "Select a pair to inspect evidence."}
+              </div>
+            </div>
+            <div className="max-h-[420px] overflow-auto border border-line">
+              <table className="w-full border-collapse text-sm">
+                <thead>
+                  <tr className="border-b border-line bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
+                    <th className="whitespace-nowrap px-3 py-2">Date</th>
+                    <th className="whitespace-nowrap px-3 py-2">Shipment</th>
+                    <th className="whitespace-nowrap px-3 py-2">Vehicle</th>
+                    <th className="whitespace-nowrap px-3 py-2">Gate Out</th>
+                    <th className="whitespace-nowrap px-3 py-2">SPBU in Shipment</th>
+                    <th className="whitespace-nowrap px-3 py-2">Products</th>
+                    <th className="whitespace-nowrap px-3 py-2">Quantity</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pairingAnalysis.evidence.rows.map((row) => (
+                    <tr key={row.shipment_id} className="border-b border-line">
+                      <td className="whitespace-nowrap px-3 py-2">{formatDate(row.date)}</td>
+                      <td className="whitespace-nowrap px-3 py-2">{row.source_shipment_id}</td>
+                      <td className="whitespace-nowrap px-3 py-2">{row.vehicle_registration ?? "-"}</td>
+                      <td className="whitespace-nowrap px-3 py-2">{formatDateTime(row.gate_out)}</td>
+                      <td className="min-w-56 px-3 py-2">{row.spbu_in_shipment.join(", ")}</td>
+                      <td className="min-w-44 px-3 py-2">{row.products.join(", ") || "-"}</td>
+                      <td className="whitespace-nowrap px-3 py-2">{formatMetric(row.quantity)}</td>
+                    </tr>
+                  ))}
+                  {pairingAnalysis.evidence.rows.length === 0 && (
+                    <tr><td className="px-3 py-8 text-center text-sm text-slate-500" colSpan={7}>No historical evidence for the selected pair.</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <section className="mt-5 border border-line bg-white p-4">
+          <div className="mb-3 text-sm font-semibold uppercase tracking-wide text-slate-600">GPS Consecutive Transition Context</div>
+          <div className="mb-3 text-xs text-slate-500">Transition A to B means actual consecutive visit sequence. It is not used as same-shipment pair count.</div>
+          <div className="grid gap-2 md:grid-cols-2 lg:grid-cols-4">
+            {pairingAnalysis.transitions.slice(0, 8).map((row) => (
+              <div key={`${row.from_spbu_code}-${row.to_spbu_code}`} className="border border-line p-3 text-sm">
+                <div className="font-semibold">{row.from_spbu_code} to {row.to_spbu_code}</div>
+                <div className="mt-1 text-xs text-slate-500">{row.transition_count.toLocaleString()} transitions | {formatPercent(row.transition_probability)}</div>
+              </div>
+            ))}
+            {pairingAnalysis.transitions.length === 0 && <div className="text-sm text-slate-500">No GPS stop sequence transitions in the active filter.</div>}
+          </div>
+        </section>
+        </>
+        )}
+        </>
         )}
 
         {currentPage === "departure-intelligence" && (

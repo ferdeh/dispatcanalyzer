@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, JSON, String, Text, Time
+from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, Time, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.sql import func
 
@@ -359,6 +359,191 @@ class FactShipmentStop(Base):
     sequence_source: Mapped[str] = mapped_column(String(40), default="UNKNOWN")
     sequence_confidence: Mapped[float | None] = mapped_column(Float)
     source_import_id: Mapped[str | None] = mapped_column(String(64))
+
+
+class FactSPBUPair(Base):
+    __tablename__ = "fact_spbu_pair"
+    __table_args__ = (
+        UniqueConstraint(
+            "depot_id",
+            "spbu_a_id",
+            "spbu_b_id",
+            "analysis_start_date",
+            "analysis_end_date",
+            "algorithm_version",
+            name="uq_fact_spbu_pair_scope",
+        ),
+        Index("ix_fact_spbu_pair_depot_dates", "depot_id", "analysis_start_date", "analysis_end_date"),
+        Index("ix_fact_spbu_pair_spbus", "spbu_a_id", "spbu_b_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    depot_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_depot.depot_id"), index=True)
+    spbu_a_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_spbu.spbu_id"), index=True)
+    spbu_b_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_spbu.spbu_id"), index=True)
+    pair_count: Mapped[int] = mapped_column(Integer, default=0)
+    shipment_a_count: Mapped[int] = mapped_column(Integer, default=0)
+    shipment_b_count: Mapped[int] = mapped_column(Integer, default=0)
+    total_shipment_count: Mapped[int] = mapped_column(Integer, default=0)
+    probability_b_given_a: Mapped[float] = mapped_column(Float, default=0.0)
+    probability_a_given_b: Mapped[float] = mapped_column(Float, default=0.0)
+    support: Mapped[float] = mapped_column(Float, default=0.0)
+    lift: Mapped[float] = mapped_column(Float, default=0.0)
+    confidence_score: Mapped[float] = mapped_column(Float, default=0.0)
+    confidence_level: Mapped[str] = mapped_column(String(40), default="INSUFFICIENT_DATA")
+    observation_count: Mapped[int] = mapped_column(Integer, default=0)
+    analysis_start_date = mapped_column(Date, nullable=False)
+    analysis_end_date = mapped_column(Date, nullable=False)
+    calculated_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    algorithm_version: Mapped[str] = mapped_column(String(80), default="pairing_v1")
+
+
+class FactSPBUTransition(Base):
+    __tablename__ = "fact_spbu_transition"
+    __table_args__ = (
+        UniqueConstraint(
+            "depot_id",
+            "from_spbu_id",
+            "to_spbu_id",
+            "analysis_start_date",
+            "analysis_end_date",
+            "algorithm_version",
+            name="uq_fact_spbu_transition_scope",
+        ),
+        Index("ix_fact_spbu_transition_depot_dates", "depot_id", "analysis_start_date", "analysis_end_date"),
+        Index("ix_fact_spbu_transition_spbus", "from_spbu_id", "to_spbu_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    depot_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_depot.depot_id"), index=True)
+    from_spbu_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_spbu.spbu_id"), index=True)
+    to_spbu_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_spbu.spbu_id"), index=True)
+    transition_count: Mapped[int] = mapped_column(Integer, default=0)
+    observation_count: Mapped[int] = mapped_column(Integer, default=0)
+    transition_probability: Mapped[float] = mapped_column(Float, default=0.0)
+    analysis_start_date = mapped_column(Date, nullable=False)
+    analysis_end_date = mapped_column(Date, nullable=False)
+    calculated_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    confidence_score: Mapped[float] = mapped_column(Float, default=0.0)
+    confidence_level: Mapped[str] = mapped_column(String(40), default="INSUFFICIENT_DATA")
+    algorithm_version: Mapped[str] = mapped_column(String(80), default="spbu_transition.consecutive_v1")
+
+
+class FactSPBUMTPair(Base):
+    __tablename__ = "fact_spbu_mt_pair"
+    __table_args__ = (
+        UniqueConstraint(
+            "depot_id",
+            "spbu_id",
+            "mt_id",
+            "analysis_start_date",
+            "analysis_end_date",
+            "product_filter",
+            "algorithm_version",
+            name="uq_fact_spbu_mt_pair_scope",
+        ),
+        Index("ix_fact_spbu_mt_pair_depot_dates", "depot_id", "analysis_start_date", "analysis_end_date"),
+        Index("ix_fact_spbu_mt_pair_entities", "spbu_id", "mt_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    depot_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_depot.depot_id"), index=True)
+    spbu_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_spbu.spbu_id"), index=True)
+    mt_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_mt.mt_id"), index=True)
+    shipment_count: Mapped[int] = mapped_column(Integer, default=0)
+    total_spbu_shipment_count: Mapped[int] = mapped_column(Integer, default=0)
+    total_mt_shipment_count: Mapped[int] = mapped_column(Integer, default=0)
+    probability_mt_given_spbu: Mapped[float] = mapped_column(Float, default=0.0)
+    probability_spbu_given_mt: Mapped[float] = mapped_column(Float, default=0.0)
+    first_observed = mapped_column(Date, nullable=False)
+    last_observed = mapped_column(Date, nullable=False)
+    operating_day_count: Mapped[int] = mapped_column(Integer, default=0)
+    confidence_score: Mapped[float] = mapped_column(Float, default=0.0)
+    confidence_level: Mapped[str] = mapped_column(String(20), default="LOW")
+    analysis_start_date = mapped_column(Date, nullable=False)
+    analysis_end_date = mapped_column(Date, nullable=False)
+    product_filter: Mapped[str] = mapped_column(String(120), default="ALL")
+    calculated_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    algorithm_version: Mapped[str] = mapped_column(String(80), default="spbu_mt_affinity.jsd_v1")
+
+
+class FactSPBUMTProfile(Base):
+    __tablename__ = "fact_spbu_mt_profile"
+    __table_args__ = (
+        UniqueConstraint(
+            "depot_id",
+            "spbu_id",
+            "analysis_start_date",
+            "analysis_end_date",
+            "product_filter",
+            "temporal_bucket",
+            "algorithm_version",
+            name="uq_fact_spbu_mt_profile_scope",
+        ),
+        Index("ix_fact_spbu_mt_profile_depot_dates", "depot_id", "analysis_start_date", "analysis_end_date"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    depot_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_depot.depot_id"), index=True)
+    spbu_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_spbu.spbu_id"), index=True)
+    shipment_count: Mapped[int] = mapped_column(Integer, default=0)
+    operating_day_count: Mapped[int] = mapped_column(Integer, default=0)
+    unique_mt_count: Mapped[int] = mapped_column(Integer, default=0)
+    dominant_mt_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("master_mt.mt_id"))
+    dominant_mt_probability: Mapped[float] = mapped_column(Float, default=0.0)
+    second_mt_probability: Mapped[float] = mapped_column(Float, default=0.0)
+    top3_mt_share: Mapped[float] = mapped_column(Float, default=0.0)
+    hhi: Mapped[float] = mapped_column(Float, default=0.0)
+    normalized_hhi: Mapped[float] = mapped_column(Float, default=0.0)
+    normalized_entropy: Mapped[float] = mapped_column(Float, default=0.0)
+    consistency_score: Mapped[float] = mapped_column(Float, default=0.0)
+    variability_score: Mapped[float] = mapped_column(Float, default=0.0)
+    dominant_mt_persistence: Mapped[float] = mapped_column(Float, default=0.0)
+    temporal_stability_score: Mapped[float] = mapped_column(Float, default=0.0)
+    pattern_shift_level: Mapped[str] = mapped_column(String(40), default="STABLE")
+    confidence_score: Mapped[float] = mapped_column(Float, default=0.0)
+    confidence_level: Mapped[str] = mapped_column(String(20), default="LOW")
+    analysis_start_date = mapped_column(Date, nullable=False)
+    analysis_end_date = mapped_column(Date, nullable=False)
+    product_filter: Mapped[str] = mapped_column(String(120), default="ALL")
+    temporal_bucket: Mapped[str] = mapped_column(String(20), default="WEEKLY")
+    calculated_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    algorithm_version: Mapped[str] = mapped_column(String(80), default="spbu_mt_affinity.jsd_v1")
+
+
+class FactSPBUMTTemporalProfile(Base):
+    __tablename__ = "fact_spbu_mt_temporal_profile"
+    __table_args__ = (
+        UniqueConstraint(
+            "depot_id",
+            "spbu_id",
+            "mt_id",
+            "period_type",
+            "period_start",
+            "analysis_start_date",
+            "analysis_end_date",
+            "algorithm_version",
+            name="uq_fact_spbu_mt_temporal_scope",
+        ),
+        Index("ix_fact_spbu_mt_temporal_depot_period", "depot_id", "period_type", "period_start"),
+        Index("ix_fact_spbu_mt_temporal_entities", "spbu_id", "mt_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    depot_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_depot.depot_id"), index=True)
+    spbu_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_spbu.spbu_id"), index=True)
+    mt_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_mt.mt_id"), index=True)
+    period_type: Mapped[str] = mapped_column(String(20))
+    period_start = mapped_column(Date, nullable=False)
+    period_end = mapped_column(Date, nullable=False)
+    shipment_count: Mapped[int] = mapped_column(Integer, default=0)
+    total_spbu_shipment_count: Mapped[int] = mapped_column(Integer, default=0)
+    probability_mt_given_spbu: Mapped[float] = mapped_column(Float, default=0.0)
+    is_dominant_mt: Mapped[bool] = mapped_column(Boolean, default=False)
+    analysis_start_date = mapped_column(Date, nullable=False)
+    analysis_end_date = mapped_column(Date, nullable=False)
+    calculated_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    algorithm_version: Mapped[str] = mapped_column(String(80), default="spbu_mt_affinity.jsd_v1")
 
 
 class DataQualityIssue(Base):

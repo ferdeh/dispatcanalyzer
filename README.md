@@ -33,6 +33,8 @@ WEB_PORT=3001 docker compose up -d web
 - Master Data Management: `/master-data`
 - Tag Consistency Analysis: `/tag-consistency`
 - Phase 2 - Depot Departure Time Intelligence: `/departure-intelligence`
+- Phase 3 - SPBU Pairing Probability Intelligence: `/pairing-intelligence`
+- Phase 4 - SPBU–MT Historical Affinity & Stability Intelligence: `/affinity-intelligence`
 
 Tema UI saat ini diselaraskan dengan aplikasi `vrp_planner` dan palet Petrofin:
 
@@ -76,6 +78,318 @@ Halaman Phase 2 - Depot Departure Time Intelligence berisi analisa deskriptif hi
 - table pagination `10`, `25`, `50`, dan `100` rows tersinkron dengan box plot dan SPBU Shift Affinity Heatmap
 
 Phase 2 bersifat descriptive intelligence. Halaman ini tidak menghitung arrival SPBU, ETA, route sequence, travel time, route optimization, atau rekomendasi jadwal dispatch.
+
+Halaman Phase 3 - SPBU Pairing Probability Intelligence berisi relationship intelligence antar-SPBU:
+
+- filter utama Depot, Date Range `7 Days` / `14 Days` / `30 Days` / `Custom Range`, Product, Search, dan Apply
+- tidak menjalankan analisa otomatis saat halaman dibuka
+- unit analitik utama adalah `shipment_id`
+- pairing berarti dua SPBU berada dalam shipment yang sama: `A - B`
+- pair diolah secara canonical unordered, tetapi conditional probability tetap directional
+- `P(B|A) = shipment(A and B) / shipment(A)`
+- `P(A|B) = shipment(A and B) / shipment(B)`
+- `Support(A,B) = shipment(A and B) / total eligible shipment`
+- `Lift(A,B) = P(B|A) / P(B)`, dengan zero denominator ditangani sebagai `0`
+- confidence adalah evidence confidence, bukan prediction probability
+- default confidence rule: `INSUFFICIENT_DATA` jika `min(shipment_a_count, shipment_b_count) < 5` atau `pair_count < 3`; `LOW` jika `pair_count < 10`; `MEDIUM` jika `10 <= pair_count < 30`; `HIGH` jika `pair_count >= 30`
+- KPI, Data Quality panel, Top Pairing Explorer, Pairing Matrix, Pairing Network Prototype, SPBU Pairing Detail, dan Historical Evidence drill-down
+
+Product segmentation:
+
+- `All Products` menggunakan canonical `fact_shipment_spbu`
+- product-specific analysis menggunakan distinct `shipment_id + spbu_id` dari Loading Order line yang memiliki product terpilih
+- shipment multi-produk tetap dihitung sebagai shipment yang sama
+- repeated LO/product/compartment lines tidak menggandakan membership atau pair count
+
+GPS transition distinction:
+
+- `A - B` berarti same-shipment pairing
+- `A -> B` berarti actual consecutive visit berdasarkan `fact_shipment_stop.stop_sequence`
+- shipment dengan sequence `A -> C -> B` menghasilkan pairing `A - C`, `A - B`, `C - B`, tetapi transition hanya `A -> C` dan `C -> B`
+- Phase 3 tidak memakai transition sebagai edge thickness pairing dan tidak melakukan route optimization
+
+Phase 3 tetap independen dari Phase 2. Departure profile dapat menjadi konteks di fase berikutnya, tetapi Phase 3 tidak mengubah departure window atau shift assignment Phase 2.
+
+Halaman Phase 4 mengukur historical vehicle-assignment behavior:
+
+- filter Depot, Search SPBU, Date Range, Product, Minimum Observations, Confidence, Temporal Bucket, Recent Period, Top-N, dan network edge metric
+- unit observasi unik `depot_id + shipment_id + spbu_id + mt_id`; product filtering dilakukan sebelum deduplikasi final
+- `P(MT|SPBU)`, `P(SPBU|MT)`, dominant MT, Top-3 Share, Fleet Affinity Vector, HHI, normalized HHI, dan normalized entropy
+- consistency, variability, evidence confidence, dan temporal stability tetap merupakan metric terpisah
+- temporal stability memakai consecutive-bucket Jensen–Shannon similarity dan dominant-MT persistence
+- output profile, probability chart, time series, recent comparison, scatter, pattern matrix, rankings, reverse MT detail, bipartite network, dan shipment evidence
+- hasil hanya mendeskripsikan historical dispatch; tidak menghasilkan future assignment recommendation atau optimization
+
+### Panduan membaca halaman Phase 4
+
+#### Filter dan tombol Apply
+
+Card paling atas menentukan scope analisis. Perubahan filter belum mengubah hasil sampai tombol **Apply** ditekan.
+
+| Filter | Fungsi | Cara membaca atau menggunakan |
+|---|---|---|
+| Depot | Membatasi shipment, SPBU, dan MT pada satu depot. | Data antardepot tidak dicampur. Depot wajib dipilih. |
+| Search SPBU | Memilih SPBU aktif berdasarkan kode atau nama dari saran pencarian. | Field aktif setelah depot dipilih. Pilih hasil yang sesuai lalu tekan **Apply**; profile, probability chart, time series, recent comparison, network highlight, dan evidence akan memakai SPBU tersebut. Jika dikosongkan, sistem memakai SPBU eligible pertama pada scope aktif. |
+| Start Date / End Date | Membatasi tanggal operasi shipment. | Teks `Available` menunjukkan rentang data yang benar-benar tersedia untuk depot tersebut. |
+| Product | Memilih All Products atau satu produk. | Product filtering dilakukan sebelum deduplikasi. Shipment–SPBU–MT yang muncul pada beberapa LO untuk produk yang sama tetap dihitung satu kali. |
+| Minimum Observations | Menentukan minimum historical shipment sebuah SPBU agar masuk hasil. | Naikkan nilai ini untuk mengurangi profile dengan evidence sangat sedikit. |
+| Confidence | Menampilkan semua profile, Medium+, atau hanya High. | Filter ini menyaring kekuatan evidence; tidak mengubah Consistency atau Variability Score. |
+| Temporal Bucket | Memilih Daily, Weekly, Monthly, atau Auto. | Bucket yang benar-benar digunakan selalu ditampilkan pada Data Quality card sehingga aggregation tidak tersembunyi. |
+| Recent Period | Menentukan recent window 7, 14, atau 30 hari. | Dipakai untuk membandingkan recent distribution dengan full-period distribution, tanpa hidden recency weighting. |
+| Top MT | Menentukan Top 5, Top 10, atau seluruh MT pada probability chart. | Mengubah jumlah bar yang ditampilkan, bukan denominator probability. |
+| Network Edge | Memilih bobot edge berupa Shipment Count atau Affinity Probability. | Pilihan ini mengubah nilai edge network; edge width tetap membantu melihat kekuatan evidence historis. |
+
+Saat halaman pertama dibuka, KPI dan visualisasi sengaja kosong. Empty state tersebut menandakan analysis scope belum diterapkan, bukan menandakan data tidak tersedia.
+
+SPBU aktif ditentukan dengan urutan berikut:
+
+1. SPBU yang dipilih melalui **Search SPBU** saat Apply;
+2. SPBU yang diklik dari ranking, scatter plot, pattern matrix, reverse chart, atau network;
+3. SPBU eligible pertama dari hasil analisis jika belum ada pilihan eksplisit.
+
+Pilihan dari grafik atau tabel disinkronkan kembali ke field Search SPBU. Search SPBU memilih fokus detail dan tidak membatasi KPI maupun Data Quality Summary; kedua bagian tersebut tetap merangkum seluruh SPBU yang lolos scope dan filter aktif.
+
+Urutan kelompok card utama pada layout saat ini adalah:
+
+1. KPI Summary dan Data Quality Summary;
+2. SPBU Consistency Scatter Plot, Historical Pattern Matrix, ranking cards, dan Historical SPBU–MT Bipartite Network;
+3. Historical Evidence Drill-Down;
+4. SPBU–MT Historical Profile;
+5. MT Historical Probability dan Historical MT Affinity Over Time;
+6. Recent vs Full-Period Pattern dan MT Reverse Historical Affinity;
+7. Methodology & Guardrails.
+
+#### KPI summary cards
+
+Seluruh KPI mengikuti depot, tanggal, produk, minimum observation, dan confidence filter yang sudah di-Apply.
+
+| Card | Arti | Cara membaca |
+|---|---|---|
+| Eligible Shipments | Jumlah distinct shipment yang mempunyai minimal satu observation SPBU–MT valid. | Bandingkan dengan Source Shipments pada Data Quality card. Selisihnya adalah shipment yang tidak dapat dianalisis. |
+| SPBU Analyzed | Jumlah SPBU yang lolos minimum observation dan confidence filter. | Nilai dapat turun saat Minimum Observations dinaikkan atau Confidence diperketat. |
+| MT Observed | Jumlah MT unik yang muncul pada relationship milik SPBU yang lolos filter. | Ini historical observed fleet, bukan jumlah MT yang tersedia pada master. |
+| Unique SPBU–MT Pairs | Jumlah relationship unik SPBU–MT yang benar-benar pernah terjadi. | Satu pair dapat dibentuk oleh satu atau banyak shipment. Duplicate LO tidak menambah jumlah pair. |
+| Avg MT / SPBU | Rata-rata jumlah MT unik yang pernah melayani satu SPBU. | Nilai tinggi menunjukkan fleet footprint rata-rata lebih lebar, tetapi belum otomatis berarti pola tidak konsisten. |
+| Median MT / SPBU | Nilai tengah jumlah MT unik per SPBU. | Lebih tahan terhadap SPBU ekstrem daripada average. Bandingkan Average dengan Median untuk melihat pengaruh outlier. |
+| High Consistency | Jumlah SPBU dengan Consistency Score minimal 65. | Menunjukkan banyaknya SPBU dengan assignment distribution terkonsentrasi. Tetap periksa Confidence. |
+| High Variability | Jumlah SPBU dengan Variability Score minimal 65. | Menunjukkan banyaknya SPBU dengan distribution relatif tersebar pada banyak MT. |
+| Low Stability | Jumlah SPBU dengan Temporal Stability di bawah 50. | Menunjukkan banyaknya pola SPBU–MT yang berubah kuat antar-bucket. Ini berbeda dari variability keseluruhan periode. |
+| Pattern Shifts | Jumlah SPBU dengan flag selain `STABLE`. | Mencakup `MINOR SHIFT`, `MODERATE SHIFT`, dan `MAJOR SHIFT`; aplikasi tidak menyimpulkan penyebab perubahan. |
+
+Contoh interpretasi gabungan:
+
+```text
+High Variability tinggi + Low Stability rendah
+→ Banyak MT digunakan, tetapi proporsi penggunaannya relatif konsisten dari waktu ke waktu.
+
+High Consistency tinggi + Pattern Shifts tinggi
+→ Overall distribution dapat terlihat terkonsentrasi, tetapi dominant fleet atau distribusinya berubah pada bagian tertentu dari periode.
+```
+
+#### SPBU–MT Historical Profile card
+
+Card ini menjelaskan SPBU yang sedang dipilih. SPBU dapat dipilih melalui Search SPBU, ranking, scatter plot, pattern matrix, reverse chart, atau network.
+
+| Sub-card / metric | Arti | Cara membaca |
+|---|---|---|
+| SPBU | Kode SPBU aktif. | Semua affinity chart, temporal chart, recent comparison, dan evidence mengacu pada SPBU ini. |
+| Historical Shipments | Distinct shipment yang melayani SPBU pada scope aktif. | Ini denominator `P(MT|SPBU)`. |
+| Operating Days | Jumlah tanggal operasi unik yang mempunyai evidence. | Dua SPBU dengan shipment count sama dapat mempunyai temporal evidence berbeda jika operating days berbeda. |
+| Unique MT Used | Jumlah MT berbeda yang pernah melayani SPBU. | Baca bersama probability distribution, consistency, variability, dan confidence; jangan digunakan sendirian. |
+| Dominant Historical MT | MT dengan historical shipment count terbesar untuk SPBU. | `Dominant` hanya berarti paling sering terjadi secara historis, bukan MT yang harus digunakan berikutnya. |
+| Dominant Probability | Proporsi shipment SPBU yang menggunakan dominant MT. | Contoh 54% berarti 54% shipment SPBU pada scope aktif menggunakan MT tersebut. |
+| Top-3 MT Share | Total probability tiga MT teratas. | Nilai tinggi menunjukkan mayoritas assignment terkonsentrasi pada tiga MT utama. |
+| Historical Pattern | Label `DEDICATED-LIKE`, `PREFERRED-FLEET`, atau `FLEXIBLE`. | Label bersifat analytical. `DEDICATED-LIKE` bukan status dedicated kontraktual. |
+
+Empat horizontal score tracks dibaca dari 0 di kiri ke 100 di kanan:
+
+- **MT Consistency**: normalized HHI. Nilai tinggi berarti assignment terkonsentrasi pada sedikit MT. Untuk satu MT, nilainya deterministik 100.
+- **Historical Variability**: normalized entropy. Nilai tinggi berarti assignment lebih merata atau tersebar. Untuk satu MT, nilainya deterministik 0.
+- **Temporal Stability**: persistence pola antar-bucket. Nilai tinggi berarti fleet distribution relatif bertahan dari waktu ke waktu.
+- **Evidence Confidence**: kekuatan evidence berdasarkan shipment count, operating days, date coverage, recency, dan temporal coverage. Nilai ini tidak dikalikan dengan score pola.
+
+Badges di bawah score tracks mempunyai arti:
+
+- **Confidence HIGH / MEDIUM / LOW**: tingkat kekuatan evidence.
+- **STABLE / MINOR SHIFT / MODERATE SHIFT / MAJOR SHIFT**: besarnya perubahan distribution yang terukur.
+- **VERY HIGH CONSISTENCY sampai VERY HIGH VARIABILITY**: klasifikasi user-facing dari concentration score.
+- **Dominant persistence**: persentase bucket yang dominant MT-nya sama dengan dominant mode seluruh bucket. Nilai 100% berarti dominant MT tidak berganti.
+
+#### Data Quality Summary card
+
+| Metric | Arti | Cara membaca |
+|---|---|---|
+| Source Shipments | Seluruh shipment pada depot dan date range sebelum eligibility check. | Menjadi baseline kualitas data. |
+| Eligible Shipments | Shipment yang menghasilkan observation valid. | Harus sama dengan KPI Eligible Shipments. |
+| Excluded Shipments | Shipment yang tidak menghasilkan observation valid. | Periksa daftar exclusion reasons untuk mengetahui masalah pemetaan atau key wajib. |
+| Eligible % | `Eligible Shipments / Source Shipments × 100`. | Nilai tinggi berarti coverage analitik lebih baik. |
+| Duplicate Observations Removed | Baris tambahan yang mempunyai key shipment–SPBU–MT sama setelah product filter. | Nilai lebih dari nol adalah bukti deduplikasi berjalan, bukan otomatis data error. |
+| Bucket used | Daily, Weekly, atau Monthly yang benar-benar digunakan. | Khusus pilihan Auto, field ini menjelaskan hasil resolusi bucket. |
+| Algorithm | Versi formula yang menghasilkan output. | Digunakan untuk reproducibility dan audit. |
+
+Exclusion reason dapat mencakup missing/unmapped MT, unmapped SPBU, invalid analytical keys, atau shipment tanpa observation yang eligible.
+
+### Cara membaca grafik Phase 4
+
+#### 1. MT Historical Probability
+
+Horizontal bar chart ini menampilkan historical MT distribution untuk SPBU aktif.
+
+- Sumbu Y berisi MT, diurutkan dari historical shipment count terbesar.
+- Sumbu X berisi `P(MT|SPBU)` dalam persen.
+- Bar pertama berwarna lime untuk menandai dominant historical MT; bar lain berwarna biru.
+- Panjang bar menunjukkan seberapa sering MT tersebut digunakan relatif terhadap seluruh shipment SPBU.
+- Hover menampilkan MT, shipment count, probability, first observed, dan last observed.
+- Klik bar untuk memilih MT tersebut, memperbarui reverse detail dan evidence relationship.
+
+Contoh:
+
+```text
+T01 = 54%, T02 = 24%, T03 = 11%
+
+Artinya 54% historical shipment SPBU menggunakan T01.
+Ini tidak berarti T01 direkomendasikan untuk shipment berikutnya.
+```
+
+#### 2. Historical MT Affinity Over Time
+
+Line chart ini menunjukkan perubahan `P(MT|SPBU)` pada setiap temporal bucket.
+
+- Sumbu X adalah period start sesuai Daily, Weekly, atau Monthly bucket.
+- Sumbu Y adalah probability MT pada bucket tersebut, dari 0% sampai 100%.
+- Setiap garis mewakili satu MT; chart membatasi garis pada MT utama agar tetap terbaca.
+- Garis relatif datar menunjukkan probability MT yang stabil.
+- Garis turun pada MT lama bersamaan dengan garis naik pada MT lain menunjukkan historical pattern shift.
+- Pergantian garis tertinggi menunjukkan perubahan dominant MT.
+- Karena hanya beberapa MT utama yang ditampilkan, garis yang terlihat tidak harus berjumlah 100%.
+
+Jangan hanya melihat dominant line. Perubahan material pada seluruh distribution dapat terjadi walaupun dominant MT tetap sama.
+
+#### 3. Recent vs Full-Period Pattern
+
+Card perbandingan ini menampilkan dua ranked distributions:
+
+- **Full selected period**: distribusi sepanjang date range yang dipilih.
+- **Recent period**: distribusi hanya pada recent window 7, 14, atau 30 hari.
+
+Cara membaca:
+
+- Bandingkan urutan MT dan persentasenya pada kedua kolom.
+- MT yang naik tajam di recent period menunjukkan peningkatan historical usage terbaru.
+- MT yang dominan di full period tetapi turun di recent period dapat mengindikasikan pattern shift.
+- Klik salah satu MT untuk membuka reverse view dan evidence.
+
+Recent distribution ditampilkan apa adanya. Tidak ada hidden weighting yang memperbesar pengaruh observation terbaru.
+
+#### 4. MT Reverse Historical Affinity
+
+Horizontal bar chart ini membalik orientasi menjadi `MT → SPBU`.
+
+- Header menampilkan MT aktif, historical shipment, unique SPBU, operating days, concentration, temporal stability, dominant-SPBU persistence, dan pattern-shift level.
+- Sumbu Y berisi SPBU yang pernah dilayani MT.
+- Sumbu X berisi `P(SPBU|MT)`.
+- Bar panjang berarti SPBU tersebut muncul pada proporsi besar shipment MT aktif.
+- Klik bar SPBU untuk menjadikannya SPBU aktif pada seluruh dashboard.
+
+Satu shipment MT dapat melayani beberapa SPBU. Karena itu total `P(SPBU|MT)` seluruh SPBU dapat melebihi 100%; setiap probability memakai denominator distinct shipment MT, bukan total pair observation.
+
+#### 5. SPBU Consistency Scatter Plot
+
+Setiap titik mewakili satu SPBU.
+
+- Sumbu X: **Unique MT Count**.
+- Sumbu Y: **Consistency Score**.
+- Ukuran titik: historical shipment count; titik besar mempunyai evidence shipment lebih banyak.
+- Warna titik: biru untuk High Confidence, lime untuk Medium, dan merah untuk Low.
+- Legend di bagian atas grafik menjelaskan ketiga warna confidence tersebut.
+
+Cara membaca area plot:
+
+- Kiri atas: sedikit MT dan assignment sangat terkonsentrasi.
+- Kanan atas: banyak MT pernah digunakan, tetapi sebagian kecil MT tetap mendominasi.
+- Kiri bawah: sedikit MT dengan distribution lebih seimbang.
+- Kanan bawah: banyak MT dengan distribution tersebar; pola paling flexible.
+
+Hover menampilkan SPBU, shipment count, unique MT, dominant MT dan probability, consistency, variability, stability, serta confidence. Klik titik untuk membuka SPBU profile dan popup persisten berisi nama, kode, serta confidence SPBU. Titik terpilih diberi border gelap; popup dapat ditutup dengan tombol `×`.
+
+#### 6. Historical Pattern Matrix
+
+Matrix ini memberi operational overview berdasarkan dua dimensi:
+
+- Sumbu X: Unique MT Count.
+- Sumbu Y: Dominant MT Affinity.
+- Garis horizontal putus-putus: dominant affinity 60%.
+- Garis vertikal putus-putus: median Unique MT Count dari SPBU yang lolos filter.
+
+Empat quadrant dibaca sebagai berikut:
+
+| Posisi | Label | Interpretasi historis |
+|---|---|---|
+| Kiri atas | DEDICATED-LIKE | Sedikit MT dan satu MT sangat dominan. |
+| Kanan atas | PREFERRED-FLEET | Banyak MT pernah digunakan, tetapi dominant MT tetap kuat. |
+| Kiri bawah | LIMITED BALANCED | Jumlah MT sedikit dan usage relatif terbagi. |
+| Kanan bawah | HIGHLY FLEXIBLE | Banyak MT dan dominant affinity rendah. |
+
+Warna titik mengikuti quadrant. Hover menampilkan SPBU, quadrant, unique MT, dominant affinity, dan shipment count. Klik titik untuk memilih SPBU.
+
+Matrix adalah ringkasan dua dimensi. Historical Pattern pada profile juga mempertimbangkan consistency dan Top-3 share, sehingga label detail dapat memberi konteks tambahan.
+
+#### 7. Ranking cards
+
+Tiga ranking bukan recommendation list; semuanya ranking descriptive historical behavior.
+
+- **Most Historically Consistent SPBU** diurutkan berdasarkan Consistency Score. Kolom Unique MT dan Top-3 Share membantu membedakan concentration dengan ukuran fleet.
+- **Most Historically Variable SPBU** diurutkan berdasarkan Variability Score. Kolom Temporal Stability menunjukkan apakah variasi fleet tersebut tetap konsisten atau berubah antarperiode.
+- **Highest Historical Pattern Change** diurutkan dari Temporal Stability terendah. Pattern Shift serta Previous MT dan Recent MT menunjukkan arah perubahan dominant pattern.
+
+Klik nama/header kolom untuk mengubah sorting, gunakan Filter SPBU untuk menyaring ranking, dan klik row untuk membuka SPBU profile terkait. Selalu baca ranking bersama Shipment dan Confidence agar profile dengan evidence kecil tidak disamakan dengan profile ber-evidence kuat.
+
+#### 8. Historical SPBU–MT Bipartite Network
+
+Network menghubungkan dua jenis node:
+
+- Node biru: SPBU.
+- Node lime: MT.
+- Border merah: node yang sedang dipilih.
+- Edge: relationship historis SPBU–MT.
+- Edge yang terkait node aktif dibuat lebih tebal dan lebih jelas.
+
+Cara membaca:
+
+- SPBU dengan banyak edge pernah dilayani oleh banyak MT.
+- MT dengan banyak edge mempunyai historical service footprint ke banyak SPBU.
+- Ketebalan edge menunjukkan historical shipment evidence. Pilihan Network Edge mengubah analytical edge value menjadi Shipment Count atau Affinity Probability, sedangkan tooltip tetap menampilkan kedua probability agar arah relationship dapat dibandingkan.
+- Hover edge menampilkan shipment count, `P(MT|SPBU)`, `P(SPBU|MT)`, first/last observed, operating days, dan confidence.
+- Klik node SPBU untuk highlight seluruh MT yang pernah melayaninya.
+- Klik node MT untuk membuka reverse service footprint MT tersebut.
+
+Network dibatasi pada relationship teratas agar tetap usable. Gunakan probability chart, reverse chart, dan evidence table untuk audit angka detail.
+
+#### 9. Historical Evidence Drill-Down
+
+Card ini adalah audit table untuk relationship SPBU–MT aktif. Setiap row adalah shipment pembentuk relationship dan menampilkan:
+
+- Date dan Shipment ID;
+- Depot dan Gate Out;
+- MT dan SPBU;
+- Products dan Quantity;
+- Other SPBU dalam shipment yang sama.
+
+Jumlah `distinct shipments` pada header harus sama dengan shipment count relationship aktif. Jika satu shipment mempunyai beberapa LO atau produk, detail dapat memuat beberapa product tetapi relationship tetap dihitung satu observation.
+
+#### 10. Methodology & Guardrails
+
+Card terakhir merangkum formula aktif untuk Consistency, Variability, Temporal Stability, dan Confidence beserta algorithm version. Gunakan card ini untuk memastikan interpretasi score konsisten saat membandingkan export, API response, atau periode analisis berbeda.
+
+Aturan interpretasi utama Phase 4:
+
+```text
+Affinity menjawab: MT mana yang historically melayani SPBU dan seberapa sering?
+Stability menjawab: apakah distribution tersebut bertahan dari waktu ke waktu?
+Confidence menjawab: seberapa kuat evidence yang mendukung kedua pembacaan tersebut?
+```
+
+Ketiga konsep tersebut tidak boleh dicampur. Historical affinity tinggi tidak membuktikan future suitability, dan confidence tinggi tidak menjadikan pola sebagai rekomendasi assignment.
 
 Operational Shift Intelligence di Phase 2:
 
@@ -136,6 +450,8 @@ Monorepo layout:
 - `example data`: source workbook Phase 0
 
 Phase 2 departure intelligence details are documented in `docs/PHASE_2_DEPOT_DEPARTURE_INTELLIGENCE.md`.
+Phase 3 pairing intelligence implementation is summarized in `PHASE_3_COMPLETION_REPORT.md`.
+Phase 4 methodology is documented in `docs/PHASE_4_SPBU_MT_AFFINITY.md`, with implementation status in `PHASE_4_COMPLETION_REPORT.md`.
 
 ## Phase Roadmap
 
@@ -301,30 +617,29 @@ Gating:
 
 - membutuhkan shipment membership dan GPS-confirmed sequence.
 
-### Phase 4: Shipment-Set and Route-Pattern Intelligence
+### Phase 4: SPBU–MT Historical Affinity & Stability Intelligence
 
 Tujuan:
 
-- menemukan recurring shipment set pattern
-- menemukan ordered route pattern dari GPS-confirmed sequence
-- membedakan `{A,B,C}` sebagai shipment set dari `Depot -> A -> C -> B -> Depot` sebagai route sequence
+- mengukur historical affinity `P(MT|SPBU)` dan reverse footprint `P(SPBU|MT)`
+- mengukur concentration, variability, evidence confidence, dan temporal stability secara terpisah
+- mendeteksi historical distribution shift tanpa memberi causal explanation
+- menyediakan Fleet Affinity Vector untuk feature Phase 5
 
 Target output:
 
-- `fact_shipment_set_pattern`
-- `fact_route_pattern`
-- `fact_route_pattern_stop`
-- route occurrence count
-- share of comparable trips
-- typical gate-out time
-- median duration
-- Route Pattern Explorer
+- `fact_spbu_mt_pair`
+- `fact_spbu_mt_profile`
+- `fact_spbu_mt_temporal_profile`
+- API `/api/v1/affinity-intelligence/analysis`
+- UI `/affinity-intelligence`
+- algorithm `spbu_mt_affinity.jsd_v1`
 
-Status saat ini: `NOT STARTED`.
+Status saat ini: `COMPLETE`.
 
 Gating:
 
-- membutuhkan Phase 3 pair/edge intelligence dan GPS-confirmed route sequence.
+- acceptance tests, UI build, documentation, dan visual validation harus tetap lulus sebelum Phase 5.
 
 ### Phase 5: Operational Cluster Intelligence
 
@@ -448,6 +763,8 @@ Setiap phase harus melewati gate berikut sebelum phase berikutnya dimulai:
 - `GET /api/v1/tag-intelligence/recommendations`
 - `GET /api/v1/network/nodes`
 - `GET /api/v1/network/edges`
+- `GET /api/v1/affinity-intelligence/analysis?depot_id=...&start_date=...&end_date=...`
+- `GET /api/v1/affinity-intelligence/available-dates?depot_id=...`
 
 Phase 1 dan Phase 6 endpoints masih gated dan mengembalikan status `NOT_STARTED`.
 
@@ -476,5 +793,6 @@ Dokumen pendukung:
 - `docs/GPS_MODEL.md`
 - `docs/PHASES.md`
 - `docs/PHASE_0_STATUS.md`
+- `docs/PHASE_4_SPBU_MT_AFFINITY.md`
 - `docs/FUTURE_VRP_INTEGRATION.md`
 - `docs/FUTURE_AI_ASSISTANT.md`

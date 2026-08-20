@@ -21,6 +21,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .compatibility import evaluate_mt_spbu_compatibility
+from .affinity_intelligence import build_affinity_date_availability, build_affinity_intelligence_payload
 from .config import get_settings
 from .database import get_db
 from .departure_intelligence import build_departure_date_availability, build_departure_intelligence_payload, build_shift_intelligence_payload
@@ -48,6 +49,7 @@ from .models import (
     TagAlias,
 )
 from .normalization import clean_str, infer_tag_type, make_id, normalize_key, normalize_product, parse_mt_name, source_int, source_number, split_project_tags
+from .pairing_intelligence import build_pairing_date_availability, build_pairing_intelligence_payload
 from .tag_consistency import build_tag_consistency_payload, get_tag_consistency_detail
 
 settings = get_settings()
@@ -648,6 +650,88 @@ def depot_departure_shift_intelligence(request: ShiftAnalysisRequest, db: Sessio
         sort_column=request.sort_column,
         sort_direction=request.sort_direction,
     )
+
+
+@app.get("/api/v1/pairing-intelligence/analysis")
+def spbu_pairing_intelligence(
+    depot_id: str,
+    start_date: str,
+    end_date: str,
+    product_id: str | None = None,
+    limit: int = 25,
+    offset: int = 0,
+    search: str | None = None,
+    sort_column: str = "evidence_strength",
+    sort_direction: str = "desc",
+    selected_spbu_id: str | None = None,
+    evidence_spbu_a_id: str | None = None,
+    evidence_spbu_b_id: str | None = None,
+    matrix_limit: int = 30,
+    network_limit: int = 40,
+    db: Session = Depends(get_db),
+) -> dict:
+    return build_pairing_intelligence_payload(
+        db,
+        depot_id=depot_id,
+        start_date=parse_iso_date_filter(start_date, "start_date"),
+        end_date=parse_iso_date_filter(end_date, "end_date"),
+        product_id=product_id or None,
+        limit=max(1, min(limit, 100)),
+        offset=max(0, offset),
+        search=search,
+        sort_column=sort_column,
+        sort_direction=sort_direction,
+        selected_spbu_id=selected_spbu_id,
+        evidence_spbu_a_id=evidence_spbu_a_id,
+        evidence_spbu_b_id=evidence_spbu_b_id,
+        matrix_limit=max(2, min(matrix_limit, 60)),
+        network_limit=max(5, min(network_limit, 100)),
+    )
+
+
+@app.get("/api/v1/pairing-intelligence/available-dates")
+def spbu_pairing_available_dates(depot_id: str, db: Session = Depends(get_db)) -> dict:
+    return build_pairing_date_availability(db, depot_id)
+
+
+@app.get("/api/v1/affinity-intelligence/analysis")
+def spbu_mt_affinity_intelligence(
+    depot_id: str,
+    start_date: str,
+    end_date: str,
+    product_id: str | None = None,
+    minimum_observations: int = 1,
+    confidence: str = "ALL",
+    temporal_bucket: str = "AUTO",
+    recent_days: int = 7,
+    top_n: int = 5,
+    selected_spbu_id: str | None = None,
+    selected_mt_id: str | None = None,
+    edge_metric: str = "SHIPMENT_COUNT",
+    network_limit: int = 100,
+    db: Session = Depends(get_db),
+) -> dict:
+    return build_affinity_intelligence_payload(
+        db,
+        depot_id=depot_id,
+        start_date=parse_iso_date_filter(start_date, "start_date"),
+        end_date=parse_iso_date_filter(end_date, "end_date"),
+        product_id=product_id or None,
+        minimum_observations=max(1, minimum_observations),
+        confidence_filter=confidence,
+        temporal_bucket=temporal_bucket,
+        recent_days=max(1, min(recent_days, 365)),
+        top_n=max(0, min(top_n, 100)),
+        selected_spbu_id=selected_spbu_id,
+        selected_mt_id=selected_mt_id,
+        edge_metric=edge_metric,
+        network_limit=max(5, min(network_limit, 250)),
+    )
+
+
+@app.get("/api/v1/affinity-intelligence/available-dates")
+def spbu_mt_affinity_available_dates(depot_id: str, db: Session = Depends(get_db)) -> dict:
+    return build_affinity_date_availability(db, depot_id)
 
 
 @app.get("/api/v1/master/compatibility/summary")
