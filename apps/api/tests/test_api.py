@@ -21,6 +21,46 @@ def test_health_endpoint() -> None:
     assert client.get("/api/v1/health").json()["status"] == "ok"
 
 
+def test_spbu_crud_backfills_lat_long_from_source_coordinate() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as session:
+        session.add(
+            MasterSPBU(
+                spbu_id="spbu_coordinate_backfill",
+                spbu_code="11201199",
+                spbu_name="11201199",
+                source_coordinate="5,19182389869645 96,4368560343681",
+                latitude=None,
+                longitude=None,
+                active_status="ACTIVE",
+            )
+        )
+        session.commit()
+
+    def override_db():
+        with Session() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        response = client.get("/api/v1/master-crud/SPBU", params={"search": "11201199", "search_column": "spbu_code"})
+        assert response.status_code == 200
+        row = response.json()["rows"][0]
+        assert row["source_coordinate"] == "5,19182389869645 96,4368560343681"
+        assert row["latitude"] == 5.19182389869645
+        assert row["longitude"] == 96.4368560343681
+
+        with Session() as session:
+            spbu = session.get(MasterSPBU, "spbu_coordinate_backfill")
+            assert spbu.latitude == 5.19182389869645
+            assert spbu.longitude == 96.4368560343681
+    finally:
+        app.dependency_overrides.clear()
+
+
 def test_departure_circular_stats_handle_midnight_cluster() -> None:
     stats = circular_stats([23 * 60 + 30, 23 * 60 + 50, 5, 20, 35])
     assert stats["p50"] in {5, 1445 % 1440}
@@ -398,29 +438,80 @@ def test_dashboard_counts_match_database() -> None:
         sync_depot = session.query(MasterDepot).filter(MasterDepot.depot_id == depot.depot_id).first()
         sync_product = session.query(MasterProduct).filter(MasterProduct.product_name != "TEST PRODUCT CRUD UPDATED").first()
         sync_tag = session.query(MasterTag).first()
+        sync_depot_id = sync_depot.depot_id
+        sync_product_id = sync_product.product_id
+        sync_tag_id = sync_tag.tag_id
+        session.add(
+            FactShipment(
+                shipment_id="sync_deleted_source_shipment",
+                source_shipment_id="sync_deleted_source_shipment",
+                depot_id=depot.depot_id,
+            )
+        )
+        session.add(
+            FactLoadingOrderLine(
+                loading_order_number="SYNC-DELETED-SOURCE-LO",
+                source_depot_name="SYNC DELETED SOURCE DEPOT",
+                shipment_id="sync_deleted_source_shipment",
+                source_product_name="SYNC DELETED SOURCE PRODUCT",
+                status="DELETED",
+            )
+        )
+        session.add(
+            MasterMT(
+                mt_id="sync_deleted_source_mt",
+                vehicle_name_raw="SYNC DELETED SOURCE MT",
+                project_tag_raw="SYNC DELETED SOURCE TAG",
+                active_status="DELETED",
+            )
+        )
+        session.add(
+            MasterSPBU(
+                spbu_id="sync_deleted_source_spbu",
+                spbu_code="SYNC_DELETED_SOURCE_SPBU",
+                project_tag_raw="SYNC DELETED SOURCE TAG",
+                active_status="DELETED",
+            )
+        )
+        session.commit()
 
-    assert client.delete(f"/api/v1/master-crud/DEPOT/{sync_depot.depot_id}").status_code == 200
+    assert client.delete(f"/api/v1/master-crud/DEPOT/{sync_depot_id}").status_code == 200
     depot_sync = client.post("/api/v1/master-crud/DEPOT/sync")
     assert depot_sync.status_code == 200
     assert depot_sync.json()["reactivated"] >= 1
+    listed_depots_after_sync = client.get("/api/v1/master/depots")
+    assert listed_depots_after_sync.status_code == 200
+    assert any(row["depot_id"] == sync_depot_id for row in listed_depots_after_sync.json())
 
-    assert client.delete(f"/api/v1/master-crud/PRODUCT/{sync_product.product_id}").status_code == 200
+    assert client.delete(f"/api/v1/master-crud/PRODUCT/{sync_product_id}").status_code == 200
     product_sync = client.post("/api/v1/master-crud/PRODUCT/sync")
     assert product_sync.status_code == 200
     assert product_sync.json()["reactivated"] >= 1
+    listed_products_after_sync = client.get("/api/v1/master/products")
+    assert listed_products_after_sync.status_code == 200
+    assert any(row["product_id"] == sync_product_id for row in listed_products_after_sync.json())
 
-    assert client.delete(f"/api/v1/master-crud/TAG/{sync_tag.tag_id}").status_code == 200
+    assert client.delete(f"/api/v1/master-crud/TAG/{sync_tag_id}").status_code == 200
     tag_sync = client.post("/api/v1/master-crud/TAG/sync")
     assert tag_sync.status_code == 200
     assert tag_sync.json()["reactivated"] >= 1
+    listed_tags_after_sync = client.get("/api/v1/master/tags")
+    assert listed_tags_after_sync.status_code == 200
+    assert any(row["tag_id"] == sync_tag_id for row in listed_tags_after_sync.json())
 
     with Session() as session:
         deleted_product = session.get(MasterProduct, product_id)
-        synced_depot = session.get(MasterDepot, sync_depot.depot_id)
-        synced_product = session.get(MasterProduct, sync_product.product_id)
-        synced_tag = session.get(MasterTag, sync_tag.tag_id)
+        synced_depot = session.get(MasterDepot, sync_depot_id)
+        synced_product = session.get(MasterProduct, sync_product_id)
+        synced_tag = session.get(MasterTag, sync_tag_id)
+        deleted_source_depot = session.query(MasterDepot).filter(MasterDepot.depot_name == "SYNC DELETED SOURCE DEPOT").first()
+        deleted_source_product = session.query(MasterProduct).filter(MasterProduct.product_name == "SYNC DELETED SOURCE PRODUCT").first()
+        deleted_source_tag = session.query(MasterTag).filter(MasterTag.tag_value == "SYNC DELETED SOURCE TAG").first()
     assert deleted_product.active_status == "ACTIVE"
     assert synced_depot.active_status == "ACTIVE"
     assert synced_product.active_status == "ACTIVE"
     assert synced_tag.active_status == "ACTIVE"
+    assert deleted_source_depot is None
+    assert deleted_source_product is None
+    assert deleted_source_tag is None
     app.dependency_overrides.clear()

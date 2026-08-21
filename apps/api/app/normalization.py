@@ -113,12 +113,12 @@ def parse_coordinate(raw: Any) -> tuple[float | None, float | None, list[str]]:
     text = clean_str(raw)
     if not text:
         return None, None, ["missing coordinate"]
-    pieces = [piece.strip() for piece in text.split(",")]
+    pieces = re.findall(r"[-+]?\d+(?:[\.,]\d+)?", text)
     if len(pieces) != 2:
-        return None, None, ["coordinate must contain latitude,longitude"]
+        return None, None, ["coordinate must contain latitude and longitude"]
     try:
-        lat = float(pieces[0])
-        lon = float(pieces[1])
+        lat = float(pieces[0].replace(",", "."))
+        lon = float(pieces[1].replace(",", "."))
     except ValueError:
         return None, None, ["coordinate values are not numeric"]
     messages = []

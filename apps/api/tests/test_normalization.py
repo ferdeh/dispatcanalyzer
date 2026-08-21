@@ -26,6 +26,11 @@ def test_coordinate_parsing_validates_ranges() -> None:
     assert lon == 98.6733
     assert messages == []
 
+    comma_lat, comma_lon, comma_messages = parse_coordinate("5,19182389869645 96,4368560343681")
+    assert comma_lat == 5.19182389869645
+    assert comma_lon == 96.4368560343681
+    assert comma_messages == []
+
     bad_lat, bad_lon, bad_messages = parse_coordinate("103.602700,98.673300")
     assert bad_lat is None
     assert bad_lon is None

@@ -59,6 +59,28 @@ def test_phase0_imports_real_workbooks(db_session) -> None:
     assert db_session.scalar(select(func.count()).select_from(StgLoadingOrder)) == 4462
 
 
+def test_spbu_import_preserves_decimal_comma_coordinate(db_session, tmp_path) -> None:
+    csv_path = tmp_path / "spbu_decimal_comma_coordinate.csv"
+    csv_path.write_text(
+        "\n".join(
+            [
+                "Nama SPBU,Coordinate,Vehicle Type tag,Project tag",
+                '11201199,"5,19182389869645 96,4368560343681",24,All In',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    processor = ImportProcessor(db_session)
+    processor.import_master_spbu(csv_path, sheet_name="SPBU")
+
+    spbu = db_session.scalar(select(MasterSPBU).where(MasterSPBU.spbu_code == "11201199"))
+    assert spbu is not None
+    assert spbu.source_coordinate == "5,19182389869645 96,4368560343681"
+    assert spbu.latitude == 5.19182389869645
+    assert spbu.longitude == 96.4368560343681
+
+
 def test_loading_order_model_preserves_multi_product_shipments(db_session) -> None:
     processor = ImportProcessor(db_session)
     processor.import_master_mt(EXAMPLE_DIR / "master data MT.xlsx")

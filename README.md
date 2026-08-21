@@ -65,6 +65,11 @@ Halaman Master Data berisi operasional data-management:
 - filter CRUD by search, depot, status
 - pagination CRUD per `10`, `50`, `100`, atau `All records`
 - checkbox select all dan select per row pada tabel CRUD
+- sort pada masing-masing kolom tabel CRUD
+- dynamic tag-type columns pada Master MT dan Master SPBU
+- edit tag MT/SPBU melalui modal edit CRUD
+- Sync Depot/Product/Tag dari canonical source yang masih aktif saja
+- SPBU coordinate parsing dari format `latitude longitude`, termasuk decimal comma seperti `5,19182389869645 96,4368560343681`
 
 Halaman Phase 2 - Depot Departure Time Intelligence berisi analisa deskriptif historis keberangkatan Mobil Tangki dari depot:
 
@@ -500,10 +505,11 @@ Progress yang sudah dibuat:
 - Import audit dan import history.
 - RAW -> STAGING -> VALIDATION -> NORMALIZATION -> PUBLISH -> CANONICAL flow.
 - Canonical master MT dengan registration normalization.
-- Canonical master SPBU dengan coordinate parsing.
+- Canonical master SPBU dengan coordinate parsing dari `source_coordinate`; format `lat long` dengan decimal comma diparse ke kolom `latitude` dan `longitude`.
 - Canonical depot dari source alias.
 - Product bootstrap dari Loading Order.
 - Tag splitting, tag master, tag type, MT tag bridge, SPBU tag bridge.
+- Tag Vehicle Class pada MT/SPBU disimpan sebagai integer dan ditampilkan sebagai kolom `TAG VEHICLE CLASS`.
 - Loading Order grouping menjadi shipment header dan loading-order lines.
 - Kombinasi `loading_order_number` + nama depot `tbbm`/`source_depot_name` menjadi primary key canonical untuk `fact_loading_order_line`; `loading_order_number` boleh sama di depot berbeda, sedangkan source `shipment_id` boleh duplikat karena satu shipment bisa multi loading order, multi SPBU, dan multi kompartemen dalam MT yang sama.
 - Shipment-SPBU membership.
@@ -514,17 +520,21 @@ Progress yang sudah dibuat:
 - Dashboard filter by depot.
 - Phase 0 KPI cards dan chart categories.
 - Master Data CRUD untuk MT, SPBU, Loading Order, Depot, Product, Tag, dan Tag Type.
-- CRUD supports add, view, update, soft delete, search, status filter, depot filter, pagination, select all, select per row.
+- CRUD supports add, view, update, soft delete, column search, sort, status filter, depot filter, pagination, select all, select per row, dan multi-row add/edit/delete.
+- Deleted master data disembunyikan dari list aktif dan unique key dapat dipakai kembali setelah soft-delete karena create path mereaktivasi record yang sudah deleted.
+- Sync master Depot/Product/Tag hanya membaca source aktif: active MT, active SPBU, dan active Loading Order. Data yang sudah `DELETED` tidak dipakai sebagai candidate sync.
+- Sync dapat mereaktivasi master Depot/Product/Tag yang deleted bila nilai tersebut masih direferensikan oleh source aktif.
 - Frontend theme sudah diselaraskan dengan `vrp_planner` menggunakan palet Petrofin untuk background, header, navigation, panel, focus state, dan chart.
 - Phase 6 inference, global MT assignment, audit/override/history/export API dan UI tersedia sebagai extension modular.
 
 Progress validasi:
 
 - Container stack healthy.
-- API tests passing: `17 passed`.
+- Relevant API/import/normalization tests passing: `18 passed`.
 - Frontend build passing.
 - Browser smoke tests passing untuk dashboard, master-data page, CRUD pagination, select all, dan All records.
-- Web container rebuilt dan healthy setelah update tema Petrofin.
+- API container rebuilt dan healthy setelah update sync dan SPBU coordinate backfill.
+- Web container rebuilt dan healthy setelah update tema Petrofin dan kolom coordinate SPBU.
 
 Belum selesai:
 

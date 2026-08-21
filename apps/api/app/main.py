@@ -48,7 +48,7 @@ from .models import (
     StgSPBU,
     TagAlias,
 )
-from .normalization import clean_str, infer_tag_type, make_id, normalize_key, normalize_product, parse_mt_name, source_int, source_number, split_project_tags
+from .normalization import clean_str, infer_tag_type, make_id, normalize_key, normalize_product, parse_coordinate, parse_mt_name, source_int, source_number, split_project_tags
 from .pairing_intelligence import build_pairing_date_availability, build_pairing_intelligence_payload
 from .phase5_routes import router as phase5_router
 from .phase6_routes import router as phase6_router
@@ -71,6 +71,24 @@ class CompatibilityRequest(BaseModel):
     mt_id: str
     spbu_id: str
     product_id: str | None = None
+
+
+def sync_spbu_coordinates_from_source(db: Session, rows: list[MasterSPBU]) -> int:
+    updated = 0
+    for spbu in rows:
+        if not spbu.source_coordinate:
+            continue
+        latitude, longitude, messages = parse_coordinate(spbu.source_coordinate)
+        if messages:
+            continue
+        if spbu.latitude == latitude and spbu.longitude == longitude:
+            continue
+        spbu.latitude = latitude
+        spbu.longitude = longitude
+        updated += 1
+    if updated:
+        db.commit()
+    return updated
 
 
 class OperationalShiftRequest(BaseModel):
@@ -357,6 +375,7 @@ def get_mt(mt_id: str, db: Session = Depends(get_db)) -> dict:
 @app.get("/api/v1/master/spbu")
 def list_spbu(limit: int = 100, offset: int = 0, db: Session = Depends(get_db)) -> list[dict]:
     rows = db.scalars(select(MasterSPBU).order_by(MasterSPBU.spbu_code).offset(offset).limit(limit)).all()
+    sync_spbu_coordinates_from_source(db, rows)
     return [public(row) for row in rows]
 
 
@@ -365,6 +384,7 @@ def get_spbu(spbu_id: str, db: Session = Depends(get_db)) -> dict:
     spbu = db.get(MasterSPBU, spbu_id)
     if not spbu:
         raise HTTPException(status_code=404, detail="SPBU not found")
+    sync_spbu_coordinates_from_source(db, [spbu])
     issue_count = db.scalar(select(func.count()).select_from(DataQualityIssue).where(DataQualityIssue.entity_type == "SPBU", DataQualityIssue.entity_id == spbu.spbu_code)) or 0
     compatible_count = 0
     for mt in db.scalars(select(MasterMT)).all():
@@ -375,7 +395,7 @@ def get_spbu(spbu_id: str, db: Session = Depends(get_db)) -> dict:
 
 @app.get("/api/v1/master/depots")
 def list_depots(db: Session = Depends(get_db)) -> list[dict]:
-    return [public(row) for row in db.scalars(select(MasterDepot).order_by(MasterDepot.depot_name)).all()]
+    return [public(row) for row in db.scalars(select(MasterDepot).where(MasterDepot.active_status != "DELETED").order_by(MasterDepot.depot_name)).all()]
 
 
 @app.get("/api/v1/exports/template")
@@ -396,7 +416,7 @@ def export_data(domain: str, depot_id: str, file_format: str = "xlsx", db: Sessi
     normalized_domain = normalize_export_domain(domain)
     normalized_format = normalize_file_format(file_format)
     depot = db.get(MasterDepot, depot_id)
-    if not depot:
+    if not depot or depot.active_status == "DELETED":
         raise HTTPException(status_code=404, detail="Depot not found.")
     if normalized_domain not in EXPORT_DOMAIN_LABELS:
         raise HTTPException(status_code=400, detail="Export domain is not supported.")
@@ -413,12 +433,12 @@ def export_data(domain: str, depot_id: str, file_format: str = "xlsx", db: Sessi
 
 @app.get("/api/v1/master/products")
 def list_products(db: Session = Depends(get_db)) -> list[dict]:
-    return [public(row) for row in db.scalars(select(MasterProduct).order_by(MasterProduct.product_name)).all()]
+    return [public(row) for row in db.scalars(select(MasterProduct).where(MasterProduct.active_status != "DELETED").order_by(MasterProduct.product_name)).all()]
 
 
 @app.get("/api/v1/master/tags")
 def list_tags(db: Session = Depends(get_db)) -> list[dict]:
-    return [public(row) for row in db.scalars(select(MasterTag).order_by(MasterTag.tag_value)).all()]
+    return [public(row) for row in db.scalars(select(MasterTag).where(MasterTag.active_status != "DELETED").order_by(MasterTag.tag_value)).all()]
 
 
 @app.get("/api/v1/master-crud/{domain}")
@@ -443,6 +463,8 @@ def crud_list_master(
     stmt = apply_crud_sort(normalized_domain, stmt, sort_column, sort_direction)
     total = db.scalar(count_stmt) or 0
     rows = db.scalars(stmt.offset(offset).limit(limit)).all()
+    if normalized_domain == "SPBU":
+        sync_spbu_coordinates_from_source(db, rows)
     tag_types = tag_type_lookup(db) if normalized_domain in {"MOBIL_TANGKI", "SPBU", "TAG"} else None
     mt_tag_values = mt_tag_value_lookup(db, [row.mt_id for row in rows], tag_types or {}) if normalized_domain == "MOBIL_TANGKI" else None
     spbu_tag_values = spbu_tag_value_lookup(db, [row.spbu_id for row in rows], tag_types or {}) if normalized_domain == "SPBU" else None
@@ -1329,15 +1351,23 @@ def build_crud_record(domain: str, payload: dict):
         )
     if domain == "SPBU":
         code = required_text(payload, "spbu_code")
+        source_coordinate = clean_str(payload.get("source_coordinate"))
+        latitude = source_number(payload.get("latitude"))
+        longitude = source_number(payload.get("longitude"))
+        if source_coordinate and (latitude is None or longitude is None):
+            parsed_latitude, parsed_longitude, coordinate_messages = parse_coordinate(source_coordinate)
+            if not coordinate_messages:
+                latitude = parsed_latitude
+                longitude = parsed_longitude
         return MasterSPBU(
             spbu_id=make_id("spbu", code),
             spbu_code=code,
             spbu_name=clean_str(payload.get("spbu_name")) or code,
             address=clean_str(payload.get("address")),
             city=clean_str(payload.get("city")),
-            latitude=source_number(payload.get("latitude")),
-            longitude=source_number(payload.get("longitude")),
-            source_coordinate=clean_str(payload.get("source_coordinate")),
+            latitude=latitude,
+            longitude=longitude,
+            source_coordinate=source_coordinate,
             master_distance_km=source_number(payload.get("master_distance_km")),
             master_travel_time_min=source_number(payload.get("master_travel_time_min")),
             vehicle_type_tag=source_int(payload.get("vehicle_type_tag")),
@@ -1395,6 +1425,13 @@ def apply_crud_update(domain: str, record, payload: dict) -> None:
         record.normalized_tag = normalize_key(record.tag_value) or record.tag_value.upper()
     if domain == "TAG_TYPE" and "code" in payload and record.code:
         record.code = record.code.upper()
+    if domain == "SPBU" and "source_coordinate" in payload and ("latitude" not in payload or "longitude" not in payload):
+        parsed_latitude, parsed_longitude, coordinate_messages = parse_coordinate(payload.get("source_coordinate"))
+        if not coordinate_messages:
+            if "latitude" not in payload:
+                record.latitude = parsed_latitude
+            if "longitude" not in payload:
+                record.longitude = parsed_longitude
 
 
 def crud_resolve_tag_for_type(db: Session, tag_value: str, tag_type: MasterTagType, source_domain: str) -> MasterTag:
@@ -1517,6 +1554,10 @@ def record_sync(result: dict, outcome: str) -> None:
     result[outcome] += 1
 
 
+def active_loading_order_filter():
+    return (FactLoadingOrderLine.status.is_(None)) | (FactLoadingOrderLine.status != "DELETED")
+
+
 def sync_depot_candidate(db: Session, name, code, result: dict) -> None:
     depot_name = clean_str(name) or clean_str(code)
     if not depot_name:
@@ -1580,20 +1621,22 @@ def sync_depots_from_sources(db: Session) -> dict:
         seen.add(key)
         sync_depot_candidate(db, name, code, result)
 
-    for row in db.scalars(select(StgMT)).all():
-        payload = row.raw_payload or {}
-        add_candidate(payload.get("Depot"), payload.get("hubId"))
-    for row in db.scalars(select(StgSPBU)).all():
-        payload = row.raw_payload or {}
-        add_candidate(payload.get("Depot"))
-    for row in db.scalars(select(StgLoadingOrder)).all():
-        payload = row.raw_payload or {}
-        add_candidate(payload.get("tbbm"), payload.get("kode_depot"))
+    for (source_depot_name,) in db.execute(
+        select(FactLoadingOrderLine.source_depot_name)
+        .where(FactLoadingOrderLine.source_depot_name.is_not(None), active_loading_order_filter())
+        .distinct()
+    ).all():
+        add_candidate(source_depot_name)
     for depot_id in {
         value
-        for (value,) in db.execute(select(MasterMT.depot_id).where(MasterMT.depot_id.is_not(None))).all()
-        + db.execute(select(MasterSPBU.primary_depot_id).where(MasterSPBU.primary_depot_id.is_not(None))).all()
-        + db.execute(select(FactShipment.depot_id).where(FactShipment.depot_id.is_not(None))).all()
+        for (value,) in db.execute(select(MasterMT.depot_id).where(MasterMT.depot_id.is_not(None), MasterMT.active_status != "DELETED")).all()
+        + db.execute(select(MasterSPBU.primary_depot_id).where(MasterSPBU.primary_depot_id.is_not(None), MasterSPBU.active_status != "DELETED")).all()
+        + db.execute(
+            select(FactShipment.depot_id)
+            .join(FactLoadingOrderLine, FactLoadingOrderLine.shipment_id == FactShipment.shipment_id)
+            .where(FactShipment.depot_id.is_not(None), active_loading_order_filter())
+            .distinct()
+        ).all()
     }:
         depot = db.get(MasterDepot, depot_id)
         if depot:
@@ -1634,10 +1677,12 @@ def sync_products_from_sources(db: Session) -> dict:
         seen.add(normalized)
         sync_product_candidate(db, value, result)
 
-    for (value,) in db.execute(select(FactLoadingOrderLine.source_product_name).where(FactLoadingOrderLine.source_product_name.is_not(None))).all():
+    for (value,) in db.execute(
+        select(FactLoadingOrderLine.source_product_name)
+        .where(FactLoadingOrderLine.source_product_name.is_not(None), active_loading_order_filter())
+        .distinct()
+    ).all():
         add_candidate(value)
-    for row in db.scalars(select(StgLoadingOrder)).all():
-        add_candidate((row.raw_payload or {}).get("produk"))
     return result
 
 
@@ -1684,14 +1729,10 @@ def sync_tags_from_sources(db: Session) -> dict:
             seen.add(normalized)
             sync_tag_candidate(db, tag_value, result)
 
-    for (raw,) in db.execute(select(MasterMT.project_tag_raw).where(MasterMT.project_tag_raw.is_not(None))).all():
+    for (raw,) in db.execute(select(MasterMT.project_tag_raw).where(MasterMT.project_tag_raw.is_not(None), MasterMT.active_status != "DELETED")).all():
         add_tags(raw)
-    for (raw,) in db.execute(select(MasterSPBU.project_tag_raw).where(MasterSPBU.project_tag_raw.is_not(None))).all():
+    for (raw,) in db.execute(select(MasterSPBU.project_tag_raw).where(MasterSPBU.project_tag_raw.is_not(None), MasterSPBU.active_status != "DELETED")).all():
         add_tags(raw)
-    for row in db.scalars(select(StgMT)).all():
-        add_tags((row.raw_payload or {}).get("project_tag"))
-    for row in db.scalars(select(StgSPBU)).all():
-        add_tags((row.raw_payload or {}).get("Project tag"))
     return result
 
 
