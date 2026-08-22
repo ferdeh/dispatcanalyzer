@@ -8,7 +8,7 @@ from pathlib import Path
 import httpx
 import pytest
 from openpyxl import Workbook, load_workbook
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -29,6 +29,13 @@ from app.phase6_validation import validate_loading_orders, validate_mt_availabil
 
 def make_session():
     engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+
+    @event.listens_for(engine, "connect")
+    def enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine)
 
@@ -49,6 +56,11 @@ def seed(session) -> MLBehavioralModel:
         [
             MasterDepot(depot_id="D1", depot_code="D1", depot_name="Depot One", latitude=-6.20, longitude=106.84, timezone="Asia/Jakarta"),
             MasterDepot(depot_id="D2", depot_code="D2", depot_name="Depot Two", timezone="Asia/Jakarta"),
+        ]
+    )
+    session.commit()
+    session.add_all(
+        [
             MasterMT(mt_id="T1", vehicle_name_raw="Truck 1", vehicle_registration="B1001AA", capacity_label="8KL", vehicle_type_tag=8, depot_id="D1", active_status="ACTIVE"),
             MasterMT(mt_id="T2", vehicle_name_raw="Truck 2", vehicle_registration="B1002AA", capacity_label="8 KL", vehicle_type_tag=8, depot_id="D1", active_status="ACTIVE"),
             MasterMT(mt_id="T3", vehicle_name_raw="Truck 3", vehicle_registration="B1003AA", capacity_label="16KL", vehicle_type_tag=16, depot_id="D1", active_status="ACTIVE"),
@@ -82,6 +94,7 @@ def seed(session) -> MLBehavioralModel:
         model_status="ACTIVE",
     )
     session.add(model)
+    session.commit()
     for spbu_id, cluster, shift in (("A", 0, "Shift 1"), ("B", 0, "Shift 1"), ("C", 1, "Shift 2"), ("LIMITED", 1, "Shift 2")):
         session.add(
             MLSPBUClusterAssignment(

@@ -247,6 +247,14 @@ def create_prediction_run(
                     "spbu_ids": [line["spbu_id"] for line in prediction["lines"]],
                 }
             )
+
+        # These models intentionally use scalar foreign-key IDs instead of ORM
+        # relationships. Flush the parent rows explicitly so PostgreSQL never
+        # receives shipment lines or MT candidates before their shipment.
+        db.flush()
+
+        for prediction in predictions:
+            entity = entities[prediction["predicted_shipment_id"]]
             for line in prediction["lines"]:
                 db.add(
                     PredictionShipmentLine(

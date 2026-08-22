@@ -201,6 +201,7 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
   const [history, setHistory] = useState<HistoryRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [runFeedback, setRunFeedback] = useState<{ status: "RUNNING" | "SUCCESS" | "ERROR"; message: string } | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [shiftTab, setShiftTab] = useState("ALL");
   const [overrideReason, setOverrideReason] = useState<Record<string, string>>({});
@@ -240,6 +241,7 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
     setLoValidation(null);
     setMtValidation(null);
     setResult(null);
+    setRunFeedback(null);
     setDemoDialogOpen(false);
     setDemoNotice(null);
     setMtDemoDialogOpen(false);
@@ -263,6 +265,7 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
     setLoValidation(null);
     setMtValidation(null);
     setResult(null);
+    setRunFeedback(null);
     setDemoDialogOpen(false);
     setDemoNotice(null);
     setMtDemoDialogOpen(false);
@@ -291,6 +294,10 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
     if (!canRun || !loadingOrderFile || !mtFile) return;
     setLoading(true);
     setError(null);
+    setRunFeedback({
+      status: "RUNNING",
+      message: "Prediction sedang diproses. Waktu proses bergantung pada jumlah loading order dan estimasi rute.",
+    });
     const body = new FormData();
     body.append("depot_id", depotId);
     body.append("model_id", modelId);
@@ -307,9 +314,12 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
       setResult(payload);
       setExpanded(payload.shipments[0]?.id ?? null);
       setShiftTab("ALL");
+      setRunFeedback({ status: "SUCCESS", message: `Prediction ${payload.prediction_run_id} berhasil diselesaikan.` });
       setHistory(await apiGet<HistoryRow[]>(`/api/v1/phase6/predictions?depot_id=${encodeURIComponent(depotId)}`));
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Prediction failed.");
+      const message = reason instanceof Error ? reason.message : "Prediction failed.";
+      setError(message);
+      setRunFeedback({ status: "ERROR", message: `Prediction gagal: ${message}` });
     } finally {
       setLoading(false);
     }
@@ -677,8 +687,24 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
               </table>
             </div>
           ) : <div className="mt-4 border border-mint bg-mint/5 p-3 text-sm text-mint">Both input files passed validation.</div>}
-          <div className="mt-5 flex justify-end">
-            <button className="inline-flex items-center gap-2 bg-petroblue px-5 py-3 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-40" disabled={!canRun || loading} onClick={() => void runPrediction()}><Play size={16} /> {loading ? "Running Prediction…" : "Run Prediction"}</button>
+          <div className="mt-5">
+            <div className="flex justify-end">
+              <button className="inline-flex items-center gap-2 bg-petroblue px-5 py-3 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-40" disabled={!canRun || loading} onClick={() => void runPrediction()}>{loading ? <RefreshCw className="animate-spin" size={16} /> : <Play size={16} />} {loading ? "Running Prediction…" : "Run Prediction"}</button>
+            </div>
+            {runFeedback && (
+              <div
+                aria-live="polite"
+                className={`mt-3 border p-3 text-sm ${
+                  runFeedback.status === "SUCCESS"
+                    ? "border-mint bg-mint/5 text-mint"
+                    : runFeedback.status === "ERROR"
+                      ? "border-rust bg-rust/5 text-rust"
+                      : "border-amber bg-amber/5 text-amber"
+                }`}
+              >
+                {runFeedback.message}
+              </div>
+            )}
           </div>
         </section>
       )}
