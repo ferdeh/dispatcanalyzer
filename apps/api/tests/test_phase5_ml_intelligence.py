@@ -29,7 +29,9 @@ from app.models import (
 )
 from app.phase5_behavioral import (
     create_pairing_graph,
+    generate_node2vec_embeddings,
     prepare_training_dataset,
+    recover_interrupted_behavioral_training_runs,
     train_behavioral_model,
     validate_feature_weights,
 )
@@ -56,7 +58,7 @@ def make_session():
 
 
 def seed_compatible_master(session, spbu_ids: list[str], *, tags: bool = False) -> None:
-    session.add(MasterDepot(depot_id="D1", depot_code="D1", depot_name="Depot One"))
+    session.add(MasterDepot(depot_id="D1", depot_code="D1", depot_name="Depot One", latitude=3.6, longitude=98.7))
     session.add(MasterMT(mt_id="T1", vehicle_name_raw="Truck 1", vehicle_registration="T-001", vehicle_type_tag=1, depot_id="D1"))
     if tags:
         session.add(MasterTagType(tag_type_id="TYPE_PROJECT", code="PROJECT", name="Project"))
@@ -69,6 +71,8 @@ def seed_compatible_master(session, spbu_ids: list[str], *, tags: bool = False) 
                 spbu_id=spbu_id,
                 spbu_code=spbu_id,
                 spbu_name=f"SPBU {spbu_id}",
+                latitude=3.5 + index * 0.01,
+                longitude=98.6 + index * 0.01,
                 vehicle_type_tag=1,
                 primary_depot_id="D1",
             )
@@ -78,7 +82,7 @@ def seed_compatible_master(session, spbu_ids: list[str], *, tags: bool = False) 
     session.commit()
 
 
-def add_shipment(session, shipment_id: str, spbu_ids: list[str], day: int, hour: int) -> None:
+def add_shipment(session, shipment_id: str, spbu_ids: list[str], day: int, hour: int, *, with_loading_orders: bool = False) -> None:
     operation_date = date(2026, 1, day)
     session.add(
         FactShipment(
@@ -91,8 +95,19 @@ def add_shipment(session, shipment_id: str, spbu_ids: list[str], day: int, hour:
             gate_out_datetime=datetime(2026, 1, day, hour, 0),
         )
     )
-    for spbu_id in spbu_ids:
+    for index, spbu_id in enumerate(spbu_ids):
         session.add(FactShipmentSPBU(shipment_id=shipment_id, spbu_id=spbu_id))
+        if with_loading_orders:
+            session.add(
+                FactLoadingOrderLine(
+                    loading_order_number=f"LO-{shipment_id}-{index}",
+                    source_depot_name="Depot One",
+                    shipment_id=shipment_id,
+                    spbu_id=spbu_id,
+                    source_product_name="P1",
+                    quantity=8,
+                )
+            )
 
 
 def test_concentration_math_score_transform_and_directional_synthetic_example() -> None:
@@ -114,13 +129,13 @@ def test_concentration_math_score_transform_and_directional_synthetic_example() 
     assert normalized[-1] > max(normalized[:-1])
 
 
-def test_readiness_is_exact_and_engine_a_deduplicates_canonical_assignment() -> None:
+def test_readiness_uses_observed_assignments_and_engine_a_deduplicates_canonical_assignment() -> None:
     Session = make_session()
     with Session() as session:
         seed_compatible_master(session, ["A", "B"])
-        readiness = build_phase5_readiness(session, "D1")
-        assert readiness["is_ready"] is True
-        assert readiness["master_compatibility_pass_percentage"] == 100.0
+        no_observations = build_phase5_readiness(session, "D1")
+        assert no_observations["is_ready"] is False
+        assert no_observations["evaluated_assignment_count"] == 0
 
         add_shipment(session, "S1", ["A"], 1, 6)
         session.add(
@@ -144,6 +159,14 @@ def test_readiness_is_exact_and_engine_a_deduplicates_canonical_assignment() -> 
             )
         )
         session.commit()
+        readiness = build_phase5_readiness(session, "D1", include_matrix=True)
+        assert readiness["is_ready"] is True
+        assert readiness["master_compatibility_pass_percentage"] == 100.0
+        assert readiness["depot_latitude"] == 3.6
+        assert readiness["depot_longitude"] == 98.7
+        assert readiness["evaluated_assignment_count"] == 2
+        assert readiness["master_eligibility_matrix"]["blocks_readiness"] is False
+
         result = run_concentration_analysis(
             session,
             depot_id="D1",
@@ -156,11 +179,22 @@ def test_readiness_is_exact_and_engine_a_deduplicates_canonical_assignment() -> 
         assert result["profiles"][0]["shipment_observation_count"] == 1
         assert result["methodology"]["observation_key"] == ["depot_id", "shipment_id", "spbu_id", "mt_id"]
 
-        session.add(MasterSPBU(spbu_id="BAD", spbu_code="BAD", vehicle_type_tag=2, primary_depot_id="D1"))
+        # An unused master combination that is ineligible must remain an Engine A
+        # matrix exclusion and must not block Phase 5 readiness.
+        session.add(MasterSPBU(spbu_id="BAD", spbu_code="BAD", vehicle_type_tag=0, primary_depot_id="D1"))
+        session.commit()
+        still_ready = build_phase5_readiness(session, "D1", include_matrix=True)
+        assert still_ready["is_ready"] is True
+        assert still_ready["master_eligibility_matrix"]["excluded_pair_count"] > 0
+
+        # The same pair does block readiness once it appears as an actual Phase 1
+        # Loading Order assignment.
+        add_shipment(session, "S-BAD", ["BAD"], 1, 7, with_loading_orders=True)
         session.commit()
         blocked = build_phase5_readiness(session, "D1")
         assert blocked["is_ready"] is False
         assert blocked["master_compatibility_pass_percentage"] < 100
+        assert blocked["mismatch_assignment_count"] == 1
 
 
 def test_pairing_graph_isolated_nodes_and_feature_weight_validation() -> None:
@@ -171,6 +205,16 @@ def test_pairing_graph_isolated_nodes_and_feature_weight_validation() -> None:
     assert graph.number_of_nodes() == 3
     assert graph.degree["ISOLATED"] == 0
     assert abs(graph["A"]["B"]["weight"] - 0.6) < 1e-9
+    parameters = {"dimensions": 4, "walk_length": 6, "num_walks": 8, "window": 3, "seed": 42}
+    embeddings, metadata = generate_node2vec_embeddings(graph, parameters)
+    repeated_embeddings, repeated_metadata = generate_node2vec_embeddings(graph, parameters)
+    assert embeddings == repeated_embeddings
+    assert metadata == repeated_metadata
+    assert metadata["implementation"] == "portable_walk_ppmi_svd.v1"
+    assert metadata["walk_count"] == 16
+    assert embeddings["ISOLATED"] == [0.0] * 4
+    assert any(abs(value) > 0 for value in embeddings["A"])
+    assert all(len(vector) == 4 for vector in embeddings.values())
     assert validate_feature_weights({"tag": 0.4, "shift": 0.25, "pairing": 0.35})["pairing"] == 0.35
     try:
         validate_feature_weights({"tag": 0.5, "shift": 0.5, "pairing": 0.5})
@@ -180,15 +224,53 @@ def test_pairing_graph_isolated_nodes_and_feature_weight_validation() -> None:
         raise AssertionError("Invalid feature weights must be rejected.")
 
 
+def test_interrupted_behavioral_runs_are_failed_once_and_completed_runs_are_preserved() -> None:
+    Session = make_session()
+    with Session() as session:
+        seed_compatible_master(session, ["A"])
+        for index, status in enumerate(("PREPARING_DATA", "TRAINING", "CALCULATING_PROFILES")):
+            session.add(
+                MLTrainingRun(
+                    training_run_id=f"INTERRUPTED-{index}",
+                    depot_id="D1",
+                    training_start_date=date(2026, 1, 1),
+                    training_end_date=date(2026, 1, 2),
+                    status=status,
+                    dataset_payload={"records": [{"spbu_id": "A"}]},
+                )
+            )
+        session.add(
+            MLTrainingRun(
+                training_run_id="COMPLETED",
+                depot_id="D1",
+                training_start_date=date(2026, 1, 1),
+                training_end_date=date(2026, 1, 2),
+                status="COMPLETED",
+            )
+        )
+        session.commit()
+
+        assert recover_interrupted_behavioral_training_runs(session) == 3
+        for index in range(3):
+            run = session.get(MLTrainingRun, f"INTERRUPTED-{index}")
+            assert run.status == "FAILED"
+            assert "API process stopped" in run.error_message
+            assert run.completed_at is not None
+        assert session.get(MLTrainingRun, "COMPLETED").status == "COMPLETED"
+        assert recover_interrupted_behavioral_training_runs(session) == 0
+
+
 def test_engine_b_dataset_training_artifacts_versioning_activation_and_comparison(tmp_path) -> None:
     get_settings().ml_artifact_dir = tmp_path
     Session = make_session()
     spbu_ids = [f"A{index}" for index in range(4)] + [f"B{index}" for index in range(4)]
     with Session() as session:
         seed_compatible_master(session, spbu_ids, tags=True)
+        session.get(MasterSPBU, spbu_ids[-1]).latitude = None
+        session.get(MasterSPBU, spbu_ids[-1]).longitude = None
         for day in range(1, 13):
-            add_shipment(session, f"A-{day}", spbu_ids[:4], day, 2)
-            add_shipment(session, f"B-{day}", spbu_ids[4:], day, 14)
+            add_shipment(session, f"A-{day}", spbu_ids[:4], day, 2, with_loading_orders=True)
+            add_shipment(session, f"B-{day}", spbu_ids[4:], day, 14, with_loading_orders=True)
         session.commit()
         prepared = prepare_training_dataset(
             session,
@@ -201,6 +283,8 @@ def test_engine_b_dataset_training_artifacts_versioning_activation_and_compariso
         )
         assert prepared["status"] == "DATASET_READY"
         assert prepared["dataset_summary"]["sufficient_history_spbu_count"] == 8
+        assert prepared["dataset_summary"]["geocoded_training_spbu_count"] == 7
+        assert prepared["dataset_summary"]["missing_coordinate_training_spbu_count"] == 1
         assert len(prepared["shift_definition_snapshot"]) == 4
         training_run_id = prepared["training_run_id"]
         trained = train_behavioral_model(
@@ -215,11 +299,20 @@ def test_engine_b_dataset_training_artifacts_versioning_activation_and_compariso
             },
         )
         assert trained["status"] == "COMPLETED"
+        assert trained["algorithm_version"] == "phase5.behavioral.portable_n2v_umap_hdbscan.v2"
+        assert trained["library_versions"]["node2vec_implementation"] == "portable_walk_ppmi_svd.v1"
+        assert "gensim" not in trained["library_versions"]
         assert len(trained["result"]["assignments"]) == 8
+        assert all(row["vehicle_class"] == 1 for row in trained["result"]["assignments"])
+        assert sum(row["latitude"] is not None and row["longitude"] is not None for row in trained["result"]["assignments"]) == 7
+        assert sum(row["latitude"] is None or row["longitude"] is None for row in trained["result"]["assignments"]) == 1
         model_v1 = save_behavioral_model(session, training_run_id, model_name="Behavior 2026", description="v1", created_by="tester")
         assert model_v1["model_version"] == 1
         assert model_v1["artifacts"]
         assert model_v1["shift_definition_snapshot"] == prepared["shift_definition_snapshot"]
+        assert all(row["vehicle_class"] == 1 for row in model_v1["assignments"])
+        assert sum(row["latitude"] is not None and row["longitude"] is not None for row in model_v1["assignments"]) == 7
+        assert sum(row["latitude"] is None or row["longitude"] is None for row in model_v1["assignments"]) == 1
 
         first_run = session.get(MLTrainingRun, training_run_id)
         copied_run_id = uuid.uuid4().hex

@@ -83,6 +83,23 @@ export async function apiForm<T>(path: string, body: FormData): Promise<T> {
   return response.json();
 }
 
+export async function apiFile(path: string, method: "POST", body: unknown, fallbackFilename: string): Promise<File> {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    throw await responseError(response);
+  }
+  const blob = await response.blob();
+  const disposition = response.headers.get("content-disposition") ?? "";
+  const match = disposition.match(/filename="([^"]+)"/);
+  return new File([blob], match?.[1] ?? fallbackFilename, {
+    type: blob.type || "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  });
+}
+
 export async function downloadFormFromApi(path: string, body: FormData, fallbackFilename: string): Promise<void> {
   const response = await fetch(`${API_BASE_URL}${path}`, { method: "POST", body });
   if (!response.ok) {

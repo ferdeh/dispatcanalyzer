@@ -4,7 +4,7 @@ Dispatch Intelligence Platform adalah aplikasi analitik operasional distribusi B
 
 Master Data + Loading Order + GPS Operational Data + Historical Dispatch
 
-menjadi trusted operational intelligence yang nanti dapat menjadi input untuk optimasi rute berbasis Google OR-Tools. Optimasi rute belum menjadi scope Phase 0-6.
+menjadi trusted operational intelligence yang nanti dapat menjadi input untuk optimasi rute. Phase 6 memakai Google Maps Routes API hanya untuk estimasi waktu perjalanan/cycle time; optimasi rute fleet-wide tetap belum menjadi scope Phase 0-6.
 
 Prinsip utama: jangan lanjut ke phase berikutnya sebelum phase berjalan benar, diuji, tervalidasi visual, terdokumentasi, dan usable.
 
@@ -12,8 +12,11 @@ Prinsip utama: jangan lanjut ke phase berikutnya sebelum phase berjalan benar, d
 
 ```bash
 cp .env.example .env
+# set GOOGLE_ROUTES_ENCRYPTION_KEY to a deployment-specific secret (minimum 16 chars)
 docker compose up --build
 ```
+
+`GOOGLE_ROUTES_ENCRYPTION_KEY` melindungi Google Maps API key yang disimpan aplikasi. Jangan commit `.env` atau memakai nilai contoh yang sama pada production. Google API key sendiri dimasukkan setelah login ke UI **Settings - Google Maps**, bukan ke frontend environment.
 
 Services:
 
@@ -37,6 +40,7 @@ WEB_PORT=3001 docker compose up -d web
 - Phase 4 - SPBU–MT Historical Affinity & Stability Intelligence: `/affinity-intelligence`
 - Phase 5 - Machine Learning Intelligence: `/machine-learning-intelligence`
 - Phase 6 - Shipment & MT Assignment Prediction: `/prediction-assignment`
+- Settings - Google Maps Integration: `/settings/google-maps-integration`
 
 Tema UI saat ini diselaraskan dengan aplikasi `vrp_planner` dan palet Petrofin:
 
@@ -662,8 +666,10 @@ Tujuan Phase 5 adalah historical pattern discovery dan reusable behavioral clust
 Readiness gate:
 
 - scope selalu satu `depot_id`; data antardepot tidak pernah dicampur
-- seluruh active MT × active SPBU master assignment space pada depot dievaluasi oleh rule source yang sama dengan API compatibility, yaitu `app.compatibility.evaluate_compatibility_entities`
-- execution hanya diizinkan jika `master_compatibility_pass_percentage == 100.00` dan numerator benar-benar sama dengan denominator
+- readiness memakai observed Loading Order assignments pada latest available Phase 1 scope dan rule source `app.tag_consistency.evaluate_mt_spbu_tags`
+- execution hanya diizinkan jika setidaknya satu assignment dievaluasi dan seluruh assignment tersebut `MATCH`; mismatch maupun data issue akan memblokir execution
+- active MT × active SPBU matrix tetap dihitung saat Engine A memerlukan compatible-fleet opportunity, tetapi pasangan yang tidak eligible adalah expected exclusions dan tidak mengurangi readiness
+- Vehicle Class pada matrix Engine A mengikuti rule Phase 1 `MT capacity <= SPBU maximum`
 - gate tidak dapat dibypass melalui UI maupun API
 
 Engine A — Historical MT–SPBU Concentration Anomaly:
@@ -689,6 +695,7 @@ Engine B — SPBU Behavioral Clustering:
 - feature group Tag, Shift, Pairing distandardisasi sendiri-sendiri, dikalikan `sqrt(weight / group_dimension)`, lalu digabung agar group lebar tidak dominan hanya karena memiliki lebih banyak kolom
 - pipeline utama adalah **Node2Vec + UMAP + HDBSCAN**. HDBSCAN noise tetap noise dan ditampilkan sebagai `Noise / Unique Behavioral Pattern`
 - training result harus direview sebelum diberi nama dan disimpan; training tidak otomatis membuat registry model atau mengaktifkannya
+- saved model untuk depot aktif dapat dipilih dan dibuka langsung dari workspace Behavioral Clustering tanpa prepare dataset atau retraining; UMAP, Geographic Cluster Map, profiles, dan paginated membership memakai assignment model yang tersimpan
 - saved package berisi encoder/configuration, scaler metadata, Node2Vec embeddings, internal/visualization UMAP model, HDBSCAN model, vectors, assignments, profiles, dependency versions, manifest, dan checksum
 - binary package berada pada persistent `ML_ARTIFACT_DIR`; relational table hanya menyimpan artifact metadata/path/checksum
 
@@ -711,23 +718,26 @@ export PYTHONPATH="$PWD/apps/api"
 export ML_ARTIFACT_DIR="$PWD/ml_artifacts"
 ```
 
-Dependency penting dipin pada `apps/api/requirements.txt`: NumPy, SciPy, scikit-learn (termasuk maintained HDBSCAN implementation), umap-learn, NetworkX, node2vec, gensim, dan joblib. Docker Compose membuat named volume `ml_artifacts` sehingga package model tetap ada setelah API container direstart.
+Dependency penting dipin pada `apps/api/requirements.txt`: NumPy, SciPy, scikit-learn (termasuk HDBSCAN dan Truncated SVD), umap-learn, NetworkX, dan joblib. Engine B menjalankan Node2Vec biased walks sendiri lalu PPMI/SVD, sehingga tidak bergantung pada ekstensi native Gensim yang dapat memicu `Illegal instruction` pada ARM64. Image API juga memakai profil CPU generik Numba untuk jalur UMAP/PyNNDescent. Docker Compose membuat named volume `ml_artifacts` sehingga package model tetap ada setelah API container direstart.
 
 Detail teknis lengkap: `docs/PHASE_5_MACHINE_LEARNING_INTELLIGENCE.md`.
 
-### Phase 6 — Shipment & MT Assignment Prediction
+### Phase 6 — Time-Aware Multi-Trip Prediction & Assignment
 
 Status saat ini: `IMPLEMENTED`.
 
-Phase 6 adalah inference, bukan training dan bukan route optimization. Satu run menggabungkan saved Phase 5 model, Loading Order aktual, dan daftar MT available untuk menghasilkan struktur `Shift → Predicted Shipment → Loading Order/SPBU → Assigned MT` yang auditable dan dapat menjadi warm start Phase 7.
+Phase 6 adalah inference, assignment, dan estimasi availability—bukan training dan bukan fleet route optimization. Satu run menggabungkan saved Phase 5 model, Loading Order bertimestamp, initial MT availability, master compatibility, dan estimasi perjalanan untuk menghasilkan trip plan auditable yang dapat menjadi input Phase 7.
 
 Input workbook:
 
-- Loading Order: `loading_order_no`, `shift_gate_out`, `spbu_no`
-- MT Availability: `shift`, `vehicle_registration_no`
+- Loading Order: `loading_order_no`, `shipment_start_datetime`, `spbu_no`; `order_quantity_kl` bersifat opsional
+- MT Availability: `vehicle_registration_no`, `initial_available_datetime`
 - template dapat diunduh dari page atau API; `.xlsx` dibatasi 10 MB
-- shift divalidasi terhadap exact shift-definition snapshot model, bukan daftar Shift 1–4 yang di-hardcode
-- SPBU/MT harus ada di canonical master dan compatible dengan depot run
+- card **Loading Order Upload** menyediakan **Data Demo**: user memasukkan total order dalam KL, sistem membaginya menjadi LO 8 KL (LO terakhir menampung sisa), memilih SPBU aktif secara acak, dan membuat timestamp siap-kirim sesuai shift snapshot model
+- workbook demo langsung dipasang sebagai file upload aktif dan melewati validator yang sama dengan file manual; nama SPBU dan kuantitas KL ikut dipertahankan untuk audit
+- timestamp tanpa offset dibaca memakai timezone depot; normalized snapshot disimpan dalam UTC dan local time
+- shift bukan input utama: shift diturunkan dari `shipment_start_datetime` menggunakan exact full-day shift-definition snapshot model Phase 5/Phase 2
+- LO divalidasi terhadap planning horizon; MT harus unik, aktif, ada di master, dan berada pada depot run
 
 Prediction flow:
 
@@ -736,51 +746,100 @@ Phase 5 Saved Model
         +
 Loading Order
         +
-MT Availability
+Initial MT Availability
         ↓
-Shipment Prediction per Shift
+Time-Aware Shipment Pairing
         ↓
 Phase 4 MT Candidate Score
         ↓
 Phase 1 Master Compatibility Hard Filter
         ↓
-Global Maximum-Weight Assignment
+Rolling Chronological MT Assignment
         ↓
-Predicted Dispatch Structure
+Google Routes / Cache / Historical Estimate
         ↓
-Phase 7 Warm Start
+Return + Next Availability Update
+        ↺ MT may be reused for a later trip
+        ↓
+Final Dispatch Prediction
+        ↓
+Phase 7 Input
 ```
 
-Shipment inference memakai immutable Phase 5 artifact/normalized model registry: cluster membership probability, same-cluster evidence, model feature weights, dominant-shift match, dan saved historical pairing strength. Score adalah normalized combination dari metric yang benar-benar ada. Pairing di bawah configurable `minimum_prediction_confidence` tetap menjadi valid single-SPBU shipment; LOW confidence ditampilkan dan tidak otomatis dihapus kecuali optional blocking threshold disetel backend.
+Shipment inference memakai immutable Phase 5 artifact/normalized model registry: cluster membership probability, same-cluster evidence, model feature weights, derived-shift match, dan saved historical pairing strength. Pairing hanya dipertimbangkan dalam derived shift yang sama dan dalam `maximum_pairing_time_gap_minutes`; `planned_start_datetime` adalah timestamp LO paling akhir dalam shipment.
 
-MT ranking memakai Phase 4 historical `P(MT|SPBU)` dengan deterministic Laplace smoothing. Historical affinity hanya score/ranking; rule Phase 1 dari `app.compatibility.evaluate_compatibility_entities` tetap hard filter terpisah. Untuk multi-SPBU shipment, MT harus lulus rule untuk seluruh SPBU (intersection). Candidate yang gagal disimpan sebagai diagnostic `MASTER_COMPATIBILITY_FAIL` tetapi tidak masuk optimizer.
+MT ranking memakai Phase 4 historical `P(MT|SPBU)` dengan deterministic Laplace smoothing. Historical affinity hanya score/ranking; rule Phase 1 dari `app.compatibility.evaluate_compatibility_entities` tetap hard filter terpisah. Untuk multi-SPBU shipment, MT harus lulus rule untuk seluruh SPBU (intersection). Candidate yang gagal disimpan sebagai diagnostic `MASTER_COMPATIBILITY_FAIL`.
 
-Assignment memakai exact global maximum-weight bipartite matching per shift melalui NetworkX. Satu MT hanya dapat dipakai satu shipment dalam shift dan satu shipment maksimal mendapat satu MT. Run tidak memaksa assignment: `NO_AVAILABLE_MT`, `NO_COMPATIBLE_MT`, `ALL_COMPATIBLE_MT_ALLOCATED`, dan `LOW_CONFIDENCE` disimpan sebagai reason code.
+Assignment diproses ascending `planned_start_datetime`. State awal tiap MT adalah `initial_available_datetime`; setelah trip dipilih, sistem menghitung return dan `next_available_datetime`. MT yang sama dapat mendapat Trip 1, 2, 3, dan seterusnya selama `previous.next_available <= next.predicted_departure`. Mode:
+
+- `STRICT_START`: MT harus available pada planned start
+- `ALLOW_DELAY`: departure boleh bergeser sampai `maximum_allowed_delay_minutes`, dengan status `ASSIGNED_WITH_DELAY`
+
+Unassigned reason meliputi `NO_MT_AVAILABLE_AT_REQUIRED_TIME`, `NO_COMPATIBLE_MT`, `LOW_PREDICTION_CONFIDENCE`, `ROUTING_ESTIMATE_FAILED`, dan `TRUCK_ROUTING_REQUIRED_BUT_UNAVAILABLE`.
+
+#### Google Maps Routes Integration
+
+Semua request Google berlangsung server-side melalui Compute Routes atau Compute Route Matrix client. API key:
+
+- disimpan encrypted-at-rest memakai `GOOGLE_ROUTES_ENCRYPTION_KEY` dari environment
+- tidak pernah dikembalikan penuh, disimpan di localStorage, dicatat dalam log, snapshot run, atau export
+- dikelola melalui `/settings/google-maps-integration` dengan Save/Replace/Delete/Test Connection
+
+Mode routing adalah `AUTO`, `TRUCK`, atau `DRIVE`. TRUCK memakai profile MT spesifik (`vehicle_height_mm`, `vehicle_width_mm`, `vehicle_length_mm`, `vehicle_weight_kg`, `vehicle_axle_count`, dan supported `hazmat_category`) hanya bila capability tersedia dan profile complete. `ALLOW_DRIVE_FALLBACK` menghasilkan `routing_mode=DRIVE_FALLBACK`, warning terlihat, dan confidence lebih konservatif; `BLOCK_IF_TRUCK_UNAVAILABLE` memblokir trip yang membutuhkan truck route.
+
+Route cache memisahkan origin, destination, departure bucket, routing preference, routing mode, configuration version, dan vehicle-profile hash. Estimasi fallback tidak menjadikan Google single point of failure:
+
+```text
+valid route cache / Google Routes
+→ historical SPBU route
+→ cluster historical median
+→ configured default
+```
+
+Untuk shipment kecil, Phase 6 mengevaluasi small permutation atau nearest-neighbor hanya untuk `estimated_visit_sequence` dan cycle-time estimation. Ini preliminary estimate, bukan optimized route.
+
+Formula implementasi:
+
+```text
+total_cycle_duration
+= depot processing
++ total travel legs (depot → SPBU... → depot)
++ SPBU service per stop
++ return processing
+
+estimated_return = predicted_departure + total_cycle_duration
+next_available = estimated_return + turnaround buffer
+```
+
+Turnaround buffer disimpan terpisah dan tidak dihitung dua kali dalam `total_cycle_duration`.
 
 Dispatcher dapat:
 
-- mengganti MT hanya ke candidate yang available dan compatible
+- mengganti MT hanya ke candidate yang compatible; route memakai profile MT baru dan timeline downstream dihitung ulang
 - move LO/SPBU ke shipment same-shift, membuat shipment baru/single, atau combine same-shift shipment
-- memicu ulang candidate scoring, compatibility filter, dan global assignment untuk shift terkait tanpa training ulang
-- membandingkan immutable model prediction dengan final dispatch plan melalui original snapshot dan `model_predicted_shipment_id`
+- memicu ulang candidate scoring, compatibility filter, rolling state, route duration, return, dan affected future availability tanpa training ulang
+- membandingkan immutable `original_model_prediction` dengan `final_dispatch_prediction`
 
-Persistence migration `0010_phase6_prediction` menambah `prediction_run`, `prediction_shipment`, `prediction_shipment_line`, `prediction_mt_candidate`, dan `prediction_assignment`. Run menyimpan normalized input, validation, model/configuration/algorithm snapshots, duration metrics, original model result, user, timestamps, candidates, exclusions, optimizer result, dan override audit.
+Persistence migration `0010_phase6_prediction` menambah prediction core; `0011_phase6_demo_lo` menambah audit quantity KL; `0012_phase6_multitrip` menambah timestamp planning, `prediction_trip`, encrypted Google configuration, route cache, profile large-vehicle MT, routing metrics, serta original/final snapshots. Prediction run snapshot menyimpan model/config version, traffic/fallback/cycle parameters, tetapi tidak menyimpan raw API key.
 
-History menyediakan View, Download, dan Duplicate/Re-run. Export `.xlsx` berisi sheets Summary, Shipment Result, MT Assignment, MT Candidates, dan Validation. UI juga menyediakan shipment network (bukan route map), MT assignment matrix, alternative candidate ranking, excluded diagnostics, structured explanation, dynamic shift tabs, dan per-shift KPI.
+History menyediakan View, Download, dan Duplicate/Re-run. Export `.xlsx` berisi Summary, Shipment Result, Trip Timeline, MT Assignment, MT Candidates, dan Validation. UI main table menampilkan trip, MT, shipment/SPBU, planned/departure/return/next-available, confidence, status; expandable detail menampilkan LO, preliminary sequence, mode, distance, travel/service/cycle, fallback, dan missing vehicle-profile fields. MT Multi-Trip Timeline menampilkan period kendaraan sampai turnaround selesai.
 
-Authorization mengikuti seam existing melalui `X-User` dan `X-Permissions`: `phase6:view`, `phase6:run`, `phase6:export`, `phase6:override`. Local requests tetap permissive sampai identity provider production menggantikan dependency ini.
+Authorization mengikuti seam existing melalui `X-User` dan `X-Permissions`: `phase6:view`, `phase6:run`, `phase6:export`, `phase6:override`, `google_routes:view`, dan `google_routes:manage`. Local requests tetap permissive sampai identity provider production menggantikan dependency ini.
 
-Phase 6 secara eksplisit tidak menghitung route sequence, distance, travel time, VRP, cost, driver hours, congestion, atau multi-trip feasibility. Semua tanggung jawab tersebut tetap Phase 7.
+#### Batas Phase 6 dan Phase 7
+
+Phase 6 boleh menghitung travel estimate, cycle time, preliminary visit sequence dalam satu shipment, dan rolling multi-trip availability. Phase 6 tidak memanggil Google Route Optimization API/GMPRO `optimizeTours`, tidak menyelesaikan full fleet VRP, tidak mengoptimalkan urutan semua shipment/MT secara global, dan tidak menghasilkan final optimized route.
+
+Phase 7 tetap bertanggung jawab atas final route optimization, fleet-wide constraints, global visit sequencing, driver hours, cost objective, dan Google Route Optimization API/GMPRO bila dipilih.
 
 Verification terakhir:
 
-- migration PostgreSQL berhasil sampai revision `0010_phase6_prediction`
-- seluruh **44 backend tests** lulus pada deployment image
-- **6 focused Phase 6 tests** lulus pada local test runtime
+- migration PostgreSQL memiliki single head revision `0012_phase6_multitrip`
+- seluruh **54 backend tests** lulus pada deployment image
+- **13 focused Phase 6 tests** lulus pada deployment image
 - TypeScript type checking dan Vite production build lulus
-- API health, 12 Phase 6 route contracts, template `.xlsx`, dan lima tabel persistence telah di-smoke-test
-- page `/prediction-assignment` telah diverifikasi melalui browser tanpa console error atau warning
-- Vite masih memberi non-blocking warning untuk application chunk sekitar 1.52 MB; code splitting ECharts/page modules menjadi technical debt performance
+- API health, timestamp template/demo, rolling assignment, route cache/profile isolation, fallback, encrypted settings, exports, dan persistence telah diuji
+- Vite memberi non-blocking warning untuk application chunk sekitar 1.71 MB; code splitting ECharts/page modules menjadi technical debt performance
 - host Python tanpa dependency ML lengkap tidak dapat menjalankan dua training tests Phase 5; deployment image adalah verification environment canonical dan membutuhkan `NUMBA_CPU_NAME=generic` serta `NUMBA_DISABLE_JIT=1` pada ARM untuk menghindari illegal-instruction dari Numba/UMAP
 
 ## Phase Quality Gate
@@ -839,6 +898,8 @@ Setiap phase harus melewati gate berikut sebelum phase berikutnya dimulai:
 - `GET /api/v1/phase6/models?depot_id=...`
 - `GET /api/v1/phase6/templates/loading-order`
 - `GET /api/v1/phase6/templates/mt-availability`
+- `GET /api/v1/phase6/templates/mt-initial-availability`
+- `POST /api/v1/phase6/demo/loading-order`
 - `POST /api/v1/phase6/validate/loading-order`
 - `POST /api/v1/phase6/validate/mt-availability`
 - `POST /api/v1/phase6/predictions`
@@ -847,7 +908,12 @@ Setiap phase harus melewati gate berikut sebelum phase berikutnya dimulai:
 - `POST /api/v1/phase6/predictions/{run_id}/recalculate`
 - `PATCH /api/v1/phase6/predictions/{run_id}/shipments/{shipment_id}`
 - `PATCH /api/v1/phase6/predictions/{run_id}/assignments/{assignment_id}`
+- `PATCH /api/v1/phase6/predictions/{run_id}/trips/{trip_id}`
 - `GET /api/v1/phase6/predictions/{run_id}/export`
+- `GET /api/v1/settings/google-routes`
+- `PUT /api/v1/settings/google-routes`
+- `DELETE /api/v1/settings/google-routes/api-key`
+- `POST /api/v1/settings/google-routes/test`
 
 Route optimization / VRP endpoints belum diimplementasikan dan tetap menjadi scope Phase 7.
 

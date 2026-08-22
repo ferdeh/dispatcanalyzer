@@ -55,9 +55,12 @@ from .phase5_readiness import require_phase5_readiness
 
 logger = logging.getLogger(__name__)
 
+NODE2VEC_IMPLEMENTATION_VERSION = "portable_walk_ppmi_svd.v1"
+INTERRUPTED_TRAINING_STATUSES = ("PREPARING_DATA", "TRAINING", "CALCULATING_PROFILES")
+
 
 def library_versions() -> dict[str, str]:
-    packages = ["numpy", "scikit-learn", "umap-learn", "networkx", "node2vec", "gensim", "joblib"]
+    packages = ["numpy", "scikit-learn", "umap-learn", "networkx", "joblib"]
     versions = {}
     for package in packages:
         try:
@@ -65,7 +68,26 @@ def library_versions() -> dict[str, str]:
         except importlib.metadata.PackageNotFoundError:
             versions[package] = "NOT_INSTALLED"
     versions["hdbscan_implementation"] = "sklearn.cluster.HDBSCAN"
+    versions["node2vec_implementation"] = NODE2VEC_IMPLEMENTATION_VERSION
     return versions
+
+
+def recover_interrupted_behavioral_training_runs(db: Session) -> int:
+    """Close transient runs left behind when the synchronous API process stopped."""
+    runs = db.scalars(select(MLTrainingRun).where(MLTrainingRun.status.in_(INTERRUPTED_TRAINING_STATUSES))).all()
+    if not runs:
+        return 0
+    completed_at = datetime.now(timezone.utc)
+    for run in runs:
+        interrupted_status = run.status
+        run.status = "FAILED"
+        run.error_message = (
+            f"Training was interrupted while status was {interrupted_status} because the API process stopped. "
+            "The retained dataset can be retried when it is complete."
+        )
+        run.completed_at = completed_at
+    db.commit()
+    return len(runs)
 
 
 def validate_feature_weights(weights: dict[str, Any] | None) -> dict[str, float]:
@@ -152,47 +174,150 @@ def create_pairing_graph(spbu_ids: list[str], pair_rows: list[dict]) -> nx.Graph
     return graph
 
 
+def _weighted_choice(rng: np.random.Generator, candidates: list[str], weights: list[float]) -> str:
+    probabilities = np.asarray(weights, dtype=float)
+    total = float(probabilities.sum())
+    if not math.isfinite(total) or total <= 0:
+        return candidates[int(rng.integers(0, len(candidates)))]
+    probabilities /= total
+    return candidates[int(rng.choice(len(candidates), p=probabilities))]
+
+
+def _node2vec_walk(
+    graph: nx.Graph,
+    start: str,
+    walk_length: int,
+    p: float,
+    q: float,
+    rng: np.random.Generator,
+) -> list[str]:
+    walk = [start]
+    while len(walk) < walk_length:
+        current = walk[-1]
+        neighbors = sorted(str(node) for node in graph.neighbors(current))
+        if not neighbors:
+            break
+        weights = []
+        previous = walk[-2] if len(walk) > 1 else None
+        for candidate in neighbors:
+            edge_weight = max(1e-12, float(graph[current][candidate].get("weight", 1.0)))
+            if previous is None:
+                bias = 1.0
+            elif candidate == previous:
+                bias = 1.0 / p
+            elif graph.has_edge(previous, candidate):
+                bias = 1.0
+            else:
+                bias = 1.0 / q
+            weights.append(edge_weight * bias)
+        walk.append(_weighted_choice(rng, neighbors, weights))
+    return walk
+
+
 def generate_node2vec_embeddings(graph: nx.Graph, parameters: dict[str, Any]) -> tuple[dict[str, list[float]], dict]:
     dimensions = max(2, min(128, int(parameters.get("dimensions", 16))))
     nodes = sorted(str(node) for node in graph.nodes)
+    isolated = sorted(str(node) for node, degree in graph.degree if degree == 0)
+    metadata = {
+        "implementation": NODE2VEC_IMPLEMENTATION_VERSION,
+        "dimensions": dimensions,
+        "isolated_nodes": isolated,
+        "fallback": "isolated nodes receive a zero pairing vector",
+    }
     if graph.number_of_edges() == 0:
-        return ({node: [0.0] * dimensions for node in nodes}, {"isolated_nodes": nodes, "fallback": "zero vector because the training pairing graph has no edges"})
+        metadata["fallback"] = "zero vector because the training pairing graph has no edges"
+        metadata["effective_dimensions"] = 0
+        return ({node: [0.0] * dimensions for node in nodes}, metadata)
+
     try:
-        from node2vec import Node2Vec
+        from sklearn.decomposition import TruncatedSVD
     except ImportError as exc:  # pragma: no cover
-        raise HTTPException(status_code=503, detail="Node2Vec dependencies are not installed. Install apps/api/requirements.txt.") from exc
+        raise HTTPException(status_code=503, detail="scikit-learn is required for the portable Node2Vec embedding.") from exc
+
     seed = int(parameters.get("seed", 42))
-    try:
-        model_builder = Node2Vec(
-            graph,
-            dimensions=dimensions,
-            walk_length=max(2, min(200, int(parameters.get("walk_length", 20)))),
-            num_walks=max(1, min(500, int(parameters.get("num_walks", 40)))),
-            p=max(0.01, float(parameters.get("p", 1.0))),
-            q=max(0.01, float(parameters.get("q", 1.0))),
-            weight_key="weight",
-            workers=1,
-            quiet=True,
-            seed=seed,
-        )
-        word2vec = model_builder.fit(
-            window=max(2, min(50, int(parameters.get("window", 8)))),
-            min_count=1,
-            batch_words=32,
-            workers=1,
-            seed=seed,
-        )
-    except Exception as exc:
-        logger.exception("Node2Vec training failed")
-        raise HTTPException(status_code=500, detail="Node2Vec pairing embedding failed. The training run has been retained for troubleshooting.") from exc
-    isolated = [str(node) for node, degree in graph.degree if degree == 0]
-    embeddings = {}
-    for node in nodes:
-        if node in isolated or node not in word2vec.wv:
-            embeddings[node] = [0.0] * dimensions
-        else:
-            embeddings[node] = [float(value) for value in word2vec.wv[node]]
-    return embeddings, {"isolated_nodes": isolated, "fallback": "isolated nodes receive a zero pairing vector"}
+    walk_length = max(2, min(200, int(parameters.get("walk_length", 20))))
+    num_walks = max(1, min(500, int(parameters.get("num_walks", 40))))
+    window = max(2, min(50, int(parameters.get("window", 8))))
+    p = max(0.01, float(parameters.get("p", 1.0)))
+    q = max(0.01, float(parameters.get("q", 1.0)))
+    isolated_set = set(isolated)
+    active_nodes = [node for node in nodes if node not in isolated_set]
+    node_index = {node: index for index, node in enumerate(active_nodes)}
+    rng = np.random.default_rng(seed)
+    cooccurrence = np.zeros((len(active_nodes), len(active_nodes)), dtype=float)
+    walk_count = 0
+
+    # Keep Node2Vec's second-order transition rule, but replace the native
+    # Gensim Word2Vec extension with deterministic PPMI matrix factorization.
+    # This avoids platform-specific SIGILL crashes observed on ARM64 containers.
+    for _ in range(num_walks):
+        for start_index in rng.permutation(len(active_nodes)):
+            walk = _node2vec_walk(graph, active_nodes[int(start_index)], walk_length, p, q, rng)
+            walk_count += 1
+            for center_position, center in enumerate(walk):
+                left = max(0, center_position - window)
+                right = min(len(walk), center_position + window + 1)
+                for context_position in range(left, right):
+                    if context_position == center_position:
+                        continue
+                    context = walk[context_position]
+                    distance = abs(context_position - center_position)
+                    cooccurrence[node_index[center], node_index[context]] += 1.0 / distance
+
+    total = float(cooccurrence.sum())
+    row_totals = cooccurrence.sum(axis=1)
+    column_totals = cooccurrence.sum(axis=0)
+    expected = np.outer(row_totals, column_totals)
+    ppmi = np.zeros_like(cooccurrence)
+    valid = (cooccurrence > 0) & (expected > 0)
+    ppmi[valid] = np.maximum(np.log((cooccurrence[valid] * total) / expected[valid]), 0.0)
+
+    matrix = ppmi
+    matrix_kind = "positive_pointwise_mutual_information"
+    if not np.any(matrix):
+        # Tiny/highly regular graphs can have no positive PMI; weighted
+        # adjacency remains a deterministic structural signal in that case.
+        matrix = nx.to_numpy_array(graph, nodelist=active_nodes, weight="weight", dtype=float)
+        matrix_kind = "weighted_adjacency_fallback"
+
+    effective_dimensions = min(dimensions, len(active_nodes), matrix.shape[1])
+    reduced = TruncatedSVD(
+        n_components=effective_dimensions,
+        algorithm="randomized",
+        n_iter=7,
+        random_state=seed,
+    ).fit_transform(matrix)
+    # SVD component signs are mathematically arbitrary. Canonicalizing them
+    # keeps persisted vectors stable across repeat runs on the same platform.
+    for column in range(reduced.shape[1]):
+        pivot = int(np.argmax(np.abs(reduced[:, column])))
+        if reduced[pivot, column] < 0:
+            reduced[:, column] *= -1
+    norms = np.linalg.norm(reduced, axis=1, keepdims=True)
+    reduced = np.divide(reduced, norms, out=np.zeros_like(reduced), where=norms > 0)
+
+    embeddings = {node: [0.0] * dimensions for node in nodes}
+    for node, vector in zip(active_nodes, reduced, strict=True):
+        padded = np.zeros(dimensions, dtype=float)
+        padded[:effective_dimensions] = vector
+        embeddings[node] = padded.tolist()
+
+    metadata.update(
+        {
+            "walk_length": walk_length,
+            "num_walks": num_walks,
+            "walk_count": walk_count,
+            "p": p,
+            "q": q,
+            "window": window,
+            "seed": seed,
+            "context_weighting": "inverse_distance",
+            "factorization_matrix": matrix_kind,
+            "reducer": "sklearn.decomposition.TruncatedSVD",
+            "effective_dimensions": effective_dimensions,
+        }
+    )
+    return embeddings, metadata
 
 
 def _feature_fusion(
@@ -301,6 +426,8 @@ def prepare_training_dataset(
                     "spbu_id": spbu.spbu_id,
                     "spbu_code": spbu.spbu_code,
                     "spbu_name": spbu.spbu_name,
+                    "latitude": float(spbu.latitude) if spbu.latitude is not None else None,
+                    "longitude": float(spbu.longitude) if spbu.longitude is not None else None,
                     "shipment_observation_count": observation_counts[spbu.spbu_id],
                     "vehicle_class": spbu.vehicle_type_tag,
                     "tag_vector": tag_vectors[spbu.spbu_id],
@@ -327,6 +454,8 @@ def prepare_training_dataset(
             "master_compatibility_pass_percentage": readiness["master_compatibility_pass_percentage"],
             "sufficient_history_spbu_count": len(records),
             "excluded_insufficient_data_spbu_count": len(excluded_ids),
+            "geocoded_training_spbu_count": sum(record["latitude"] is not None and record["longitude"] is not None for record in records),
+            "missing_coordinate_training_spbu_count": sum(record["latitude"] is None or record["longitude"] is None for record in records),
             "pairing_edge_count": len(pair_rows),
             "isolated_spbu_count": len(set(eligible_ids) - {row[side] for row in pair_rows for side in ("spbu_a_id", "spbu_b_id")}),
             "data_quality": data_quality,
@@ -345,6 +474,7 @@ def prepare_training_dataset(
                 "departure_algorithm_version": DEPARTURE_ALGORITHM_VERSION,
                 "shift_assignment_algorithm_version": SHIFT_ASSIGNMENT_ALGORITHM_VERSION,
                 "pairing_algorithm_version": PAIRING_ALGORITHM_VERSION,
+                "geographic_coordinate_source": "MasterSPBU latitude/longitude snapshot; visualization only and excluded from model features",
                 "source_observation_key": ["shipment_id", "spbu_id"],
             },
         }
@@ -456,7 +586,8 @@ def train_behavioral_model(db: Session, training_run_id: str, configuration: dic
     run = db.get(MLTrainingRun, training_run_id)
     if not run:
         raise HTTPException(status_code=404, detail="Training run not found.")
-    if run.status not in {"DATASET_READY", "COMPLETED"}:
+    retrying_failed_dataset = run.status == "FAILED" and bool((run.dataset_payload or {}).get("records"))
+    if run.status not in {"DATASET_READY", "COMPLETED"} and not retrying_failed_dataset:
         raise HTTPException(status_code=409, detail="Prepare and validate the dataset before training.")
     require_phase5_readiness(db, run.depot_id)
     config = _validated_training_configuration(configuration)
@@ -466,7 +597,10 @@ def train_behavioral_model(db: Session, training_run_id: str, configuration: dic
         raise HTTPException(status_code=422, detail=f"Too few SPBUs for clustering. Need at least {max(3, minimum_cluster_size)} sufficient-history SPBUs.")
     run.status = "TRAINING"
     run.training_configuration = config
+    run.algorithm_version = BEHAVIORAL_ALGORITHM_VERSION
+    run.library_versions = library_versions()
     run.error_message = None
+    run.completed_at = None
     db.commit()
     try:
         pair_rows = run.dataset_payload.get("pair_rows", [])
@@ -521,12 +655,15 @@ def train_behavioral_model(db: Session, training_run_id: str, configuration: dic
                     "spbu_id": record["spbu_id"],
                     "spbu_code": record["spbu_code"],
                     "spbu_name": record["spbu_name"],
+                    "latitude": record.get("latitude"),
+                    "longitude": record.get("longitude"),
                     "shipment_observation_count": record["shipment_observation_count"],
                     "cluster_id": None if is_noise else label,
                     "cluster_label": "Noise / Unique Behavioral Pattern" if is_noise else f"Cluster {label + 1}",
                     "membership_probability": round(float(probabilities[index]), 6),
                     "is_noise": is_noise,
                     "dominant_shift": record["dominant_shift"],
+                    "vehicle_class": record.get("vehicle_class"),
                     "key_tags": record["key_tags"],
                     "visualization_x": round(float(visualization[index, 0]), 6),
                     "visualization_y": round(float(visualization[index, 1]), 6),
@@ -633,6 +770,8 @@ def get_training_run(db: Session, training_run_id: str) -> dict:
                     "spbu_id",
                     "spbu_code",
                     "spbu_name",
+                    "latitude",
+                    "longitude",
                     "shipment_observation_count",
                     "dominant_shift",
                     "key_tags",

@@ -1,0 +1,515 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import logging
+import time
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+from typing import Any
+
+import httpx
+from cryptography.fernet import Fernet, InvalidToken
+from fastapi import HTTPException
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from .config import get_settings
+from .models import GoogleRoutesConfiguration, MasterMT
+
+
+logger = logging.getLogger(__name__)
+CONFIGURATION_ID = "default"
+ROUTES_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
+MATRIX_URL = "https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix"
+SUPPORTED_ROUTING_MODES = {"AUTO", "TRUCK", "DRIVE"}
+SUPPORTED_ROUTING_PREFERENCES = {"TRAFFIC_UNAWARE", "TRAFFIC_AWARE", "TRAFFIC_AWARE_OPTIMAL"}
+SUPPORTED_FALLBACK_POLICIES = {"ALLOW_DRIVE_FALLBACK", "BLOCK_IF_TRUCK_UNAVAILABLE"}
+SUPPORTED_HAZARDOUS_GOODS = {
+    "EXPLOSIVES",
+    "GASES",
+    "FLAMMABLE",
+    "COMBUSTIBLE",
+    "ORGANIC",
+    "POISON",
+    "CORROSIVE",
+    "ASPIRATION_HAZARD",
+    "ENVIRONMENTAL_HAZARD",
+    "OTHER",
+}
+
+
+class GoogleRoutesError(RuntimeError):
+    def __init__(self, code: str, message: str, *, status_code: int = 502):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.status_code = status_code
+
+
+def _fernet() -> Fernet:
+    encryption_key = (get_settings().google_routes_encryption_key or "").strip()
+    if len(encryption_key) < 16:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "SECRET_ENCRYPTION_NOT_CONFIGURED",
+                "message": "GOOGLE_ROUTES_ENCRYPTION_KEY must be configured before an API key can be stored.",
+            },
+        )
+    derived = base64.urlsafe_b64encode(hashlib.sha256(encryption_key.encode("utf-8")).digest())
+    return Fernet(derived)
+
+
+def encrypt_api_key(api_key: str) -> str:
+    return _fernet().encrypt(api_key.encode("utf-8")).decode("ascii")
+
+
+def decrypt_api_key(encrypted_api_key: str) -> str:
+    try:
+        return _fernet().decrypt(encrypted_api_key.encode("ascii")).decode("utf-8")
+    except InvalidToken as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "SECRET_DECRYPTION_FAILED", "message": "Stored Google Routes API key could not be decrypted."},
+        ) from exc
+
+
+def mask_api_key(api_key: str) -> str:
+    return f"••••••••••••{api_key[-4:]}"
+
+
+def get_google_routes_configuration(db: Session, *, create: bool = True) -> GoogleRoutesConfiguration | None:
+    configuration = db.get(GoogleRoutesConfiguration, CONFIGURATION_ID)
+    if configuration or not create:
+        return configuration
+    configuration = GoogleRoutesConfiguration(configuration_id=CONFIGURATION_ID)
+    db.add(configuration)
+    db.flush()
+    return configuration
+
+
+def parse_hazardous_goods(value: str | None) -> tuple[list[str], list[str]]:
+    raw_values = [item.strip().upper() for item in (value or "").replace(";", ",").split(",") if item.strip()]
+    supported = sorted({item for item in raw_values if item in SUPPORTED_HAZARDOUS_GOODS})
+    unsupported = sorted({item for item in raw_values if item not in SUPPORTED_HAZARDOUS_GOODS})
+    return supported, unsupported
+
+
+def large_vehicle_profile(mt: MasterMT, *, required: bool = True) -> dict:
+    fields = {
+        "vehicle_height_mm": mt.vehicle_height_mm,
+        "vehicle_width_mm": mt.vehicle_width_mm,
+        "vehicle_length_mm": mt.vehicle_length_mm,
+        "vehicle_weight_kg": mt.vehicle_weight_kg,
+        "vehicle_axle_count": mt.vehicle_axle_count,
+    }
+    missing = [key for key, value in fields.items() if value is None or int(value) <= 0]
+    hazardous_goods, unsupported_hazmat = parse_hazardous_goods(mt.hazmat_category)
+    status = "NOT_REQUIRED" if not required else "COMPLETE" if not missing and not unsupported_hazmat else "INCOMPLETE"
+    google_vehicle_info: dict[str, Any] = {}
+    if status == "COMPLETE":
+        google_vehicle_info = {
+            "totalHeightMm": int(mt.vehicle_height_mm),
+            "totalWidthMm": int(mt.vehicle_width_mm),
+            "totalLengthMm": int(mt.vehicle_length_mm),
+            "totalWeightKg": int(mt.vehicle_weight_kg),
+            "totalAxleCount": int(mt.vehicle_axle_count),
+        }
+        if hazardous_goods:
+            google_vehicle_info["hazardousGoodsTypes"] = hazardous_goods
+    fingerprint_payload = {
+        **fields,
+        "hazardous_goods_types": hazardous_goods,
+        "unsupported_hazmat": unsupported_hazmat,
+    }
+    return {
+        "status": status,
+        "missing_fields": missing,
+        "unsupported_hazmat_categories": unsupported_hazmat,
+        "google_vehicle_info": google_vehicle_info,
+        "profile_hash": hashlib.sha256(json.dumps(fingerprint_payload, sort_keys=True).encode("utf-8")).hexdigest(),
+    }
+
+
+def refresh_large_vehicle_profile_status(mt: MasterMT, *, required: bool = True) -> dict:
+    profile = large_vehicle_profile(mt, required=required)
+    mt.large_vehicle_profile_status = profile["status"]
+    return profile
+
+
+def configuration_snapshot(configuration: GoogleRoutesConfiguration | None) -> dict:
+    if not configuration:
+        return {
+            "configuration_id": None,
+            "configuration_version": None,
+            "api_key_configured": False,
+            "routing_mode": "AUTO",
+            "routing_preference": "TRAFFIC_AWARE",
+            "fallback_policy": "ALLOW_DRIVE_FALLBACK",
+            "cache_ttl_minutes": 60,
+            "departure_time_bucket_minutes": 15,
+            "default_depot_processing_minutes": 30,
+            "default_spbu_service_minutes": 45,
+            "default_return_processing_minutes": 15,
+            "default_turnaround_buffer_minutes": 30,
+            "default_route_duration_minutes": 120,
+            "connection_status": "NOT_CONFIGURED",
+            "truck_routing_status": "UNKNOWN",
+        }
+    return {
+        "configuration_id": configuration.configuration_id,
+        "configuration_version": configuration.configuration_version,
+        "api_key_configured": bool(configuration.encrypted_api_key),
+        "routing_mode": configuration.routing_mode,
+        "routing_preference": configuration.routing_preference,
+        "fallback_policy": configuration.fallback_policy,
+        "cache_ttl_minutes": configuration.cache_ttl_minutes,
+        "departure_time_bucket_minutes": configuration.departure_time_bucket_minutes,
+        "default_depot_processing_minutes": configuration.default_depot_processing_minutes,
+        "default_spbu_service_minutes": configuration.default_spbu_service_minutes,
+        "default_return_processing_minutes": configuration.default_return_processing_minutes,
+        "default_turnaround_buffer_minutes": configuration.default_turnaround_buffer_minutes,
+        "default_route_duration_minutes": configuration.default_route_duration_minutes,
+        "connection_status": configuration.connection_status,
+        "truck_routing_status": configuration.truck_routing_status,
+    }
+
+
+def public_google_routes_configuration(db: Session, *, depot_id: str | None = None) -> dict:
+    configuration = get_google_routes_configuration(db)
+    assert configuration is not None
+    statement = select(MasterMT).where(MasterMT.active_status == "ACTIVE")
+    if depot_id:
+        statement = statement.where(MasterMT.depot_id == depot_id)
+    vehicles = db.scalars(statement.order_by(MasterMT.vehicle_registration)).all()
+    profiles = []
+    counts: Counter[str] = Counter()
+    for mt in vehicles:
+        profile = refresh_large_vehicle_profile_status(mt, required=configuration.routing_mode != "DRIVE")
+        counts[profile["status"]] += 1
+        profiles.append(
+            {
+                "vehicle_id": mt.mt_id,
+                "vehicle_registration_no": mt.vehicle_registration or mt.mt_id,
+                "profile_status": profile["status"],
+                "missing_fields": profile["missing_fields"],
+                "unsupported_hazmat_categories": profile["unsupported_hazmat_categories"],
+            }
+        )
+    db.flush()
+    return {
+        **configuration_snapshot(configuration),
+        "masked_api_key": configuration.masked_api_key,
+        "last_test_result": configuration.last_test_result or {},
+        "encryption_ready": len((get_settings().google_routes_encryption_key or "").strip()) >= 16,
+        "vehicle_profile_readiness": {
+            "total_active_mt": len(vehicles),
+            "complete": counts["COMPLETE"],
+            "incomplete": counts["INCOMPLETE"],
+            "profiles": profiles[:100],
+        },
+        "updated_by": configuration.updated_by,
+        "updated_at": configuration.updated_at.isoformat() if configuration.updated_at else None,
+    }
+
+
+def save_google_routes_configuration(db: Session, payload: dict, *, updated_by: str) -> dict:
+    configuration = get_google_routes_configuration(db)
+    assert configuration is not None
+    routing_mode = str(payload.get("routing_mode", configuration.routing_mode)).upper()
+    routing_preference = str(payload.get("routing_preference", configuration.routing_preference)).upper()
+    fallback_policy = str(payload.get("fallback_policy", configuration.fallback_policy)).upper()
+    if routing_mode not in SUPPORTED_ROUTING_MODES:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_ROUTING_MODE", "message": "routing_mode must be AUTO, TRUCK, or DRIVE."})
+    if routing_preference not in SUPPORTED_ROUTING_PREFERENCES:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_ROUTING_PREFERENCE", "message": "Unsupported Google routing preference."})
+    if fallback_policy not in SUPPORTED_FALLBACK_POLICIES:
+        raise HTTPException(status_code=400, detail={"code": "INVALID_FALLBACK_POLICY", "message": "Unsupported large-vehicle fallback policy."})
+    numeric_bounds = {
+        "cache_ttl_minutes": (1, 10080),
+        "departure_time_bucket_minutes": (1, 1440),
+        "default_depot_processing_minutes": (0, 1440),
+        "default_spbu_service_minutes": (0, 1440),
+        "default_return_processing_minutes": (0, 1440),
+        "default_turnaround_buffer_minutes": (0, 1440),
+        "default_route_duration_minutes": (1, 10080),
+    }
+    for field, (minimum, maximum) in numeric_bounds.items():
+        if field not in payload:
+            continue
+        try:
+            value = int(payload[field])
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail={"code": "INVALID_ROUTE_CONFIGURATION", "message": f"{field} must be an integer."}) from exc
+        if value < minimum or value > maximum:
+            raise HTTPException(status_code=400, detail={"code": "INVALID_ROUTE_CONFIGURATION", "message": f"{field} must be between {minimum} and {maximum}."})
+        setattr(configuration, field, value)
+    api_key = str(payload.get("api_key") or "").strip()
+    if api_key:
+        if len(api_key) < 20:
+            raise HTTPException(status_code=400, detail={"code": "INVALID_API_KEY_FORMAT", "message": "Google Maps API key is too short."})
+        configuration.encrypted_api_key = encrypt_api_key(api_key)
+        configuration.key_fingerprint = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+        configuration.masked_api_key = mask_api_key(api_key)
+        configuration.connection_status = "NOT_TESTED"
+        configuration.truck_routing_status = "UNKNOWN"
+        configuration.last_test_result = {}
+    configuration.routing_mode = routing_mode
+    configuration.routing_preference = routing_preference
+    configuration.fallback_policy = fallback_policy
+    configuration.configuration_version = int(configuration.configuration_version or 0) + 1
+    configuration.updated_by = updated_by
+    db.commit()
+    return public_google_routes_configuration(db)
+
+
+def delete_google_routes_api_key(db: Session, *, updated_by: str) -> dict:
+    configuration = get_google_routes_configuration(db)
+    assert configuration is not None
+    configuration.encrypted_api_key = None
+    configuration.key_fingerprint = None
+    configuration.masked_api_key = None
+    configuration.connection_status = "NOT_CONFIGURED"
+    configuration.truck_routing_status = "UNKNOWN"
+    configuration.last_test_result = {}
+    configuration.configuration_version = int(configuration.configuration_version or 0) + 1
+    configuration.updated_by = updated_by
+    db.commit()
+    return public_google_routes_configuration(db)
+
+
+def _parse_duration(value: str | None) -> int:
+    if not value or not value.endswith("s"):
+        return 0
+    return round(float(value[:-1]))
+
+
+class GoogleRoutesClient:
+    """Server-side Routes API client used only for per-trip travel estimation.
+
+    This client intentionally has no Route Optimization / optimizeTours endpoint.
+    Phase 6 estimates one route leg or route matrix; fleet-wide VRP belongs to Phase 7.
+    """
+
+    def __init__(self, api_key: str, *, transport: httpx.BaseTransport | None = None):
+        self._api_key = api_key
+        settings = get_settings()
+        self._timeout = settings.google_routes_request_timeout_seconds
+        self._max_retries = settings.google_routes_max_retries
+        self._transport = transport
+
+    def _post(self, url: str, payload: dict, field_mask: str, *, truck_request: bool = False) -> Any:
+        headers = {
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": self._api_key,
+            "X-Goog-FieldMask": field_mask,
+        }
+        for attempt in range(self._max_retries + 1):
+            try:
+                with httpx.Client(timeout=self._timeout, transport=self._transport) as client:
+                    response = client.post(url, headers=headers, json=payload)
+            except httpx.TimeoutException as exc:
+                if attempt < self._max_retries:
+                    time.sleep(0.1 * (2**attempt))
+                    continue
+                raise GoogleRoutesError("GOOGLE_REQUEST_TIMEOUT", "Google Routes request timed out.", status_code=504) from exc
+            except httpx.HTTPError as exc:
+                if attempt < self._max_retries:
+                    time.sleep(0.1 * (2**attempt))
+                    continue
+                raise GoogleRoutesError("GOOGLE_CONNECTION_ERROR", "Google Routes could not be reached.", status_code=502) from exc
+            if response.status_code in {429, 500, 502, 503, 504} and attempt < self._max_retries:
+                time.sleep(0.1 * (2**attempt))
+                continue
+            if response.is_success:
+                return response.json()
+            try:
+                error_payload = response.json()
+                safe_message = str(error_payload.get("error", {}).get("message") or "Google Routes request failed.")
+                status = str(error_payload.get("error", {}).get("status") or "")
+            except Exception:
+                safe_message, status = "Google Routes request failed.", ""
+            normalized = safe_message.lower()
+            if "not been used" in normalized or "disabled" in normalized or "not enabled" in normalized:
+                code = "GOOGLE_ROUTES_NOT_ENABLED"
+            elif response.status_code in {401, 403} and ("api key" in normalized or status in {"UNAUTHENTICATED", "PERMISSION_DENIED"}):
+                code = "GOOGLE_API_KEY_INVALID"
+            elif response.status_code == 429:
+                code = "GOOGLE_RATE_LIMIT"
+            elif truck_request and response.status_code in {400, 403}:
+                code = "TRUCK_ROUTING_NOT_AVAILABLE"
+            elif response.status_code == 404:
+                code = "GOOGLE_ROUTE_NOT_FOUND"
+            else:
+                code = "GOOGLE_ROUTE_REQUEST_FAILED"
+            logger.warning("Google Routes request failed: code=%s status=%s", code, response.status_code)
+            raise GoogleRoutesError(code, safe_message, status_code=response.status_code)
+        raise GoogleRoutesError("GOOGLE_ROUTE_REQUEST_FAILED", "Google Routes request failed.")
+
+    @staticmethod
+    def _waypoint(latitude: float, longitude: float) -> dict:
+        return {"location": {"latLng": {"latitude": latitude, "longitude": longitude}}}
+
+    @staticmethod
+    def _future_departure(departure_datetime: datetime | None) -> str | None:
+        if not departure_datetime:
+            return None
+        aware = departure_datetime if departure_datetime.tzinfo else departure_datetime.replace(tzinfo=timezone.utc)
+        if aware <= datetime.now(timezone.utc) + timedelta(minutes=1):
+            return None
+        return aware.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def compute_route(
+        self,
+        *,
+        origin: tuple[float, float],
+        destination: tuple[float, float],
+        departure_datetime: datetime | None,
+        routing_mode: str,
+        routing_preference: str,
+        vehicle_info: dict | None = None,
+    ) -> dict:
+        truck = routing_mode == "TRUCK"
+        payload: dict[str, Any] = {
+            "origin": self._waypoint(*origin),
+            "destination": self._waypoint(*destination),
+            "travelMode": routing_mode,
+            "routingPreference": "TRAFFIC_AWARE_OPTIMAL" if truck else routing_preference,
+        }
+        departure = self._future_departure(departure_datetime)
+        if departure:
+            payload["departureTime"] = departure
+        if truck:
+            if not vehicle_info:
+                raise GoogleRoutesError("INVALID_VEHICLE_PROFILE", "Complete vehicleInfo is required for TRUCK routing.", status_code=422)
+            payload["routeModifiers"] = {"vehicleInfo": vehicle_info}
+        response = self._post(
+            ROUTES_URL,
+            payload,
+            "routes.distanceMeters,routes.duration,routes.staticDuration,routes.travelAdvisory.routeRestrictionsPartiallyIgnored,routes.warnings",
+            truck_request=truck,
+        )
+        routes = response.get("routes") or []
+        if not routes:
+            raise GoogleRoutesError("GOOGLE_ROUTE_NOT_FOUND", "Google Routes returned no route.", status_code=404)
+        route = routes[0]
+        return {
+            "distance_meters": int(route.get("distanceMeters") or 0),
+            "duration_seconds": _parse_duration(route.get("duration")),
+            "static_duration_seconds": _parse_duration(route.get("staticDuration")) or None,
+            "restrictions_partially_ignored": bool((route.get("travelAdvisory") or {}).get("routeRestrictionsPartiallyIgnored")),
+            "warnings": route.get("warnings") or [],
+        }
+
+    def compute_route_matrix(
+        self,
+        *,
+        origin: tuple[float, float],
+        destination: tuple[float, float],
+        departure_datetime: datetime | None,
+    ) -> dict:
+        payload: dict[str, Any] = {
+            "origins": [{"waypoint": self._waypoint(*origin)}],
+            "destinations": [{"waypoint": self._waypoint(*destination)}],
+            "travelMode": "DRIVE",
+            "routingPreference": "TRAFFIC_AWARE",
+        }
+        departure = self._future_departure(departure_datetime)
+        if departure:
+            payload["departureTime"] = departure
+        response = self._post(
+            MATRIX_URL,
+            payload,
+            "originIndex,destinationIndex,status,condition,distanceMeters,duration,staticDuration",
+        )
+        rows = response if isinstance(response, list) else []
+        if not rows or rows[0].get("condition") not in {None, "ROUTE_EXISTS"}:
+            raise GoogleRoutesError("GOOGLE_ROUTE_NOT_FOUND", "Google Route Matrix returned no route.", status_code=404)
+        return rows[0]
+
+
+def test_google_routes_connection(db: Session, *, tested_by: str) -> dict:
+    configuration = get_google_routes_configuration(db)
+    assert configuration is not None
+    if not configuration.encrypted_api_key:
+        result = {
+            "connection_status": "NOT_CONFIGURED",
+            "checks": {
+                "api_key_valid": "NOT_RUN",
+                "routes_api": "NOT_RUN",
+                "compute_routes": "NOT_RUN",
+                "compute_route_matrix": "NOT_RUN",
+                "large_vehicle_routing": "NOT_RUN",
+            },
+        }
+        configuration.connection_status = "NOT_CONFIGURED"
+        configuration.last_test_result = result
+        db.commit()
+        return result
+    api_key = decrypt_api_key(configuration.encrypted_api_key)
+    client = GoogleRoutesClient(api_key)
+    future = datetime.now(timezone.utc) + timedelta(minutes=10)
+    checks = {
+        "api_key_valid": "NOT_RUN",
+        "routes_api": "NOT_RUN",
+        "compute_routes": "NOT_RUN",
+        "compute_route_matrix": "NOT_RUN",
+        "large_vehicle_routing": "NOT_RUN",
+    }
+    error_code = None
+    try:
+        client.compute_route(
+            origin=(-6.2088, 106.8456),
+            destination=(-6.2146, 106.8451),
+            departure_datetime=future,
+            routing_mode="DRIVE",
+            routing_preference="TRAFFIC_AWARE",
+        )
+        checks.update({"api_key_valid": "PASS", "routes_api": "PASS", "compute_routes": "PASS"})
+        client.compute_route_matrix(
+            origin=(-6.2088, 106.8456), destination=(-6.2146, 106.8451), departure_datetime=future
+        )
+        checks["compute_route_matrix"] = "PASS"
+        try:
+            client.compute_route(
+                origin=(40.883274, -74.704574),
+                destination=(40.991920, -75.183371),
+                departure_datetime=future,
+                routing_mode="TRUCK",
+                routing_preference="TRAFFIC_AWARE_OPTIMAL",
+                vehicle_info={
+                    "totalAxleCount": 5,
+                    "totalHeightMm": 4114,
+                    "totalLengthMm": 21945,
+                    "totalWidthMm": 2590,
+                    "totalWeightKg": 32658,
+                },
+            )
+            checks["large_vehicle_routing"] = "PASS"
+            configuration.truck_routing_status = "AVAILABLE"
+        except GoogleRoutesError:
+            checks["large_vehicle_routing"] = "NOT_AVAILABLE"
+            configuration.truck_routing_status = "NOT_AVAILABLE"
+        configuration.connection_status = "CONNECTED"
+    except GoogleRoutesError as exc:
+        error_code = exc.code
+        checks["api_key_valid"] = "FAIL" if exc.code == "GOOGLE_API_KEY_INVALID" else checks["api_key_valid"]
+        checks["routes_api"] = "FAIL"
+        configuration.connection_status = {
+            "GOOGLE_API_KEY_INVALID": "INVALID_KEY",
+            "GOOGLE_ROUTES_NOT_ENABLED": "ROUTES_API_NOT_ENABLED",
+        }.get(exc.code, "CONNECTION_ERROR")
+    result = {
+        "connection_status": configuration.connection_status,
+        "truck_routing_status": configuration.truck_routing_status,
+        "checks": checks,
+        "error_code": error_code,
+        "tested_at": datetime.now(timezone.utc).isoformat(),
+        "tested_by": tested_by,
+    }
+    configuration.last_test_result = result
+    configuration.updated_by = tested_by
+    db.commit()
+    return result

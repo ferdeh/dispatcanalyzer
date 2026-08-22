@@ -3,10 +3,12 @@ from __future__ import annotations
 import csv
 import base64
 import json
+import logging
 import re
 import shutil
 import tempfile
 from collections import Counter
+from contextlib import asynccontextmanager
 from datetime import datetime
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -23,7 +25,7 @@ from sqlalchemy.orm import Session
 from .compatibility import evaluate_mt_spbu_compatibility
 from .affinity_intelligence import build_affinity_date_availability, build_affinity_intelligence_payload
 from .config import get_settings
-from .database import get_db
+from .database import SessionLocal, get_db
 from .departure_intelligence import build_departure_date_availability, build_departure_intelligence_payload, build_shift_intelligence_payload
 from .importer import ImportProcessor
 from .models import (
@@ -50,12 +52,32 @@ from .models import (
 )
 from .normalization import clean_str, infer_tag_type, make_id, normalize_key, normalize_product, parse_coordinate, parse_mt_name, source_int, source_number, split_project_tags
 from .pairing_intelligence import build_pairing_date_availability, build_pairing_intelligence_payload
+from .phase5_behavioral import recover_interrupted_behavioral_training_runs
 from .phase5_routes import router as phase5_router
 from .phase6_routes import router as phase6_router
+from .google_routes_settings_routes import router as google_routes_settings_router
+from .google_routes import refresh_large_vehicle_profile_status
 from .tag_consistency import build_tag_consistency_payload, get_tag_consistency_detail
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
-app = FastAPI(title="Dispatch Intelligence Platform", version="0.1.0")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    try:
+        with SessionLocal() as db:
+            recovered = recover_interrupted_behavioral_training_runs(db)
+        if recovered:
+            logger.warning("Recovered %s interrupted Phase 5 behavioral training run(s).", recovered)
+    except Exception:
+        # Recovery must never turn a diagnostic cleanup into another app-load
+        # failure. Normal endpoint database errors remain visible independently.
+        logger.exception("Could not recover interrupted Phase 5 behavioral training runs during startup.")
+    yield
+
+
+app = FastAPI(title="Dispatch Intelligence Platform", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
@@ -65,6 +87,7 @@ app.add_middleware(
 )
 app.include_router(phase5_router)
 app.include_router(phase6_router)
+app.include_router(google_routes_settings_router)
 
 
 class CompatibilityRequest(BaseModel):
@@ -478,10 +501,14 @@ def crud_create_master(domain: str, payload: dict = Body(...), db: Session = Dep
     record = build_crud_record(normalized_domain, payload)
     reactivated = reactivate_deleted_crud_record(db, normalized_domain, record)
     if reactivated:
+        if normalized_domain == "MOBIL_TANGKI":
+            refresh_large_vehicle_profile_status(reactivated)
         apply_crud_tag_links(db, normalized_domain, reactivated, payload)
         return commit_crud(db, normalized_domain, reactivated)
     db.add(record)
     db.flush()
+    if normalized_domain == "MOBIL_TANGKI":
+        refresh_large_vehicle_profile_status(record)
     apply_crud_tag_links(db, normalized_domain, record, payload)
     return commit_crud(db, normalized_domain, record)
 
@@ -508,6 +535,8 @@ def crud_update_master(domain: str, record_id: str, payload: dict = Body(...), d
     if not record:
         raise HTTPException(status_code=404, detail="Master data record not found.")
     apply_crud_update(normalized_domain, record, payload)
+    if normalized_domain == "MOBIL_TANGKI":
+        refresh_large_vehicle_profile_status(record)
     apply_crud_tag_links(db, normalized_domain, record, payload)
     return commit_crud(db, normalized_domain, record)
 
@@ -1148,6 +1177,8 @@ def crud_search_columns(domain: str) -> dict[str, object]:
         "DEPOT": {
             "depot_code": MasterDepot.depot_code,
             "depot_name": MasterDepot.depot_name,
+            "latitude": MasterDepot.latitude,
+            "longitude": MasterDepot.longitude,
             "region": MasterDepot.region,
             "timezone": MasterDepot.timezone,
             "active_status": MasterDepot.active_status,
@@ -1344,6 +1375,12 @@ def build_crud_record(domain: str, payload: dict):
             vehicle_type_tag=source_int(payload.get("vehicle_type_tag")),
             project_tag_raw=clean_str(payload.get("project_tag_raw")),
             number_of_compartments=source_int(payload.get("number_of_compartments")),
+            vehicle_height_mm=source_int(payload.get("vehicle_height_mm")),
+            vehicle_length_mm=source_int(payload.get("vehicle_length_mm")),
+            vehicle_weight_kg=source_int(payload.get("vehicle_weight_kg")),
+            vehicle_width_mm=source_int(payload.get("vehicle_width_mm")),
+            vehicle_axle_count=source_int(payload.get("vehicle_axle_count")),
+            hazmat_category=clean_str(payload.get("hazmat_category")),
             depot_id=clean_str(payload.get("depot_id")),
             source_hub_id=clean_str(payload.get("source_hub_id")),
             assignee=clean_str(payload.get("assignee")),
@@ -1402,7 +1439,7 @@ def apply_crud_update(domain: str, record, payload: dict) -> None:
         "PRODUCT": ["product_name", "active_status"],
         "TAG_TYPE": ["code", "name", "description", "admin_editable"],
         "TAG": ["tag_type_id", "tag_value", "active_status"],
-        "MOBIL_TANGKI": ["source_mt_id", "vehicle_name_raw", "vehicle_registration", "capacity_label", "vehicle_type_tag", "project_tag_raw", "number_of_compartments", "depot_id", "source_hub_id", "assignee", "active_status"],
+        "MOBIL_TANGKI": ["source_mt_id", "vehicle_name_raw", "vehicle_registration", "capacity_label", "vehicle_type_tag", "project_tag_raw", "number_of_compartments", "depot_id", "source_hub_id", "assignee", "active_status", "vehicle_height_mm", "vehicle_length_mm", "vehicle_weight_kg", "vehicle_width_mm", "vehicle_axle_count", "hazmat_category"],
         "SPBU": ["spbu_code", "spbu_name", "address", "city", "latitude", "longitude", "source_coordinate", "master_distance_km", "master_travel_time_min", "vehicle_type_tag", "project_tag_raw", "primary_depot_id", "active_status"],
         "LOADING_ORDER": ["shipment_id", "spbu_id", "spbu_mapping_status", "source_spbu_code", "shipto", "product_id", "source_product_name", "quantity", "status", "source_distance_km", "actual_km", "source_import_id"],
     }[domain]
@@ -1412,7 +1449,7 @@ def apply_crud_update(domain: str, record, payload: dict) -> None:
         value = payload[field]
         if field in {"latitude", "longitude", "master_distance_km", "master_travel_time_min", "quantity", "source_distance_km", "actual_km"}:
             value = source_number(value)
-        elif field in {"number_of_compartments", "vehicle_type_tag"}:
+        elif field in {"number_of_compartments", "vehicle_type_tag", "vehicle_height_mm", "vehicle_length_mm", "vehicle_weight_kg", "vehicle_width_mm", "vehicle_axle_count"}:
             value = source_int(value)
         elif field == "admin_editable":
             value = bool(value)
@@ -1879,6 +1916,13 @@ def build_mt_export(db: Session, depot: MasterDepot) -> tuple[str, list[str], li
         "capacity_label",
         "vehicle_type_tag",
         "number_of_compartments",
+        "vehicle_height_mm",
+        "vehicle_width_mm",
+        "vehicle_length_mm",
+        "vehicle_weight_kg",
+        "vehicle_axle_count",
+        "hazmat_category",
+        "large_vehicle_profile_status",
         "source_hub_id",
         "assignee",
         "active_status",
@@ -1897,6 +1941,13 @@ def build_mt_export(db: Session, depot: MasterDepot) -> tuple[str, list[str], li
             mt.capacity_label,
             mt.vehicle_type_tag,
             mt.number_of_compartments,
+            mt.vehicle_height_mm,
+            mt.vehicle_width_mm,
+            mt.vehicle_length_mm,
+            mt.vehicle_weight_kg,
+            mt.vehicle_axle_count,
+            mt.hazmat_category,
+            mt.large_vehicle_profile_status,
             mt.source_hub_id,
             mt.assignee,
             mt.active_status,

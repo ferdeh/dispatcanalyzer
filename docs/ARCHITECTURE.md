@@ -16,6 +16,21 @@ Phase 5 remains inside the FastAPI modular monolith. Synchronous status transiti
 
 The repository has no authentication provider. Phase 5 exposes a replacement seam through `phase5_auth`: local calls preserve current permissive behavior, while deployments may pass `X-User` and comma-separated `X-Permissions` (`phase5:view`, `phase5:run`, `phase5:train`, `phase5:save`, `phase5:activate`, `phase5:delete`). This is not a login system; production should replace the dependency with the platform identity provider.
 
-Phase 6 extends the same modular monolith through separate validation, inference, assignment, persistence/service, export, route, and authorization modules. Phase 5 artifact integrity is checked before inference when a joblib package exists; normalized model-registry assignments provide the persisted representation for legacy development databases. Phase 4 affinity creates ranking evidence, while `compatibility.evaluate_compatibility_entities` remains the only master-rule evaluator. NetworkX maximum-weight matching solves the one-to-one assignment globally per shift on the backend. The browser never performs combinatorial assignment.
+Phase 6 extends the same modular monolith through validation, inference, rolling assignment, route estimation, persistence, export, settings, and authorization modules. Phase 5 artifact integrity is checked before inference when a joblib package exists; normalized model-registry assignments remain the persisted representation for legacy development databases. Phase 4 affinity creates ranking evidence, while `compatibility.evaluate_compatibility_entities` remains the single master-rule evaluator.
 
-Phase 6 run rows retain immutable input/model/parameter/original-result snapshots. Current final shipment/assignment rows can change through audited overrides without rewriting the original model layer. `phase6_auth` exposes `phase6:view`, `phase6:run`, `phase6:export`, and `phase6:override` through the same replaceable header seam. Phase 6 has no dependency on a Phase 7 service and contains no route, distance, travel-time, or VRP solver.
+```text
+Timestamped LO + Initial MT Availability
+    → Phase 2 shift derivation
+    → Phase 5 time-feasible shipment prediction
+    → Phase 4 MT score + Phase 1 compatibility
+    → rolling chronological vehicle state
+    → vehicle-specific Google/fallback travel estimate
+    → cycle time, estimated return, next availability
+    → persisted final trip timeline + Phase 7 input
+```
+
+`Phase6RouteEstimationService` estimates one predicted shipment at a time. It may evaluate small permutations or nearest-neighbor stop order solely to estimate cycle time. It never calls Google Route Optimization, GMPRO `optimizeTours`, or a fleet-wide VRP solver. That boundary keeps preliminary `estimated_visit_sequence` distinct from the final optimized route owned by Phase 7.
+
+Google Routes requests are backend-only. The global API key is encrypted using an environment-provided application secret; the database stores ciphertext/fingerprint/mask, the frontend receives only the mask, and prediction snapshots retain configuration version—not key material. Route cache identity includes endpoints, departure bucket, routing preference, effective routing mode, configuration version, and vehicle profile hash. `TRUCK` uses the selected MT profile; unavailable or invalid truck routing either produces a visible `DRIVE_FALLBACK` or blocks, according to policy.
+
+Phase 6 run rows retain immutable input/model/routing/parameter/original-result snapshots and a separate final dispatch snapshot. Audited overrides recalculate route/cycle/availability and downstream rolling state without retraining Phase 5 or rewriting the original model layer. `phase6_auth` exposes `phase6:view`, `phase6:run`, `phase6:export`, `phase6:override`, `google_routes:view`, and `google_routes:manage` through the same replaceable header seam.

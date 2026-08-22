@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import math
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -107,13 +108,19 @@ def predict_shipments(
         by_shift[row["shift_id"]].append(row)
     shipments: list[dict] = []
     minimum = float(parameters["minimum_prediction_confidence"])
+    maximum_gap_seconds = int(parameters.get("maximum_pairing_time_gap_minutes", 30)) * 60
     for shift_id in sorted(by_shift):
-        rows = sorted(by_shift[shift_id], key=lambda row: (row["spbu_no"], row["loading_order_no"]))
+        rows = sorted(by_shift[shift_id], key=lambda row: (row["shipment_start_datetime"], row["spbu_no"], row["loading_order_no"]))
         graph = nx.Graph()
         graph.add_nodes_from(range(len(rows)))
         edge_explanations: dict[frozenset[int], dict] = {}
         for left in range(len(rows)):
             for right in range(left + 1, len(rows)):
+                first_datetime = datetime.fromisoformat(rows[left]["shipment_start_datetime"])
+                second_datetime = datetime.fromisoformat(rows[right]["shipment_start_datetime"])
+                time_gap_seconds = abs((second_datetime - first_datetime).total_seconds())
+                if time_gap_seconds > maximum_gap_seconds:
+                    continue
                 first, second = assignments.get(rows[left]["spbu_id"]), assignments.get(rows[right]["spbu_id"])
                 if not first or not second or first.get("is_noise") or second.get("is_noise") or first.get("cluster_id") != second.get("cluster_id"):
                     continue
@@ -135,14 +142,17 @@ def predict_shipments(
                         "shift_match": round(shift_match, 6),
                         "feature_weights": weights,
                         "normalized_model_score": score,
+                        "pairing_time_gap_minutes": round(time_gap_seconds / 60, 3),
+                        "maximum_pairing_time_gap_minutes": maximum_gap_seconds // 60,
                     }
         matching = nx.algorithms.matching.max_weight_matching(graph, maxcardinality=False, weight="weight")
         groups = [sorted(edge) for edge in matching]
         matched_nodes = {index for group in groups for index in group}
         groups.extend([[index] for index in range(len(rows)) if index not in matched_nodes])
-        groups.sort(key=lambda group: min(rows[index]["loading_order_no"] for index in group))
+        groups.sort(key=lambda group: (max(rows[index]["shipment_start_datetime"] for index in group), min(rows[index]["loading_order_no"] for index in group)))
         for number, group in enumerate(groups, start=1):
             selected_rows = [rows[index] for index in group]
+            planned_start = max(datetime.fromisoformat(row["shipment_start_datetime"]) for row in selected_rows)
             if len(group) > 1:
                 explanation = edge_explanations[frozenset(group)]
                 score = float(explanation["normalized_model_score"])
@@ -150,7 +160,7 @@ def predict_shipments(
                 assignment = assignments.get(selected_rows[0]["spbu_id"])
                 score = round(float(assignment.get("membership_probability", 0.0)), 6) if assignment else 0.0
                 explanation = {
-                    "single_spbu_reason": "No same-shift pairing met the configured prediction threshold.",
+                    "single_spbu_reason": "No same-shift, time-feasible pairing met the configured prediction threshold.",
                     "cluster_membership_probability": score if assignment else None,
                     "model_coverage": "COVERED" if assignment else "UNSEEN_SPBU",
                 }
@@ -160,6 +170,7 @@ def predict_shipments(
                     "predicted_shipment_id": shipment_number,
                     "shift_id": shift_id,
                     "shift": selected_rows[0]["shift"],
+                    "planned_start_datetime": planned_start,
                     "score": score,
                     "confidence_level": confidence_level(score, parameters),
                     "low_confidence": score < minimum,
@@ -167,6 +178,9 @@ def predict_shipments(
                     "explanation": {**explanation, "model_id": model.model_id, "model_version": model.model_version},
                 }
             )
+    shipments.sort(key=lambda shipment: (shipment["planned_start_datetime"], shipment["predicted_shipment_id"]))
+    for number, shipment in enumerate(shipments, start=1):
+        shipment["predicted_shipment_id"] = f"PRED-SHIP-{number:04d}"
     return shipments
 
 
@@ -204,13 +218,10 @@ def predict_mt_candidates(
         latest_affinity[(row.spbu_id, row.mt_id)] = row
         spbu_totals[row.spbu_id] = max(spbu_totals[row.spbu_id], row.total_spbu_shipment_count)
 
-    available_by_shift: dict[str, set[str]] = defaultdict(set)
-    for row in availability:
-        available_by_shift[row["shift_id"]].add(row["vehicle_id"])
     result: dict[str, list[dict]] = {}
     for shipment in shipments:
         candidates = []
-        for vehicle_id in sorted(available_by_shift.get(shipment["shift_id"], set())):
+        for vehicle_id in vehicle_ids:
             mt = mts[vehicle_id]
             checks = [
                 evaluate_compatibility_entities(
@@ -248,7 +259,10 @@ def predict_mt_candidates(
                         "score_method": "mean Laplace-smoothed Phase 4 P(MT|SPBU)",
                         "master_compatibility": "PASS" if compatible else "FAIL",
                         "failed_master_rules": failed_rules,
-                        "availability": shipment["shift"],
+                        "availability": "Evaluated dynamically by rolling vehicle state.",
+                        "initial_available_datetime": next(
+                            row["initial_available_datetime"] for row in availability if row["vehicle_id"] == vehicle_id
+                        ),
                     },
                 }
             )

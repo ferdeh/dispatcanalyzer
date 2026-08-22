@@ -32,13 +32,13 @@ def workbook_bytes(sheets: list[tuple[str, list[str], list[list]]]) -> bytes:
 
 def loading_order_template() -> bytes:
     return workbook_bytes(
-        [("Loading Order", ["loading_order_no", "shift_gate_out", "spbu_no"], [["LO000001", "Shift 1", "SPBU001"]])]
+        [("Loading Order", ["loading_order_no", "shipment_start_datetime", "spbu_no", "order_quantity_kl"], [["LO000001", "2026-08-22 05:00:00", "SPBU001", 8]])]
     )
 
 
 def mt_availability_template() -> bytes:
     return workbook_bytes(
-        [("MT Availability", ["shift", "vehicle_registration_no"], [["Shift 1", "B9123ABC"]])]
+        [("MT Availability", ["vehicle_registration_no", "initial_available_datetime"], [["B9123ABC", "2026-08-22 04:30:00"]])]
     )
 
 
@@ -62,15 +62,20 @@ def prediction_export(db: Session, run_id: str) -> tuple[bytes, str]:
     shipment_rows = []
     assignment_rows = []
     candidate_rows = []
+    trip_rows = []
     for shipment in payload["shipments"]:
+        trip = shipment.get("trip") or {}
         for line in shipment["lines"]:
             shipment_rows.append(
                 [
                     payload["prediction_run_id"],
                     shipment["shift"],
+                    shipment["planned_start_datetime"],
                     shipment["predicted_shipment_id"],
                     line["loading_order_no"],
+                    line["shipment_start_datetime"],
                     line["spbu_no"],
+                    line["order_quantity_kl"],
                     shipment["shipment_prediction_score"],
                     shipment["shipment_confidence_level"],
                 ]
@@ -99,6 +104,31 @@ def prediction_export(db: Session, run_id: str) -> tuple[bytes, str]:
                     candidate["exclusion_reason"],
                 ]
             )
+        trip_rows.append(
+            [
+                trip.get("trip_id"),
+                trip.get("trip_number"),
+                trip.get("vehicle_registration_no"),
+                shipment["predicted_shipment_id"],
+                trip.get("planned_start_datetime"),
+                trip.get("predicted_departure_datetime"),
+                trip.get("delay_minutes"),
+                ", ".join(trip.get("estimated_visit_sequence") or []),
+                trip.get("routing_provider"),
+                trip.get("routing_mode"),
+                trip.get("route_distance_meters"),
+                trip.get("route_duration_seconds"),
+                trip.get("service_duration_seconds"),
+                trip.get("total_cycle_duration_seconds"),
+                trip.get("estimated_return_datetime"),
+                trip.get("next_available_datetime"),
+                trip.get("routing_confidence"),
+                trip.get("route_estimation_source"),
+                trip.get("assignment_status"),
+                trip.get("fallback_used"),
+                ", ".join(trip.get("warning_codes") or []),
+            ]
+        )
     validation_rows = [
         [issue["file"], issue["row"], issue["field"], issue["status"], issue["error_code"], issue["description"]]
         for issue in payload["validation"]
@@ -108,8 +138,13 @@ def prediction_export(db: Session, run_id: str) -> tuple[bytes, str]:
             ("Summary", ["Metric", "Value"], summary_rows),
             (
                 "Shipment Result",
-                ["prediction_run_id", "shift", "predicted_shipment_id", "loading_order_no", "spbu_no", "shipment_prediction_score", "shipment_confidence_level"],
+                ["prediction_run_id", "derived_shift", "planned_start_datetime", "predicted_shipment_id", "loading_order_no", "shipment_start_datetime", "spbu_no", "order_quantity_kl", "shipment_prediction_score", "shipment_confidence_level"],
                 shipment_rows,
+            ),
+            (
+                "Trip Timeline",
+                ["trip_id", "trip_number", "vehicle_registration_no", "predicted_shipment_id", "planned_start_datetime", "predicted_departure_datetime", "delay_minutes", "estimated_visit_sequence", "routing_provider", "routing_mode", "route_distance_meters", "route_duration_seconds", "service_duration_seconds", "total_cycle_duration_seconds", "estimated_return_datetime", "next_available_datetime", "routing_confidence", "route_estimation_source", "assignment_status", "fallback_used", "warning_codes"],
+                trip_rows,
             ),
             (
                 "MT Assignment",

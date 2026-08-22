@@ -1,6 +1,8 @@
 import ReactECharts from "echarts-for-react";
 import { Archive, BrainCircuit, CheckCircle2, Copy, Eye, Play, RefreshCw, Save, Scale, Trash2, X } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
+import { CircleMarker, MapContainer, Popup, TileLayer, Tooltip, useMap } from "react-leaflet";
+import "leaflet/dist/leaflet.css";
 import { apiGet, apiSend } from "../lib/api";
 
 type Depot = { depot_id: string; depot_name: string };
@@ -8,17 +10,26 @@ type Tab = "concentration" | "clustering" | "registry";
 type Readiness = {
   depot_id: string;
   depot_name: string;
+  depot_latitude: number | null;
+  depot_longitude: number | null;
   master_compatibility_pass_percentage: number;
-  active_mt_count: number;
-  active_spbu_count: number;
+  compatibility_scope: string;
+  compatibility_scope_description: string;
+  scope_start_date: string | null;
+  scope_end_date: string | null;
+  evaluated_assignment_count: number;
+  passed_assignment_count: number;
+  failed_assignment_count: number;
+  mismatch_assignment_count: number;
+  data_issue_assignment_count: number;
   evaluated_pair_count: number;
   passed_pair_count: number;
   failed_pair_count: number;
   is_ready: boolean;
   status: string;
   requirement: string;
-  failure_counts: Record<string, number>;
-  issue_examples: Array<{ mt_id: string; vehicle_registration: string | null; spbu_id: string; spbu_code: string; failed_rules: string[] }>;
+  status_counts: Record<string, number>;
+  compatibility_issues_path: string;
 };
 type MTDistribution = {
   mt_id: string;
@@ -75,6 +86,8 @@ type DatasetSummary = {
   master_compatibility_pass_percentage: number;
   sufficient_history_spbu_count: number;
   excluded_insufficient_data_spbu_count: number;
+  geocoded_training_spbu_count: number;
+  missing_coordinate_training_spbu_count: number;
   pairing_edge_count: number;
   isolated_spbu_count: number;
 };
@@ -82,12 +95,15 @@ type Assignment = {
   spbu_id: string;
   spbu_code: string;
   spbu_name: string | null;
+  latitude?: number | null;
+  longitude?: number | null;
   shipment_observation_count?: number;
   cluster_id: number | null;
   cluster_label: string;
   membership_probability: number;
   is_noise: boolean;
   dominant_shift: string;
+  vehicle_class?: number | null;
   key_tags: string[];
   visualization_x: number;
   visualization_y: number;
@@ -139,11 +155,14 @@ type ModelSummary = {
   depot_name: string;
   training_start_date: string;
   training_end_date: string;
+  training_shipment_count: number;
   training_spbu_count: number;
+  minimum_shipment_observation: number;
   cluster_count: number;
   noise_spbu_count: number;
   average_membership_probability: number;
   model_status: string;
+  algorithm_version: string;
   created_by: string;
   created_at: string | null;
 };
@@ -169,6 +188,18 @@ type Comparison = {
   cluster_merges: unknown[];
   methodology: string;
 };
+
+const CLUSTER_COLORS = [
+  "#5470c6", "#91cc75", "#fac858", "#ee6666", "#73c0de", "#3ba272", "#fc8452", "#9a60b4", "#ea7ccc", "#2f4554",
+  "#61a0a8", "#d48265", "#749f83", "#ca8622", "#bda29a", "#6e7074", "#546570", "#c4ccd3", "#0b73bf", "#b8d211",
+  "#ef5b5b", "#7c3aed", "#0891b2", "#16a34a",
+];
+
+function clusterColor(clusterLabel: string, clusterLabels: string[]) {
+  if (clusterLabel === "Noise / Unique Behavioral Pattern") return "#94a3b8";
+  const clusteredLabels = clusterLabels.filter((value) => value !== "Noise / Unique Behavioral Pattern");
+  return CLUSTER_COLORS[Math.max(0, clusteredLabels.indexOf(clusterLabel)) % CLUSTER_COLORS.length];
+}
 
 const defaultShifts: ShiftDefinition[] = [
   { shift_id: "shift_1", name: "Shift 1", start_time: "00:00", end_time: "05:59" },
@@ -212,6 +243,161 @@ function Metric({ title, value, hint }: { title: string; value: string | number;
   );
 }
 
+type MappedAssignment = Assignment & { latitude: number; longitude: number };
+type DepotLocation = { depot_id: string; depot_name: string; latitude: number | null; longitude: number | null };
+type MappedDepotLocation = DepotLocation & { latitude: number; longitude: number };
+
+function hasGeographicCoordinates(assignment: Assignment): assignment is MappedAssignment {
+  return typeof assignment.latitude === "number"
+    && Number.isFinite(assignment.latitude)
+    && assignment.latitude >= -90
+    && assignment.latitude <= 90
+    && typeof assignment.longitude === "number"
+    && Number.isFinite(assignment.longitude)
+    && assignment.longitude >= -180
+    && assignment.longitude <= 180;
+}
+
+function hasDepotCoordinates(depot: DepotLocation | null): depot is MappedDepotLocation {
+  return Boolean(depot)
+    && typeof depot?.latitude === "number"
+    && Number.isFinite(depot.latitude)
+    && depot.latitude >= -90
+    && depot.latitude <= 90
+    && typeof depot.longitude === "number"
+    && Number.isFinite(depot.longitude)
+    && depot.longitude >= -180
+    && depot.longitude <= 180;
+}
+
+function FitGeographicBounds({ assignments, depot }: { assignments: MappedAssignment[]; depot: MappedDepotLocation | null }) {
+  const map = useMap();
+
+  useEffect(() => {
+    const positions = assignments.map((assignment) => [assignment.latitude, assignment.longitude] as [number, number]);
+    if (depot) positions.push([depot.latitude, depot.longitude]);
+    if (!positions.length) return;
+    map.fitBounds(
+      positions,
+      { padding: [28, 28], maxZoom: 12 }
+    );
+  }, [assignments, depot, map]);
+
+  return null;
+}
+
+function GeographicClusterMap({ assignments, depot }: { assignments: Assignment[]; depot: DepotLocation | null }) {
+  const mappedAssignments = useMemo(() => assignments.filter(hasGeographicCoordinates), [assignments]);
+  const mappedDepot = hasDepotCoordinates(depot) ? depot : null;
+  const clusterLabels = useMemo(
+    () => Array.from(new Set(mappedAssignments.map((assignment) => assignment.cluster_label))),
+    [mappedAssignments]
+  );
+  const missingCoordinateCount = assignments.length - mappedAssignments.length;
+
+  return (
+    <div className="border border-line bg-white p-4 lg:col-span-2">
+      <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-600">Geographic Cluster Map</h3>
+          <p className="mt-1 text-xs text-slate-500">Master SPBU and Master Depot latitude/longitude positions; coordinates do not influence clustering.</p>
+        </div>
+        <div className="text-xs text-slate-500">
+          {mappedAssignments.length.toLocaleString()} SPBU mapped · {missingCoordinateCount.toLocaleString()} missing · {mappedDepot ? "Depot mapped" : "Depot coordinates missing"}
+        </div>
+      </div>
+      {mappedAssignments.length || mappedDepot ? (
+        <>
+          <div className="relative z-0 mt-3 overflow-hidden rounded-2xl border border-line" role="region" aria-label="Geographic cluster map using Master SPBU and Master Depot coordinates">
+            <MapContainer
+              center={mappedDepot ? [mappedDepot.latitude, mappedDepot.longitude] : [mappedAssignments[0].latitude, mappedAssignments[0].longitude]}
+              zoom={8}
+              scrollWheelZoom
+              preferCanvas
+              className="h-[500px] w-full bg-slate-100"
+            >
+              <TileLayer
+                attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+                url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+              />
+              <FitGeographicBounds assignments={mappedAssignments} depot={mappedDepot} />
+              {mappedAssignments.map((assignment) => (
+                <CircleMarker
+                  key={assignment.spbu_id}
+                  center={[assignment.latitude, assignment.longitude]}
+                  radius={assignment.is_noise ? 5 : 6}
+                  pathOptions={{
+                    color: "#ffffff",
+                    fillColor: clusterColor(assignment.cluster_label, clusterLabels),
+                    fillOpacity: 0.88,
+                    weight: 1.5,
+                  }}
+                >
+                  <Tooltip direction="top" opacity={1}>
+                    <div className="min-w-60 text-sm text-petroink">
+                      <div className="font-semibold">{assignment.spbu_name || assignment.spbu_code}</div>
+                      <div className="text-xs text-slate-500">SPBU {assignment.spbu_code} · {assignment.cluster_label}</div>
+                      <div className="mt-2"><span className="font-semibold">Shift:</span> {assignment.dominant_shift}</div>
+                      <div><span className="font-semibold">Vehicle tag:</span> {assignment.vehicle_class === null || assignment.vehicle_class === undefined ? "-" : `Vehicle Class ${assignment.vehicle_class}`}</div>
+                      <div className="mt-1"><span className="font-semibold">Other tags:</span> {assignment.key_tags.join(", ") || "-"}</div>
+                    </div>
+                  </Tooltip>
+                  <Popup>
+                    <div className="min-w-48 text-sm text-petroink">
+                      <div className="font-semibold">{assignment.spbu_code} · {assignment.spbu_name}</div>
+                      <div className="mt-1">{assignment.cluster_label}</div>
+                      <div>Membership: {pct(assignment.membership_probability)}</div>
+                      <div>Dominant shift: {assignment.dominant_shift}</div>
+                      <div>Vehicle tag: {assignment.vehicle_class === null || assignment.vehicle_class === undefined ? "-" : `Vehicle Class ${assignment.vehicle_class}`}</div>
+                      <div>Other tags: {assignment.key_tags.join(", ") || "-"}</div>
+                      <div className="mt-1 text-xs text-slate-500">{assignment.latitude.toFixed(5)}, {assignment.longitude.toFixed(5)}</div>
+                    </div>
+                  </Popup>
+                </CircleMarker>
+              ))}
+              {mappedDepot && (
+                <CircleMarker
+                  center={[mappedDepot.latitude, mappedDepot.longitude]}
+                  radius={11}
+                  pathOptions={{ color: "#facc15", fillColor: "#0f2942", fillOpacity: 1, weight: 4 }}
+                >
+                  <Tooltip direction="top" opacity={1}>
+                    <div className="min-w-48 text-sm text-petroink">
+                      <div className="font-semibold">Depot · {mappedDepot.depot_name}</div>
+                      <div className="mt-1 text-xs text-slate-500">Master Depot position</div>
+                      <div className="mt-1">{mappedDepot.latitude.toFixed(5)}, {mappedDepot.longitude.toFixed(5)}</div>
+                    </div>
+                  </Tooltip>
+                  <Popup>
+                    <div className="min-w-48 text-sm text-petroink">
+                      <div className="font-semibold">Depot · {mappedDepot.depot_name}</div>
+                      <div className="mt-1">Coordinates from Master Depot</div>
+                      <div className="text-xs text-slate-500">{mappedDepot.latitude.toFixed(5)}, {mappedDepot.longitude.toFixed(5)}</div>
+                    </div>
+                  </Popup>
+                </CircleMarker>
+              )}
+            </MapContainer>
+          </div>
+          <div className="mt-3 flex max-h-24 flex-wrap gap-x-4 gap-y-2 overflow-y-auto text-xs text-slate-600">
+            {mappedDepot && <div className="inline-flex items-center gap-1.5 font-semibold text-petroink"><span className="h-3 w-3 rounded-full border-2 border-yellow-400 bg-petroink" />Depot</div>}
+            {clusterLabels.map((clusterLabel) => (
+              <div className="inline-flex items-center gap-1.5" key={clusterLabel}>
+                <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: clusterColor(clusterLabel, clusterLabels) }} />
+                {clusterLabel}
+              </div>
+            ))}
+          </div>
+        </>
+      ) : (
+        <div className="mt-3 border border-dashed border-line bg-slate-50 px-4 py-10 text-center text-sm text-slate-500">
+          Neither the selected depot nor any training SPBU has complete master latitude/longitude coordinates.
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function MachineLearningIntelligencePage({ depots }: { depots: Depot[] }) {
   const [tab, setTab] = useState<Tab>("concentration");
   const [depotId, setDepotId] = useState("");
@@ -237,6 +423,8 @@ export function MachineLearningIntelligencePage({ depots }: { depots: Depot[] })
   const [minimumObservationFilter, setMinimumObservationFilter] = useState("0");
   const [spbuSearch, setSpbuSearch] = useState("");
   const [scoreDirection, setScoreDirection] = useState<"desc" | "asc">("desc");
+  const [concentrationPage, setConcentrationPage] = useState(0);
+  const [concentrationPageSize, setConcentrationPageSize] = useState(10);
   const [selectedConcentration, setSelectedConcentration] = useState<ConcentrationProfile | null>(null);
 
   const [trainingStart, setTrainingStart] = useState("");
@@ -247,6 +435,8 @@ export function MachineLearningIntelligencePage({ depots }: { depots: Depot[] })
   const [engineBAdvanced, setEngineBAdvanced] = useState(false);
   const [engineBLoading, setEngineBLoading] = useState(false);
   const [trainingRun, setTrainingRun] = useState<TrainingRun | null>(null);
+  const [clusterMembershipPage, setClusterMembershipPage] = useState(0);
+  const [clusterMembershipPageSize, setClusterMembershipPageSize] = useState(10);
   const [selectedCluster, setSelectedCluster] = useState<ClusterProfile | null>(null);
   const [saveDialog, setSaveDialog] = useState(false);
   const [modelName, setModelName] = useState("");
@@ -255,6 +445,9 @@ export function MachineLearningIntelligencePage({ depots }: { depots: Depot[] })
   const [models, setModels] = useState<ModelSummary[]>([]);
   const [registryLoading, setRegistryLoading] = useState(false);
   const [openedModel, setOpenedModel] = useState<ModelDetail | null>(null);
+  const [selectedClusteringModelId, setSelectedClusteringModelId] = useState("");
+  const [displayedSavedModel, setDisplayedSavedModel] = useState<ModelDetail | null>(null);
+  const [clusteringModelLoading, setClusteringModelLoading] = useState(false);
   const [compareA, setCompareA] = useState("");
   const [compareB, setCompareB] = useState("");
   const [comparison, setComparison] = useState<Comparison | null>(null);
@@ -269,6 +462,9 @@ export function MachineLearningIntelligencePage({ depots }: { depots: Depot[] })
     setReadiness(null);
     setConcentrationRun(null);
     setTrainingRun(null);
+    setDisplayedSavedModel(null);
+    setSelectedClusteringModelId("");
+    setModels([]);
     setError(null);
     Promise.all([
       apiGet<Readiness>(`/api/v1/phase5/readiness?depot_id=${encodeURIComponent(depotId)}`),
@@ -291,7 +487,7 @@ export function MachineLearningIntelligencePage({ depots }: { depots: Depot[] })
   }, [depotId]);
 
   useEffect(() => {
-    if (tab === "registry") void refreshRegistry();
+    if (tab === "registry" || tab === "clustering") void refreshRegistry();
   }, [tab, depotId]);
 
   async function refreshReadiness() {
@@ -363,6 +559,18 @@ export function MachineLearningIntelligencePage({ depots }: { depots: Depot[] })
       });
   }, [classificationFilter, concentrationRun, minimumObservationFilter, minimumScore, scoreDirection, spbuSearch]);
 
+  useEffect(() => {
+    setConcentrationPage(0);
+  }, [classificationFilter, concentrationRun?.analysis_run_id, minimumObservationFilter, minimumScore, scoreDirection, spbuSearch]);
+
+  const concentrationPageCount = Math.max(1, Math.ceil(filteredConcentration.length / concentrationPageSize));
+  const concentrationPageRows = useMemo(
+    () => filteredConcentration.slice(concentrationPage * concentrationPageSize, (concentrationPage + 1) * concentrationPageSize),
+    [concentrationPage, concentrationPageSize, filteredConcentration]
+  );
+  const concentrationRangeStart = filteredConcentration.length === 0 ? 0 : concentrationPage * concentrationPageSize + 1;
+  const concentrationRangeEnd = Math.min(filteredConcentration.length, (concentrationPage + 1) * concentrationPageSize);
+
   const concentrationChartRows = useMemo(
     () => (concentrationRun?.profiles ?? []).filter((row) => row.concentration_anomaly_score !== null),
     [concentrationRun]
@@ -379,6 +587,7 @@ export function MachineLearningIntelligencePage({ depots }: { depots: Depot[] })
     setEngineBLoading(true);
     setError(null);
     setTrainingRun(null);
+    setDisplayedSavedModel(null);
     try {
       setTrainingRun(await apiSend<TrainingRun>("/api/v1/phase5/engine-b/prepare-dataset", "POST", {
         depot_id: depotId,
@@ -430,7 +639,9 @@ export function MachineLearningIntelligencePage({ depots }: { depots: Depot[] })
   async function refreshRegistry() {
     setRegistryLoading(true);
     try {
-      setModels(await apiGet<ModelSummary[]>(`/api/v1/phase5/models${depotId ? `?depot_id=${encodeURIComponent(depotId)}` : ""}`));
+      const registryModels = await apiGet<ModelSummary[]>(`/api/v1/phase5/models${depotId ? `?depot_id=${encodeURIComponent(depotId)}` : ""}`);
+      setModels(registryModels);
+      setSelectedClusteringModelId((current) => registryModels.some((model) => model.model_id === current) ? current : "");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Failed to load Model Registry.");
     } finally {
@@ -443,6 +654,23 @@ export function MachineLearningIntelligencePage({ depots }: { depots: Depot[] })
       setOpenedModel(await apiGet<ModelDetail>(`/api/v1/phase5/models/${modelId}`));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Failed to open model.");
+    }
+  }
+
+  async function openClusteringModel() {
+    if (!selectedClusteringModelId) return;
+    setClusteringModelLoading(true);
+    setError(null);
+    try {
+      const model = await apiGet<ModelDetail>(`/api/v1/phase5/models/${selectedClusteringModelId}`);
+      setTrainingRun(null);
+      setSelectedCluster(null);
+      setDisplayedSavedModel(model);
+      setClusterMembershipPage(0);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Failed to open saved clustering model.");
+    } finally {
+      setClusteringModelLoading(false);
     }
   }
 
@@ -496,6 +724,7 @@ export function MachineLearningIntelligencePage({ depots }: { depots: Depot[] })
         random_seed: draft.random_seed
       });
       setTrainingRun(null);
+      setDisplayedSavedModel(null);
       setTab("clustering");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Duplicate configuration failed.");
@@ -522,6 +751,44 @@ export function MachineLearningIntelligencePage({ depots }: { depots: Depot[] })
   }
 
   const trainedResult = trainingRun?.result && "summary" in trainingRun.result ? trainingRun.result as TrainingResult : null;
+  const savedModelResult = useMemo<TrainingResult | null>(() => displayedSavedModel ? {
+    summary: {
+      training_spbu_count: displayedSavedModel.training_spbu_count,
+      cluster_count: displayedSavedModel.cluster_count,
+      clustered_spbu_count: displayedSavedModel.training_spbu_count - displayedSavedModel.noise_spbu_count,
+      noise_spbu_count: displayedSavedModel.noise_spbu_count,
+      average_membership_probability: displayedSavedModel.average_membership_probability,
+    },
+    assignments: displayedSavedModel.assignments,
+    cluster_profiles: displayedSavedModel.cluster_profiles,
+    warnings: [],
+    saved: true,
+  } : null, [displayedSavedModel]);
+  const displayedClusterResult = savedModelResult ?? trainedResult;
+  const behavioralClusterLabels = useMemo(
+    () => Array.from(new Set((displayedClusterResult?.assignments ?? []).map((assignment) => assignment.cluster_label))),
+    [displayedClusterResult?.assignments]
+  );
+  const clusterMembershipAssignments = displayedClusterResult?.assignments ?? [];
+  const clusterMembershipPageCount = Math.max(1, Math.ceil(clusterMembershipAssignments.length / clusterMembershipPageSize));
+  const clusterMembershipSafePage = Math.min(clusterMembershipPage, clusterMembershipPageCount - 1);
+  const clusterMembershipPageRows = clusterMembershipAssignments.slice(
+    clusterMembershipSafePage * clusterMembershipPageSize,
+    (clusterMembershipSafePage + 1) * clusterMembershipPageSize
+  );
+  const clusterMembershipRangeStart = clusterMembershipAssignments.length === 0 ? 0 : clusterMembershipSafePage * clusterMembershipPageSize + 1;
+  const clusterMembershipRangeEnd = Math.min(clusterMembershipAssignments.length, (clusterMembershipSafePage + 1) * clusterMembershipPageSize);
+  const displayedShiftDefinitions = displayedSavedModel?.shift_definition_snapshot ?? shiftDefinitions;
+  const geographicDepot = useMemo<DepotLocation | null>(() => readiness ? {
+    depot_id: readiness.depot_id,
+    depot_name: readiness.depot_name,
+    latitude: readiness.depot_latitude,
+    longitude: readiness.depot_longitude,
+  } : null, [readiness]);
+
+  useEffect(() => {
+    setClusterMembershipPage(0);
+  }, [displayedSavedModel?.model_id, trainingRun?.training_run_id, displayedClusterResult?.assignments]);
 
   return (
     <div className="space-y-5">
@@ -531,7 +798,7 @@ export function MachineLearningIntelligencePage({ depots }: { depots: Depot[] })
         <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
           <div>
             <div className="flex items-center gap-2 text-sm font-semibold uppercase tracking-wide text-slate-600"><BrainCircuit size={18} /> Phase 5 Readiness</div>
-            <p className="mt-1 text-sm text-slate-500">Machine learning remains locked until every active MT–SPBU master pair in the selected depot passes the canonical compatibility rules.</p>
+            <p className="mt-1 text-sm text-slate-500">Machine learning is unlocked when every observed Loading Order assignment in the latest Phase 1 scope passes tag compatibility. Unused ineligible MT–SPBU combinations are expected exclusions and do not block Phase 5.</p>
           </div>
           <div className="flex gap-2">
             <select className="min-w-64 border border-line bg-white px-3 py-2 text-sm" value={depotId} onChange={(event) => setDepotId(event.target.value)} title="Phase 5 depot">
@@ -543,9 +810,9 @@ export function MachineLearningIntelligencePage({ depots }: { depots: Depot[] })
         </div>
         {readiness && (
           <div className={`mt-4 grid gap-4 border p-4 lg:grid-cols-[1fr_1fr_auto] ${readiness.is_ready ? "border-mint bg-mint/5" : "border-rust bg-rust/5"}`}>
-            <div><div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Master Compatibility</div><div className="mt-1 text-3xl font-semibold">{readiness.master_compatibility_pass_percentage.toFixed(2)}%</div><div className="mt-1 text-xs text-slate-500">{readiness.passed_pair_count.toLocaleString()} of {readiness.evaluated_pair_count.toLocaleString()} active master pairs pass</div></div>
+            <div><div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Observed Assignment Compatibility</div><div className="mt-1 text-3xl font-semibold">{readiness.master_compatibility_pass_percentage.toFixed(2)}%</div><div className="mt-1 text-xs text-slate-500">{readiness.passed_assignment_count.toLocaleString()} of {readiness.evaluated_assignment_count.toLocaleString()} Loading Order assignments pass</div><div className="mt-1 text-xs text-slate-500">Phase 1 scope: {readiness.scope_start_date ?? "no available date"}{readiness.scope_end_date && readiness.scope_end_date !== readiness.scope_start_date ? ` – ${readiness.scope_end_date}` : ""}</div></div>
             <div><div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Status</div><span className={`mt-2 inline-flex border px-3 py-1 text-sm font-semibold ${badgeClass(readiness.status)}`}>{label(readiness.status)}</span><p className="mt-2 text-xs text-slate-500">{readiness.requirement}</p></div>
-            {!readiness.is_ready && <button className="self-center border border-rust px-3 py-2 text-sm font-semibold text-rust" onClick={() => { window.location.href = `/tag-consistency?depot_id=${encodeURIComponent(depotId)}`; }}>View Compatibility Issues</button>}
+            {!readiness.is_ready && <button className="self-center border border-rust px-3 py-2 text-sm font-semibold text-rust" onClick={() => { window.location.href = readiness.compatibility_issues_path; }}>View Phase 1 Results</button>}
           </div>
         )}
       </section>
@@ -585,7 +852,16 @@ export function MachineLearningIntelligencePage({ depots }: { depots: Depot[] })
               </section>
               <section className="border border-line bg-white p-4">
                 <div className="mb-4 flex flex-wrap gap-3"><select className="border border-line px-3 py-2 text-sm" value={classificationFilter} onChange={(event) => setClassificationFilter(event.target.value)}><option value="ALL">All classifications</option>{["NORMAL", "MODERATE_CONCENTRATION", "HIGH_CONCENTRATION", "INVESTIGATION_RECOMMENDED", "INSUFFICIENT_DATA"].map((value) => <option key={value} value={value}>{label(value)}</option>)}</select><input className="border border-line px-3 py-2 text-sm" type="number" min="0" max="100" value={minimumScore} onChange={(event) => setMinimumScore(event.target.value)} placeholder="Minimum anomaly score" title="Minimum anomaly score" /><input className="border border-line px-3 py-2 text-sm" type="number" min="0" value={minimumObservationFilter} onChange={(event) => setMinimumObservationFilter(event.target.value)} placeholder="Minimum observation" title="Minimum observation" /><input className="min-w-60 border border-line px-3 py-2 text-sm" value={spbuSearch} onChange={(event) => setSpbuSearch(event.target.value)} placeholder="Search SPBU" /></div>
-                <div className="overflow-x-auto"><table className="w-full border-collapse text-sm"><thead><tr className="border-b border-line bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500"><th className="px-3 py-2">SPBU</th><th className="px-3 py-2">Observations</th><th className="px-3 py-2">Compatible MT</th><th className="px-3 py-2">Used MT</th><th className="px-3 py-2" title="Historically used compatible MT divided by compatible MT.">Utilization Breadth</th><th className="px-3 py-2">Dominant MT</th><th className="px-3 py-2" title="Largest historical P(MT | SPBU).">Dominant Share</th><th className="px-3 py-2" title="Higher HHI means a smaller fleet dominates historical assignments.">HHI</th><th className="px-3 py-2" title="Shannon entropy normalized by the number of historically used MTs; higher means more even usage.">Normalized Entropy</th><th className="px-3 py-2" title="Negative Isolation Forest score_samples value; higher is more unusual within the run.">Raw ML</th><th className="px-3 py-2" title="Raw ML severity min-max scaled to 0–100 within this run; higher means more unusual concentration."><button onClick={() => setScoreDirection((value) => value === "desc" ? "asc" : "desc")}>Anomaly Score {scoreDirection === "desc" ? "↓" : "↑"}</button></th><th className="px-3 py-2">Classification</th></tr></thead><tbody>{filteredConcentration.map((row) => <tr key={row.spbu_id} className="cursor-pointer border-b border-line hover:bg-petrocloud/50" onClick={() => setSelectedConcentration(row)}><td className="px-3 py-2"><div className="font-semibold">{row.spbu_code}</div><div className="text-xs text-slate-500">{row.spbu_name}</div></td><td className="px-3 py-2">{row.shipment_observation_count}</td><td className="px-3 py-2">{row.compatible_mt_count}</td><td className="px-3 py-2">{row.historically_used_mt_count}</td><td className="px-3 py-2">{pct(row.utilization_breadth)}</td><td className="px-3 py-2">{row.dominant_mt_registration ?? "-"}</td><td className="px-3 py-2">{pct(row.dominant_mt_share)}</td><td className="px-3 py-2">{score(row.hhi)}</td><td className="px-3 py-2">{score(row.normalized_entropy)}</td><td className="px-3 py-2">{score(row.raw_ml_anomaly_score)}</td><td className="px-3 py-2 font-semibold">{score(row.concentration_anomaly_score)}</td><td className="px-3 py-2"><span className={`whitespace-nowrap border px-2 py-1 text-xs ${badgeClass(row.concentration_classification)}`}>{label(row.concentration_classification)}</span></td></tr>)}{filteredConcentration.length === 0 && <tr><td colSpan={12} className="px-3 py-8 text-center text-slate-500">No profiles match the active filters.</td></tr>}</tbody></table></div>
+                <div className="overflow-x-auto"><table className="w-full border-collapse text-sm"><thead><tr className="border-b border-line bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500"><th className="px-3 py-2">SPBU</th><th className="px-3 py-2">Observations</th><th className="px-3 py-2">Compatible MT</th><th className="px-3 py-2">Used MT</th><th className="px-3 py-2" title="Historically used compatible MT divided by compatible MT.">Utilization Breadth</th><th className="px-3 py-2">Dominant MT</th><th className="px-3 py-2" title="Largest historical P(MT | SPBU).">Dominant Share</th><th className="px-3 py-2" title="Higher HHI means a smaller fleet dominates historical assignments.">HHI</th><th className="px-3 py-2" title="Shannon entropy normalized by the number of historically used MTs; higher means more even usage.">Normalized Entropy</th><th className="px-3 py-2" title="Negative Isolation Forest score_samples value; higher is more unusual within the run.">Raw ML</th><th className="px-3 py-2" title="Raw ML severity min-max scaled to 0–100 within this run; higher means more unusual concentration."><button onClick={() => setScoreDirection((value) => value === "desc" ? "asc" : "desc")}>Anomaly Score {scoreDirection === "desc" ? "↓" : "↑"}</button></th><th className="px-3 py-2">Classification</th></tr></thead><tbody>{concentrationPageRows.map((row) => <tr key={row.spbu_id} className="cursor-pointer border-b border-line hover:bg-petrocloud/50" onClick={() => setSelectedConcentration(row)}><td className="px-3 py-2"><div className="font-semibold">{row.spbu_code}</div><div className="text-xs text-slate-500">{row.spbu_name}</div></td><td className="px-3 py-2">{row.shipment_observation_count}</td><td className="px-3 py-2">{row.compatible_mt_count}</td><td className="px-3 py-2">{row.historically_used_mt_count}</td><td className="px-3 py-2">{pct(row.utilization_breadth)}</td><td className="px-3 py-2">{row.dominant_mt_registration ?? "-"}</td><td className="px-3 py-2">{pct(row.dominant_mt_share)}</td><td className="px-3 py-2">{score(row.hhi)}</td><td className="px-3 py-2">{score(row.normalized_entropy)}</td><td className="px-3 py-2">{score(row.raw_ml_anomaly_score)}</td><td className="px-3 py-2 font-semibold">{score(row.concentration_anomaly_score)}</td><td className="px-3 py-2"><span className={`whitespace-nowrap border px-2 py-1 text-xs ${badgeClass(row.concentration_classification)}`}>{label(row.concentration_classification)}</span></td></tr>)}{filteredConcentration.length === 0 && <tr><td colSpan={12} className="px-3 py-8 text-center text-slate-500">No profiles match the active filters.</td></tr>}</tbody></table></div>
+                <div className="mt-4 flex flex-col gap-3 border-t border-line pt-4 text-sm sm:flex-row sm:items-center sm:justify-between">
+                  <div className="text-slate-500">Showing {concentrationRangeStart.toLocaleString()}–{concentrationRangeEnd.toLocaleString()} of {filteredConcentration.length.toLocaleString()} SPBUs</div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <label className="inline-flex items-center gap-2 text-slate-500">Rows per page<select className="border border-line bg-white px-3 py-2 text-sm text-petroink" value={concentrationPageSize} onChange={(event) => { setConcentrationPageSize(Number(event.target.value)); setConcentrationPage(0); }} title="Rows per page"><option value={10}>10</option><option value={20}>20</option><option value={50}>50</option></select></label>
+                    <button className="border border-line px-3 py-2 disabled:cursor-not-allowed disabled:opacity-50" onClick={() => setConcentrationPage((current) => Math.max(0, current - 1))} disabled={concentrationPage === 0}>Previous</button>
+                    <span className="min-w-24 text-center text-slate-500">Page {concentrationPage + 1} of {concentrationPageCount}</span>
+                    <button className="border border-line px-3 py-2 disabled:cursor-not-allowed disabled:opacity-50" onClick={() => setConcentrationPage((current) => Math.min(concentrationPageCount - 1, current + 1))} disabled={concentrationPage + 1 >= concentrationPageCount}>Next</button>
+                  </div>
+                </div>
               </section>
             </>
           )}
@@ -597,7 +873,20 @@ export function MachineLearningIntelligencePage({ depots }: { depots: Depot[] })
           <section className="border border-line bg-white p-5">
             <h2 className="font-display text-xl font-semibold">SPBU Behavioral Clustering</h2><p className="mt-1 text-sm text-slate-500">Tag + full shift distribution + Phase 3 co-shipment graph. Clusters describe behavior and never override compatibility.</p>
             <div className="mt-4 grid gap-3 md:grid-cols-2 lg:grid-cols-5"><label className="text-xs font-semibold uppercase tracking-wide text-slate-500">Depot<input className="mt-1 w-full border border-line bg-slate-50 px-3 py-2 text-sm" value={readiness?.depot_name ?? ""} readOnly /></label><label className="text-xs font-semibold uppercase tracking-wide text-slate-500">Training Start Date<input className="mt-1 w-full border border-line px-3 py-2 text-sm" type="date" value={trainingStart} onChange={(event) => setTrainingStart(event.target.value)} /></label><label className="text-xs font-semibold uppercase tracking-wide text-slate-500">Training End Date<input className="mt-1 w-full border border-line px-3 py-2 text-sm" type="date" value={trainingEnd} onChange={(event) => setTrainingEnd(event.target.value)} /></label><label className="text-xs font-semibold uppercase tracking-wide text-slate-500">Minimum Shipment Observation<input className="mt-1 w-full border border-line px-3 py-2 text-sm" type="number" min="1" value={trainingMinimum} onChange={(event) => setTrainingMinimum(event.target.value)} /></label><button className="mt-5 bg-mint px-4 py-2 text-sm font-semibold text-white disabled:opacity-40" disabled={!readiness?.is_ready || engineBLoading || !trainingStart || !trainingEnd} onClick={prepareDataset}>{engineBLoading && !trainingRun ? "Preparing…" : "Prepare Training Dataset"}</button></div>
-            <div className="mt-4 border border-line bg-slate-50 p-4"><div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Shift Definition Snapshot</div><div className="mt-3 grid gap-2 md:grid-cols-2 lg:grid-cols-4">{shiftDefinitions.map((shift, index) => <div className="border border-line bg-white p-3" key={shift.shift_id}><input className="w-full border-b border-line pb-1 text-sm font-semibold" value={shift.name} onChange={(event) => setShiftDefinitions((current) => current.map((row, rowIndex) => rowIndex === index ? { ...row, name: event.target.value } : row))} /><div className="mt-2 flex items-center gap-2"><input className="w-full border border-line p-1 text-xs" type="time" value={shift.start_time} onChange={(event) => setShiftDefinitions((current) => current.map((row, rowIndex) => rowIndex === index ? { ...row, start_time: event.target.value } : row))} /><span>–</span><input className="w-full border border-line p-1 text-xs" type="time" value={shift.end_time} onChange={(event) => setShiftDefinitions((current) => current.map((row, rowIndex) => rowIndex === index ? { ...row, end_time: event.target.value } : row))} /></div></div>)}</div></div>
+            <div className="mt-4 flex flex-col gap-3 border border-line bg-petrocloud/40 p-4 lg:flex-row lg:items-end">
+              <label className="min-w-0 flex-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                Saved Behavioral Model
+                <select className="mt-1 w-full border border-line bg-white px-3 py-2 text-sm text-petroink" value={selectedClusteringModelId} onChange={(event) => setSelectedClusteringModelId(event.target.value)} disabled={registryLoading || models.length === 0} title="Select a saved Behavioral Clustering model">
+                  <option value="">{registryLoading ? "Loading saved models…" : models.length ? "Select saved model" : "No saved model for this depot"}</option>
+                  {models.map((model) => <option value={model.model_id} key={model.model_id}>{model.model_name} v{model.model_version} · {label(model.model_status)} · {model.training_start_date}–{model.training_end_date}</option>)}
+                </select>
+              </label>
+              <button className="inline-flex items-center justify-center gap-2 bg-petroblue px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-40" onClick={openClusteringModel} disabled={!selectedClusteringModelId || clusteringModelLoading}>
+                <Eye size={16} /> {clusteringModelLoading ? "Opening…" : "Open Saved Model"}
+              </button>
+              <p className="max-w-md text-xs leading-5 text-slate-500">Display stored clusters, UMAP, geographic positions, profiles, and membership without preparing or retraining a dataset.</p>
+            </div>
+            <div className="mt-4 border border-line bg-slate-50 p-4"><div className="flex items-center justify-between gap-3"><div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Shift Definition Snapshot</div>{displayedSavedModel && <span className="text-xs text-petroblue">Stored with opened model</span>}</div><div className="mt-3 grid gap-2 md:grid-cols-2 lg:grid-cols-4">{displayedShiftDefinitions.map((shift, index) => <div className="border border-line bg-white p-3" key={shift.shift_id}><input className="w-full border-b border-line pb-1 text-sm font-semibold disabled:bg-white" value={shift.name} disabled={Boolean(displayedSavedModel)} onChange={(event) => setShiftDefinitions((current) => current.map((row, rowIndex) => rowIndex === index ? { ...row, name: event.target.value } : row))} /><div className="mt-2 flex items-center gap-2"><input className="w-full border border-line p-1 text-xs disabled:bg-white" type="time" value={shift.start_time} disabled={Boolean(displayedSavedModel)} onChange={(event) => setShiftDefinitions((current) => current.map((row, rowIndex) => rowIndex === index ? { ...row, start_time: event.target.value } : row))} /><span>–</span><input className="w-full border border-line p-1 text-xs disabled:bg-white" type="time" value={shift.end_time} disabled={Boolean(displayedSavedModel)} onChange={(event) => setShiftDefinitions((current) => current.map((row, rowIndex) => rowIndex === index ? { ...row, end_time: event.target.value } : row))} /></div></div>)}</div></div>
           </section>
 
           {trainingRun && <section className="border border-line bg-white p-5"><div className="flex items-center justify-between"><div><div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Training Dataset</div><h3 className="mt-1 text-lg font-semibold">{trainingRun.status === "DATASET_READY" ? "Dataset Ready for Validation" : label(trainingRun.status)}</h3></div><span className={`border px-3 py-1 text-xs font-semibold ${badgeClass(trainingRun.status)}`}>{label(trainingRun.status)}</span></div><div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-5"><Metric title="Shipments" value={trainingRun.dataset_summary.shipment_count ?? 0} /><Metric title="SPBU in Period" value={trainingRun.dataset_summary.spbu_count ?? 0} /><Metric title="Sufficient History" value={trainingRun.dataset_summary.sufficient_history_spbu_count ?? 0} /><Metric title="Excluded" value={trainingRun.dataset_summary.excluded_insufficient_data_spbu_count ?? 0} /><Metric title="Pairing Edges" value={trainingRun.dataset_summary.pairing_edge_count ?? 0} /></div>
@@ -606,7 +895,10 @@ export function MachineLearningIntelligencePage({ depots }: { depots: Depot[] })
             {!trainedResult && <div className="mt-4 flex gap-2"><button className="inline-flex items-center gap-2 bg-petroblue px-4 py-2 text-sm font-semibold text-white disabled:opacity-40" onClick={trainModel} disabled={engineBLoading || Math.abs(weightTotal - 1) > 0.000001}><Play size={16} /> {engineBLoading ? "Training…" : "Train Model"}</button><button className="border border-line px-4 py-2 text-sm" onClick={() => setTrainingRun(null)}>Discard Dataset</button></div>}
           </section>}
 
-          {trainedResult && <><section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5"><Metric title="Training SPBU" value={trainedResult.summary.training_spbu_count} /><Metric title="Clusters" value={trainedResult.summary.cluster_count} /><Metric title="Clustered SPBU" value={trainedResult.summary.clustered_spbu_count} /><Metric title="Noise / Unique Pattern" value={trainedResult.summary.noise_spbu_count} hint="Not an error; these SPBUs do not strongly match a discovered cluster." /><Metric title="Average Membership" value={pct(trainedResult.summary.average_membership_probability)} /></section>{trainedResult.warnings.map((warning) => <div key={warning} className="border border-amber bg-amber/5 px-4 py-3 text-sm text-amber">{warning}</div>)}<section className="grid gap-4 lg:grid-cols-2"><div className="border border-line bg-white p-4"><h3 className="text-sm font-semibold uppercase tracking-wide text-slate-600">UMAP Cluster Map</h3><ReactECharts style={{ height: 420 }} option={{ tooltip: { formatter: (params: { data: { name: string; value: number[]; detail: Assignment } }) => `${params.data.name}<br/>${params.data.detail.cluster_label}<br/>Membership: ${pct(params.data.detail.membership_probability)}<br/>${params.data.detail.dominant_shift}<br/>${params.data.detail.key_tags.slice(0, 3).join(", ")}` }, xAxis: { show: false }, yAxis: { show: false }, series: Array.from(new Set(trainedResult.assignments.map((row) => row.cluster_label))).map((clusterLabel) => ({ name: clusterLabel, type: "scatter", symbolSize: 11, data: trainedResult.assignments.filter((row) => row.cluster_label === clusterLabel).map((row) => ({ name: row.spbu_code, value: [row.visualization_x, row.visualization_y], detail: row })) })) }} /></div><div className="border border-line bg-white p-4"><h3 className="text-sm font-semibold uppercase tracking-wide text-slate-600">Cluster Profiles</h3><div className="mt-3 max-h-[420px] space-y-3 overflow-y-auto">{trainedResult.cluster_profiles.map((profile) => <button className="w-full border border-line p-3 text-left hover:bg-petrocloud" key={profile.cluster_id} onClick={() => setSelectedCluster(profile)}><div className="flex items-center justify-between"><span className="font-semibold">{profile.cluster_label}</span><span className="text-sm">{profile.cluster_size} members</span></div><div className="mt-2 text-sm text-slate-600">Dominant shift: {profile.dominant_shift}</div><div className="mt-1 text-xs text-slate-500">{profile.common_tags.slice(0, 3).map((tag) => tag.tag).join(" · ") || "No tag shared by at least 50% of members"}</div><div className="mt-1 text-xs text-slate-500">Average membership {pct(profile.average_membership_probability)} · {profile.low_confidence_member_count} low-confidence</div></button>)}</div></div></section><section className="border border-line bg-white p-4"><h3 className="text-sm font-semibold uppercase tracking-wide text-slate-600">Cluster Membership</h3><div className="mt-3 overflow-x-auto"><table className="w-full text-sm"><thead><tr className="border-b border-line bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500"><th className="px-3 py-2">SPBU</th><th className="px-3 py-2">Cluster</th><th className="px-3 py-2" title="HDBSCAN confidence that the SPBU belongs in its cluster.">Membership Probability</th><th className="px-3 py-2" title="Not an error; may represent a unique operational pattern.">Noise / Outlier</th><th className="px-3 py-2">Dominant Shift</th><th className="px-3 py-2">Key Tags</th></tr></thead><tbody>{trainedResult.assignments.map((row) => <tr className="border-b border-line" key={row.spbu_id}><td className="px-3 py-2"><div className="font-semibold">{row.spbu_code}</div><div className="text-xs text-slate-500">{row.spbu_name}</div></td><td className="px-3 py-2">{row.cluster_label}</td><td className="px-3 py-2">{pct(row.membership_probability)}</td><td className="px-3 py-2">{row.is_noise ? "Yes" : "No"}</td><td className="px-3 py-2">{row.dominant_shift}</td><td className="max-w-72 px-3 py-2 text-xs">{row.key_tags.slice(0, 4).join(", ") || "-"}</td></tr>)}</tbody></table></div><div className="mt-4 flex flex-wrap gap-2"><button className="inline-flex items-center gap-2 bg-mint px-4 py-2 text-sm font-semibold text-white" onClick={() => setSaveDialog(true)}><Save size={16} /> Save Model</button><button className="border border-line px-4 py-2 text-sm" onClick={() => setTrainingRun(null)}>Discard Result</button><button className="border border-line px-4 py-2 text-sm" onClick={() => setTrainingRun((current) => current ? { ...current, result: {} } : current)}>Adjust Parameters & Retrain</button></div></section></>}
+          {displayedClusterResult && <>
+            {displayedSavedModel && <section className="flex flex-col gap-3 border border-petroblue bg-petrocloud/50 p-4 sm:flex-row sm:items-center sm:justify-between"><div><div className="text-xs font-semibold uppercase tracking-wide text-petroblue">Opened Saved Model</div><div className="mt-1 flex flex-wrap items-center gap-2"><h3 className="text-lg font-semibold">{displayedSavedModel.model_name} v{displayedSavedModel.model_version}</h3><span className={`border px-2 py-1 text-xs ${badgeClass(displayedSavedModel.model_status)}`}>{label(displayedSavedModel.model_status)}</span></div><p className="mt-1 text-sm text-slate-500">Training period {displayedSavedModel.training_start_date} – {displayedSavedModel.training_end_date} · {displayedSavedModel.algorithm_version}</p></div><button className="border border-line bg-white px-4 py-2 text-sm" onClick={() => { setDisplayedSavedModel(null); setSelectedCluster(null); }}>Close Saved Model</button></section>}
+            <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5"><Metric title="Training SPBU" value={displayedClusterResult.summary.training_spbu_count} /><Metric title="Clusters" value={displayedClusterResult.summary.cluster_count} /><Metric title="Clustered SPBU" value={displayedClusterResult.summary.clustered_spbu_count} /><Metric title="Noise / Unique Pattern" value={displayedClusterResult.summary.noise_spbu_count} hint="Not an error; these SPBUs do not strongly match a discovered cluster." /><Metric title="Average Membership" value={pct(displayedClusterResult.summary.average_membership_probability)} /></section>{displayedClusterResult.warnings.map((warning) => <div key={warning} className="border border-amber bg-amber/5 px-4 py-3 text-sm text-amber">{warning}</div>)}<section className="grid gap-4 lg:grid-cols-2"><div className="border border-line bg-white p-4"><h3 className="text-sm font-semibold uppercase tracking-wide text-slate-600">UMAP Cluster Map</h3><ReactECharts style={{ height: 420 }} option={{ color: behavioralClusterLabels.map((clusterLabel) => clusterColor(clusterLabel, behavioralClusterLabels)), tooltip: { formatter: (params: { data: { name: string; value: number[]; detail: Assignment } }) => `${params.data.name}<br/>${params.data.detail.cluster_label}<br/>Membership: ${pct(params.data.detail.membership_probability)}<br/>${params.data.detail.dominant_shift}<br/>${params.data.detail.key_tags.slice(0, 3).join(", ")}` }, xAxis: { show: false }, yAxis: { show: false }, series: behavioralClusterLabels.map((clusterLabel) => ({ name: clusterLabel, type: "scatter", symbolSize: 11, data: displayedClusterResult.assignments.filter((row) => row.cluster_label === clusterLabel).map((row) => ({ name: row.spbu_code, value: [row.visualization_x, row.visualization_y], detail: row })) })) }} /></div><div className="border border-line bg-white p-4"><h3 className="text-sm font-semibold uppercase tracking-wide text-slate-600">Cluster Profiles</h3><div className="mt-3 max-h-[420px] space-y-3 overflow-y-auto">{displayedClusterResult.cluster_profiles.map((profile) => <button className="w-full border border-line p-3 text-left hover:bg-petrocloud" key={profile.cluster_id} onClick={() => setSelectedCluster(profile)}><div className="flex items-center justify-between"><span className="font-semibold">{profile.cluster_label}</span><span className="text-sm">{profile.cluster_size} members</span></div><div className="mt-2 text-sm text-slate-600">Dominant shift: {profile.dominant_shift}</div><div className="mt-1 text-xs text-slate-500">{profile.common_tags.slice(0, 3).map((tag) => tag.tag).join(" · ") || "No tag shared by at least 50% of members"}</div><div className="mt-1 text-xs text-slate-500">Average membership {pct(profile.average_membership_probability)} · {profile.low_confidence_member_count} low-confidence</div></button>)}</div></div><GeographicClusterMap assignments={displayedClusterResult.assignments} depot={geographicDepot} /></section><section className="border border-line bg-white p-4"><h3 className="text-sm font-semibold uppercase tracking-wide text-slate-600">Cluster Membership</h3><div className="mt-3 overflow-x-auto"><table className="w-full text-sm"><thead><tr className="border-b border-line bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500"><th className="px-3 py-2">SPBU</th><th className="px-3 py-2">Cluster</th><th className="px-3 py-2" title="HDBSCAN confidence that the SPBU belongs in its cluster.">Membership Probability</th><th className="px-3 py-2" title="Not an error; may represent a unique operational pattern.">Noise / Outlier</th><th className="px-3 py-2">Dominant Shift</th><th className="px-3 py-2">Key Tags</th></tr></thead><tbody>{clusterMembershipPageRows.map((row) => <tr className="border-b border-line" key={row.spbu_id}><td className="px-3 py-2"><div className="font-semibold">{row.spbu_code}</div><div className="text-xs text-slate-500">{row.spbu_name}</div></td><td className="px-3 py-2">{row.cluster_label}</td><td className="px-3 py-2">{pct(row.membership_probability)}</td><td className="px-3 py-2">{row.is_noise ? "Yes" : "No"}</td><td className="px-3 py-2">{row.dominant_shift}</td><td className="max-w-72 px-3 py-2 text-xs">{row.key_tags.slice(0, 4).join(", ") || "-"}</td></tr>)}</tbody></table></div><div className="mt-4 flex flex-col gap-3 border-t border-line pt-4 text-sm sm:flex-row sm:items-center sm:justify-between"><div className="text-slate-500">Showing {clusterMembershipRangeStart.toLocaleString()}–{clusterMembershipRangeEnd.toLocaleString()} of {clusterMembershipAssignments.length.toLocaleString()} SPBUs</div><div className="flex flex-wrap items-center gap-2"><label className="inline-flex items-center gap-2 text-slate-500">Rows per page<select className="border border-line bg-white px-3 py-2 text-sm text-petroink" value={clusterMembershipPageSize} onChange={(event) => { setClusterMembershipPageSize(Number(event.target.value)); setClusterMembershipPage(0); }} title="Cluster membership rows per page"><option value={10}>10</option><option value={20}>20</option><option value={50}>50</option></select></label><button className="border border-line px-3 py-2 disabled:cursor-not-allowed disabled:opacity-50" onClick={() => setClusterMembershipPage((current) => Math.max(0, current - 1))} disabled={clusterMembershipSafePage === 0}>Previous</button><span className="min-w-24 text-center text-slate-500">Page {clusterMembershipSafePage + 1} of {clusterMembershipPageCount}</span><button className="border border-line px-3 py-2 disabled:cursor-not-allowed disabled:opacity-50" onClick={() => setClusterMembershipPage((current) => Math.min(clusterMembershipPageCount - 1, current + 1))} disabled={clusterMembershipSafePage + 1 >= clusterMembershipPageCount}>Next</button></div></div>{displayedSavedModel ? <div className="mt-4 flex flex-wrap gap-2"><button className="border border-line px-4 py-2 text-sm" onClick={() => { setOpenedModel(displayedSavedModel); setTab("registry"); }}>View Registry Details</button><button className="border border-line px-4 py-2 text-sm" onClick={() => { setDisplayedSavedModel(null); setSelectedCluster(null); }}>Close Saved Model</button></div> : <div className="mt-4 flex flex-wrap gap-2"><button className="inline-flex items-center gap-2 bg-mint px-4 py-2 text-sm font-semibold text-white" onClick={() => setSaveDialog(true)}><Save size={16} /> Save Model</button><button className="border border-line px-4 py-2 text-sm" onClick={() => setTrainingRun(null)}>Discard Result</button><button className="border border-line px-4 py-2 text-sm" onClick={() => setTrainingRun((current) => current ? { ...current, result: {} } : current)}>Adjust Parameters & Retrain</button></div>}</section>
+          </>}
         </>
       )}
 
@@ -615,7 +907,7 @@ export function MachineLearningIntelligencePage({ depots }: { depots: Depot[] })
 
       {selectedConcentration && <div className="fixed inset-0 z-50 flex justify-end bg-slate-900/35"><div className="h-full w-full max-w-3xl overflow-y-auto bg-white p-5 shadow-xl"><div className="flex items-start justify-between"><div><div className="text-xs font-semibold uppercase tracking-wide text-slate-500">SPBU Concentration Detail</div><h2 className="mt-1 text-xl font-semibold">{selectedConcentration.spbu_code} · {selectedConcentration.spbu_name}</h2><p className="mt-1 text-sm text-slate-500">Baseline {concentrationRun?.baseline_start_date} – {concentrationRun?.baseline_end_date}</p></div><button className="border border-line p-2" onClick={() => setSelectedConcentration(null)}><X size={17} /></button></div><div className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-4"><Metric title="Compatible MT" value={selectedConcentration.compatible_mt_count} /><Metric title="Historically Used" value={selectedConcentration.historically_used_mt_count} /><Metric title="Dominant Share" value={pct(selectedConcentration.dominant_mt_share)} /><Metric title="Anomaly Score" value={score(selectedConcentration.concentration_anomaly_score)} /><Metric title="Utilization Breadth" value={pct(selectedConcentration.utilization_breadth)} /><Metric title="HHI" value={score(selectedConcentration.hhi)} /><Metric title="Entropy" value={score(selectedConcentration.entropy)} /><Metric title="Normalized Entropy" value={score(selectedConcentration.normalized_entropy)} /></div><div className="mt-5 border border-line p-4"><h3 className="text-sm font-semibold uppercase tracking-wide text-slate-600">Historical MT Distribution</h3><ReactECharts style={{ height: 320 }} option={{ grid: { left: 60, right: 20, bottom: 80 }, xAxis: { type: "category", data: selectedConcentration.mt_distribution.filter((row) => row.historically_used).map((row) => row.mt_registration), axisLabel: { rotate: 45 } }, yAxis: { type: "value", name: "Shipment count" }, tooltip: { trigger: "axis" }, series: [{ type: "bar", data: selectedConcentration.mt_distribution.filter((row) => row.historically_used).map((row) => row.shipment_count) }] }} /></div><div className="mt-5 border border-line p-4"><h3 className="text-sm font-semibold uppercase tracking-wide text-slate-600">Peer Context</h3><div className="mt-3 grid grid-cols-2 gap-3 text-sm">{Object.entries(selectedConcentration.peer_statistics).map(([key, value]) => <div key={key}><span className="text-slate-500">{label(key)}:</span> <span className="font-semibold">{String(value)}</span></div>)}</div></div><div className="mt-5 border border-line p-4"><h3 className="text-sm font-semibold uppercase tracking-wide text-slate-600">Compatible but Historically Unused MT</h3><div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">{selectedConcentration.mt_distribution.filter((row) => !row.historically_used).map((row) => <div className="border border-line px-3 py-2 text-sm" key={row.mt_id}>{row.mt_registration}</div>)}{selectedConcentration.mt_distribution.every((row) => row.historically_used) && <div className="text-sm text-slate-500">Every compatible MT was historically used.</div>}</div></div></div></div>}
 
-      {selectedCluster && <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/35 p-4"><div className="max-h-[90vh] w-full max-w-3xl overflow-y-auto bg-white p-5 shadow-xl"><div className="flex justify-between"><div><div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Cluster Detail</div><h2 className="mt-1 text-xl font-semibold">{selectedCluster.cluster_label}</h2></div><button className="border border-line p-2" onClick={() => setSelectedCluster(null)}><X size={17} /></button></div><div className="mt-4 grid gap-3 sm:grid-cols-3"><Metric title="Members" value={selectedCluster.cluster_size} /><Metric title="Average Membership" value={pct(selectedCluster.average_membership_probability)} /><Metric title="Low Confidence" value={selectedCluster.low_confidence_member_count} /></div><div className="mt-4 grid gap-4 lg:grid-cols-2"><div className="border border-line p-4"><h3 className="font-semibold">Tag Profile</h3><div className="mt-2 space-y-2 text-sm">{selectedCluster.common_tags.map((tag) => <div key={tag.tag}>{tag.tag} · {pct(tag.member_share)}</div>)}</div></div><div className="border border-line p-4"><h3 className="font-semibold">Shift Profile</h3><div className="mt-2 space-y-2 text-sm">{selectedCluster.shift_distribution.map((shift) => <div key={shift.shift_id}>{shift.shift_name} · {pct(shift.share)}</div>)}</div></div></div><div className="mt-4 border border-line p-4"><h3 className="font-semibold">Member SPBUs</h3><div className="mt-2 grid gap-2 sm:grid-cols-2">{trainedResult?.assignments.filter((assignment) => assignment.cluster_id === selectedCluster.cluster_id && !assignment.is_noise).map((assignment) => <div className="border border-line px-3 py-2 text-sm" key={assignment.spbu_id}><span className="font-semibold">{assignment.spbu_code}</span> · {assignment.spbu_name}</div>)}</div></div><div className="mt-4 border border-line p-4"><h3 className="font-semibold">Top Internal Pairings</h3><div className="mt-2 space-y-2 text-sm">{selectedCluster.top_internal_pairings.map((pair) => <div key={`${pair.spbu_a_code}-${pair.spbu_b_code}`}>{pair.spbu_a_code} ↔ {pair.spbu_b_code} · {pair.pair_count} shipments · strength {pct(pair.pairing_strength)}</div>)}{selectedCluster.top_internal_pairings.length === 0 && <div className="text-slate-500">No internal co-shipment edges.</div>}</div></div></div></div>}
+      {selectedCluster && <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/35 p-4"><div className="max-h-[90vh] w-full max-w-3xl overflow-y-auto bg-white p-5 shadow-xl"><div className="flex justify-between"><div><div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Cluster Detail</div><h2 className="mt-1 text-xl font-semibold">{selectedCluster.cluster_label}</h2></div><button className="border border-line p-2" onClick={() => setSelectedCluster(null)}><X size={17} /></button></div><div className="mt-4 grid gap-3 sm:grid-cols-3"><Metric title="Members" value={selectedCluster.cluster_size} /><Metric title="Average Membership" value={pct(selectedCluster.average_membership_probability)} /><Metric title="Low Confidence" value={selectedCluster.low_confidence_member_count} /></div><div className="mt-4 grid gap-4 lg:grid-cols-2"><div className="border border-line p-4"><h3 className="font-semibold">Tag Profile</h3><div className="mt-2 space-y-2 text-sm">{selectedCluster.common_tags.map((tag) => <div key={tag.tag}>{tag.tag} · {pct(tag.member_share)}</div>)}</div></div><div className="border border-line p-4"><h3 className="font-semibold">Shift Profile</h3><div className="mt-2 space-y-2 text-sm">{selectedCluster.shift_distribution.map((shift) => <div key={shift.shift_id}>{shift.shift_name} · {pct(shift.share)}</div>)}</div></div></div><div className="mt-4 border border-line p-4"><h3 className="font-semibold">Member SPBUs</h3><div className="mt-2 grid gap-2 sm:grid-cols-2">{displayedClusterResult?.assignments.filter((assignment) => assignment.cluster_id === selectedCluster.cluster_id && !assignment.is_noise).map((assignment) => <div className="border border-line px-3 py-2 text-sm" key={assignment.spbu_id}><span className="font-semibold">{assignment.spbu_code}</span> · {assignment.spbu_name}</div>)}</div></div><div className="mt-4 border border-line p-4"><h3 className="font-semibold">Top Internal Pairings</h3><div className="mt-2 space-y-2 text-sm">{selectedCluster.top_internal_pairings.map((pair) => <div key={`${pair.spbu_a_code}-${pair.spbu_b_code}`}>{pair.spbu_a_code} ↔ {pair.spbu_b_code} · {pair.pair_count} shipments · strength {pct(pair.pairing_strength)}</div>)}{selectedCluster.top_internal_pairings.length === 0 && <div className="text-slate-500">No internal co-shipment edges.</div>}</div></div></div></div>}
 
       {saveDialog && <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/35 p-4"><div className="w-full max-w-lg bg-white p-5 shadow-xl"><div className="flex justify-between"><h2 className="text-lg font-semibold">Save Behavioral Model</h2><button onClick={() => setSaveDialog(false)}><X size={17} /></button></div><label className="mt-4 block text-xs font-semibold uppercase tracking-wide text-slate-500">Model Name *<input className="mt-1 w-full border border-line px-3 py-2 text-sm" value={modelName} onChange={(event) => setModelName(event.target.value)} placeholder="Balongan Behavioral Cluster 2025" /></label><label className="mt-3 block text-xs font-semibold uppercase tracking-wide text-slate-500">Description<textarea className="mt-1 w-full border border-line px-3 py-2 text-sm" rows={4} value={modelDescription} onChange={(event) => setModelDescription(event.target.value)} /></label><div className="mt-4 flex justify-end gap-2"><button className="border border-line px-4 py-2 text-sm" onClick={() => setSaveDialog(false)}>Cancel</button><button className="bg-mint px-4 py-2 text-sm font-semibold text-white disabled:opacity-40" disabled={!modelName.trim() || engineBLoading} onClick={saveModel}>{engineBLoading ? "Saving…" : "Save Model"}</button></div></div></div>}
 

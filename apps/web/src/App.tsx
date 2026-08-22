@@ -7,6 +7,7 @@ import { ChartPanel } from "./components/ChartPanel";
 import { AffinityIntelligencePage } from "./components/AffinityIntelligencePage";
 import { MachineLearningIntelligencePage } from "./components/MachineLearningIntelligencePage";
 import { PredictionAssignmentPage } from "./components/PredictionAssignmentPage";
+import { GoogleMapsIntegrationPage } from "./components/GoogleMapsIntegrationPage";
 
 type Overview = Record<string, number>;
 type Charts = Record<string, SeriesPoint[]>;
@@ -74,7 +75,7 @@ type CrudDomainConfig = {
   depotFilter?: boolean;
   statusFilter?: boolean;
 };
-type Page = "dashboard" | "master-data" | "tag-consistency" | "departure-intelligence" | "pairing-intelligence" | "affinity-intelligence" | "machine-learning-intelligence" | "prediction-assignment";
+type Page = "dashboard" | "master-data" | "tag-consistency" | "departure-intelligence" | "pairing-intelligence" | "affinity-intelligence" | "machine-learning-intelligence" | "prediction-assignment" | "google-maps-integration";
 type CrudPageSize = 10 | 50 | 100 | "ALL";
 type CrudSortDirection = "asc" | "desc";
 type CrudModalMode = "add" | "edit" | null;
@@ -466,7 +467,7 @@ function crudConfigs(depots: Depot[], tagTypes: TagType[]): Record<string, CrudD
       idKey: "mt_id",
       titleKey: "vehicle_registration",
       depotFilter: true,
-      columns: ["vehicle_registration", "vehicle_name_raw", "capacity_label", "number_of_compartments", ...mtTagColumns, "active_status"],
+      columns: ["vehicle_registration", "vehicle_name_raw", "capacity_label", "number_of_compartments", "large_vehicle_profile_status", ...mtTagColumns, "active_status"],
       fields: [
         { key: "vehicle_name_raw", label: "Raw Name", required: true },
         { key: "vehicle_registration", label: "Registration" },
@@ -474,6 +475,12 @@ function crudConfigs(depots: Depot[], tagTypes: TagType[]): Record<string, CrudD
         { key: "vehicle_type_tag", label: "Tag Vehicle Class", kind: "number" },
         ...editableTagFields,
         { key: "number_of_compartments", label: "Compartments", kind: "number" },
+        { key: "vehicle_height_mm", label: "Vehicle Height (mm)", kind: "number" },
+        { key: "vehicle_width_mm", label: "Vehicle Width (mm)", kind: "number" },
+        { key: "vehicle_length_mm", label: "Vehicle Length (mm)", kind: "number" },
+        { key: "vehicle_weight_kg", label: "Vehicle Weight (kg)", kind: "number" },
+        { key: "vehicle_axle_count", label: "Axle Count", kind: "number" },
+        { key: "hazmat_category", label: "Hazardous Goods Categories", kind: "textarea" },
         { key: "depot_id", label: "Depot", kind: "select", options: depotOptions },
         { key: "assignee", label: "Assignee" },
         { key: "active_status", label: "Status", kind: "select", options: statusOptions }
@@ -526,7 +533,7 @@ function crudConfigs(depots: Depot[], tagTypes: TagType[]): Record<string, CrudD
       label: "Depot",
       idKey: "depot_id",
       titleKey: "depot_name",
-      columns: ["depot_code", "depot_name", "region", "timezone", "active_status"],
+      columns: ["depot_code", "depot_name", "latitude", "longitude", "region", "timezone", "active_status"],
       fields: [
         { key: "depot_code", label: "Depot Code" },
         { key: "depot_name", label: "Depot Name", required: true },
@@ -700,6 +707,7 @@ function pageFromPath(pathname: string): Page {
   if (pathname === "/affinity-intelligence") return "affinity-intelligence";
   if (pathname === "/machine-learning-intelligence") return "machine-learning-intelligence";
   if (pathname === "/prediction-assignment") return "prediction-assignment";
+  if (pathname === "/settings/google-maps-integration") return "google-maps-integration";
   return "dashboard";
 }
 
@@ -972,6 +980,22 @@ function crudValuesFromRow(row: Record<string, unknown>, config: CrudDomainConfi
   return Object.fromEntries(config.fields.map((field) => [field.key, row[field.key] ?? (field.kind === "checkbox" ? false : "")]));
 }
 
+function initialTagConsistencyFilters(): TagConsistencyFilters {
+  const params = new URLSearchParams(window.location.search);
+  return {
+    startDate: params.get("start_date") ?? "",
+    endDate: params.get("end_date") ?? "",
+    depotId: params.get("depot_id") ?? "ALL",
+    spbu: params.get("spbu") ?? "",
+    vehicle: params.get("vehicle") ?? "",
+    tagType: params.get("tag_type") ?? "ALL",
+    status: params.get("overall_status") ?? "ALL",
+    productId: params.get("product_id") ?? "",
+    vehicleClass: params.get("vehicle_class") ?? "",
+    search: params.get("search") ?? ""
+  };
+}
+
 function App() {
   const [currentPage, setCurrentPage] = useState<Page>(() => pageFromPath(window.location.pathname));
   const [overview, setOverview] = useState<Overview>({});
@@ -1008,18 +1032,7 @@ function App() {
   const [selectedCrudIds, setSelectedCrudIds] = useState<Set<string>>(() => new Set());
   const [crudLoading, setCrudLoading] = useState(false);
   const [crudSyncing, setCrudSyncing] = useState(false);
-  const [tagFilters, setTagFilters] = useState<TagConsistencyFilters>({
-    startDate: "",
-    endDate: "",
-    depotId: "ALL",
-    spbu: "",
-    vehicle: "",
-    tagType: "ALL",
-    status: "ALL",
-    productId: "",
-    vehicleClass: "",
-    search: ""
-  });
+  const [tagFilters, setTagFilters] = useState<TagConsistencyFilters>(initialTagConsistencyFilters);
   const [tagAnalysis, setTagAnalysis] = useState<TagConsistencyResponse | null>(null);
   const [tagLoading, setTagLoading] = useState(false);
   const [tagOffset, setTagOffset] = useState(0);
@@ -1620,7 +1633,11 @@ function App() {
     const boundaryData = (shiftAnalysis?.shift_config ?? [])
       .flatMap((shift) => [shift.start_minute, shift.start_minute + 1440])
       .filter((minute) => minute > yMin && minute < yMax)
-      .map((minute) => ({ yAxis: minute, label: { formatter: shiftedMinuteAxisLabel(minute) } }));
+      .map((minute) => ({
+        yAxis: minute,
+        label: { formatter: shiftedMinuteAxisLabel(minute), color: "#b91c1c", fontWeight: 700 },
+        lineStyle: { color: "#dc2626", type: "dashed", width: 2.5 }
+      }));
     return {
       tooltip: {
         trigger: "item",
@@ -1641,7 +1658,13 @@ function App() {
           data,
           itemStyle: { color: "#dfe9e6", borderColor: "#2f7d6d" },
           markLine: boundaryData.length
-            ? { silent: true, symbol: "none", lineStyle: { color: "#94a3b8", type: "dashed", width: 1 }, data: boundaryData }
+            ? {
+                silent: true,
+                symbol: "none",
+                label: { color: "#b91c1c", fontWeight: 700 },
+                lineStyle: { color: "#dc2626", type: "dashed", width: 2.5 },
+                data: boundaryData
+              }
             : undefined
         }
       ]
@@ -2133,6 +2156,8 @@ function App() {
                   ? "/machine-learning-intelligence"
                   : page === "prediction-assignment"
                     ? "/prediction-assignment"
+                    : page === "google-maps-integration"
+                      ? "/settings/google-maps-integration"
               : "/";
     if (window.location.pathname !== path) {
       window.history.pushState({}, "", path);
@@ -2171,7 +2196,9 @@ function App() {
                         : currentPage === "machine-learning-intelligence"
                           ? "Phase 5 historical concentration anomaly detection and SPBU behavioral clustering."
                           : currentPage === "prediction-assignment"
-                            ? "Phase 6 shipment prediction and globally optimized MT assignment."
+                            ? "Phase 6 time-aware shipment prediction, rolling multi-trip MT assignment, and availability estimates."
+                            : currentPage === "google-maps-integration"
+                              ? "Secure Google Routes integration, truck-routing capability, fallback, cache, and cycle-time settings."
                   : "Data Foundation Overview"}
             </p>
           </div>
@@ -2199,6 +2226,9 @@ function App() {
             </button>
             <button className={pageNavButtonClass("prediction-assignment")} onClick={() => navigate("prediction-assignment")} title="Open Phase 6 Prediction and Assignment">
               Phase 6 - Prediction & Assignment
+            </button>
+            <button className={pageNavButtonClass("google-maps-integration")} onClick={() => navigate("google-maps-integration")} title="Open Google Maps Integration settings">
+              Settings - Google Maps
             </button>
           </div>
         </div>
@@ -2271,6 +2301,10 @@ function App() {
 
         {currentPage === "prediction-assignment" && (
           <PredictionAssignmentPage depots={depots} />
+        )}
+
+        {currentPage === "google-maps-integration" && (
+          <GoogleMapsIntegrationPage depots={depots} />
         )}
 
         {currentPage === "pairing-intelligence" && (

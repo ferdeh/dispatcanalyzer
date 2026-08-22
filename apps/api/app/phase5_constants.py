@@ -2,7 +2,7 @@ from __future__ import annotations
 
 
 CONCENTRATION_ALGORITHM_VERSION = "phase5.concentration.iforest.v1"
-BEHAVIORAL_ALGORITHM_VERSION = "phase5.behavioral.n2v_umap_hdbscan.v1"
+BEHAVIORAL_ALGORITHM_VERSION = "phase5.behavioral.portable_n2v_umap_hdbscan.v2"
 DEFAULT_MINIMUM_OBSERVATIONS = 10
 
 CONCENTRATION_CLASSIFICATION_THRESHOLDS = {

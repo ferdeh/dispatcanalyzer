@@ -230,11 +230,22 @@ def get_behavioral_model(db: Session, model_id: str) -> dict:
                 "spbu_id": assignment.spbu_id,
                 "spbu_code": spbus[assignment.spbu_id].spbu_code if assignment.spbu_id in spbus else assignment.spbu_id,
                 "spbu_name": spbus[assignment.spbu_id].spbu_name if assignment.spbu_id in spbus else None,
+                "latitude": (
+                    float(spbus[assignment.spbu_id].latitude)
+                    if assignment.spbu_id in spbus and spbus[assignment.spbu_id].latitude is not None
+                    else None
+                ),
+                "longitude": (
+                    float(spbus[assignment.spbu_id].longitude)
+                    if assignment.spbu_id in spbus and spbus[assignment.spbu_id].longitude is not None
+                    else None
+                ),
                 "cluster_id": assignment.cluster_id,
                 "cluster_label": assignment.cluster_label,
                 "membership_probability": assignment.membership_probability,
                 "is_noise": assignment.is_noise,
                 "dominant_shift": assignment.dominant_shift,
+                "vehicle_class": spbus[assignment.spbu_id].vehicle_type_tag if assignment.spbu_id in spbus else None,
                 "key_tags": assignment.key_tags,
                 "visualization_x": assignment.visualization_x,
                 "visualization_y": assignment.visualization_y,

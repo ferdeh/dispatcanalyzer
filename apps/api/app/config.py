@@ -13,6 +13,9 @@ class Settings(BaseSettings):
     minimum_gps_dwell_minutes: float = 5.0
     minimum_gps_event_count: int = 2
     ml_artifact_dir: Path = Path("./ml_artifacts")
+    google_routes_encryption_key: str | None = None
+    google_routes_request_timeout_seconds: float = 8.0
+    google_routes_max_retries: int = 2
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

@@ -1,7 +1,7 @@
 import ReactECharts from "echarts-for-react";
-import { ChevronDown, ChevronRight, Download, Eye, FileCheck2, Play, RefreshCw, Split, Upload, XCircle } from "lucide-react";
+import { ChevronDown, ChevronRight, Download, Eye, FileCheck2, Play, RefreshCw, Sparkles, Split, Upload, XCircle } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
-import { apiForm, apiGet, apiSend, downloadFormFromApi, downloadFromApi } from "../lib/api";
+import { apiFile, apiForm, apiGet, apiSend, downloadFormFromApi, downloadFromApi } from "../lib/api";
 
 type Depot = { depot_id: string; depot_name: string };
 type Model = {
@@ -28,7 +28,7 @@ type Validation = {
   blocking_error_count: number;
   warning_count: number;
   issues: ValidationIssue[];
-  normalized_rows: Array<Record<string, string>>;
+  normalized_rows: Array<Record<string, string | number | null>>;
   row_count: number;
   detected_shifts: string[];
 };
@@ -42,11 +42,41 @@ type Candidate = {
   exclusion_reason: string | null;
   explanation: Record<string, unknown>;
 };
+type Trip = {
+  id: string;
+  trip_id: string;
+  trip_number: number | null;
+  vehicle_id: string | null;
+  vehicle_registration_no: string | null;
+  planned_start_datetime: string;
+  predicted_departure_datetime: string | null;
+  delay_minutes: number;
+  estimated_visit_sequence: string[];
+  routing_provider: string | null;
+  routing_mode: string | null;
+  routing_preference: string | null;
+  large_vehicle_used: boolean;
+  route_distance_meters: number | null;
+  route_duration_seconds: number | null;
+  service_duration_seconds: number | null;
+  turnaround_buffer_seconds: number | null;
+  total_cycle_duration_seconds: number | null;
+  estimated_return_datetime: string | null;
+  next_available_datetime: string | null;
+  routing_confidence: string | null;
+  route_estimation_source: string | null;
+  assignment_status: string;
+  unassigned_reason: string | null;
+  fallback_used: boolean;
+  warning_codes: string[];
+  vehicle_profile_snapshot: { profile_status?: string; missing_fields?: string[] };
+};
 type Shipment = {
   id: string;
   predicted_shipment_id: string;
   shift_id: string;
   shift: string;
+  planned_start_datetime: string;
   shipment_prediction_score: number;
   shipment_confidence_level: string;
   low_confidence: boolean;
@@ -55,9 +85,11 @@ type Shipment = {
   lines: Array<{
     id: string;
     loading_order_no: string;
+    shipment_start_datetime: string;
     spbu_id: string;
     spbu_no: string;
     spbu_name: string | null;
+    order_quantity_kl: number | null;
     model_predicted_shipment_id: string;
   }>;
   assignment: {
@@ -71,6 +103,7 @@ type Shipment = {
     unassigned_reason: string | null;
     override_reason: string | null;
   };
+  trip: Trip | null;
   candidates: Candidate[];
 };
 type PredictionResult = {
@@ -86,16 +119,25 @@ type PredictionResult = {
   durations_ms: Record<string, number>;
   summary: {
     loading_orders: number;
+    total_order_kl: number;
     unique_spbu: number;
     predicted_shipments: number;
     available_mt: number;
     assigned_shipments: number;
     unassigned_shipments: number;
+    total_trips: number;
+    assigned_with_delay: number;
+    multi_trip_mt: number;
+    fallback_trips: number;
     average_shipment_confidence: number;
     average_mt_assignment_confidence: number;
   };
   summary_by_shift: Array<Record<string, string | number>>;
   shipments: Shipment[];
+  trips: Trip[];
+  mt_timeline: Array<{ vehicle_id: string; vehicle_registration_no: string; trips: Array<{ trip_id: string; trip_number: number; shipment_id: string; start: string; return: string; next_available: string; status: string }> }>;
+  routing_configuration: Record<string, unknown>;
+  routing_metrics: Record<string, number>;
   original_model_prediction: Array<Record<string, unknown>>;
 };
 type HistoryRow = {
@@ -118,7 +160,7 @@ function pct(value: number | null | undefined) {
 
 function badgeClass(value: string) {
   if (["PASS", "HIGH", "ASSIGNED", "COMPLETED", "ACTIVE", "READY"].includes(value)) return "border-mint bg-mint/10 text-mint";
-  if (["WARNING", "MEDIUM", "MANUAL_OVERRIDE", "SAVED"].includes(value)) return "border-amber bg-amber/10 text-amber";
+  if (["WARNING", "MEDIUM", "MANUAL_OVERRIDE", "ASSIGNED_WITH_DELAY", "SAVED", "DRIVE_FALLBACK"].includes(value)) return "border-amber bg-amber/10 text-amber";
   return "border-rust bg-rust/10 text-rust";
 }
 
@@ -139,6 +181,14 @@ function explanationRows(value: Record<string, unknown>) {
   return Object.entries(value).filter(([, item]) => item !== null && item !== undefined && typeof item !== "object");
 }
 
+function dateTime(value: string | null | undefined) {
+  return value ? new Date(value).toLocaleString("id-ID") : "—";
+}
+
+function durationMinutes(value: number | null | undefined) {
+  return value === null || value === undefined ? "—" : `${Math.round(value / 60).toLocaleString("id-ID")} min`;
+}
+
 export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
   const [depotId, setDepotId] = useState("");
   const [models, setModels] = useState<Model[]>([]);
@@ -156,11 +206,22 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
   const [overrideReason, setOverrideReason] = useState<Record<string, string>>({});
   const [moveTargets, setMoveTargets] = useState<Record<string, string>>({});
   const [minimumConfidence, setMinimumConfidence] = useState("0.60");
+  const [maximumPairingGap, setMaximumPairingGap] = useState("30");
+  const [assignmentMode, setAssignmentMode] = useState("STRICT_START");
+  const [maximumDelay, setMaximumDelay] = useState("30");
+  const [demoDialogOpen, setDemoDialogOpen] = useState(false);
+  const [demoTotalKl, setDemoTotalKl] = useState("80");
+  const [demoLoading, setDemoLoading] = useState(false);
+  const [demoNotice, setDemoNotice] = useState<string | null>(null);
 
   const selectedModel = models.find((model) => model.model_id === modelId) ?? null;
   const issues = [...(loValidation?.issues ?? []), ...(mtValidation?.issues ?? [])];
   const blockingErrors = (loValidation?.blocking_error_count ?? 0) + (mtValidation?.blocking_error_count ?? 0);
   const warnings = (loValidation?.warning_count ?? 0) + (mtValidation?.warning_count ?? 0);
+  const validatedOrderKl = (loValidation?.normalized_rows ?? []).reduce(
+    (total, row) => total + (typeof row.order_quantity_kl === "number" ? row.order_quantity_kl : Number(row.order_quantity_kl ?? 0)),
+    0,
+  );
   const canRun = Boolean(depotId && modelId && loadingOrderFile && mtFile && loValidation && mtValidation && blockingErrors === 0);
 
   useEffect(() => {
@@ -171,6 +232,8 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
     setLoValidation(null);
     setMtValidation(null);
     setResult(null);
+    setDemoDialogOpen(false);
+    setDemoNotice(null);
     if (!depotId) {
       setHistory([]);
       return;
@@ -190,10 +253,12 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
     setLoValidation(null);
     setMtValidation(null);
     setResult(null);
+    setDemoDialogOpen(false);
+    setDemoNotice(null);
   }, [modelId]);
 
   async function validateFile(kind: "loading-order" | "mt-availability", file: File) {
-    if (!depotId || !modelId) return;
+    if (!depotId || !modelId) return null;
     setError(null);
     const body = new FormData();
     body.append("depot_id", depotId);
@@ -203,8 +268,10 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
       const validation = await apiForm<Validation>(`/api/v1/phase6/validate/${kind}`, body);
       if (kind === "loading-order") setLoValidation(validation);
       else setMtValidation(validation);
+      return validation;
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Validation failed.");
+      return null;
     }
   }
 
@@ -217,7 +284,12 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
     body.append("model_id", modelId);
     body.append("loading_order_file", loadingOrderFile);
     body.append("mt_availability_file", mtFile);
-    body.append("parameters", JSON.stringify({ minimum_prediction_confidence: Number(minimumConfidence) }));
+    body.append("parameters", JSON.stringify({
+      minimum_prediction_confidence: Number(minimumConfidence),
+      maximum_pairing_time_gap_minutes: Number(maximumPairingGap),
+      assignment_mode: assignmentMode,
+      maximum_allowed_delay_minutes: Number(maximumDelay),
+    }));
     try {
       const payload = await apiForm<PredictionResult>("/api/v1/phase6/predictions", body);
       setResult(payload);
@@ -228,6 +300,36 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
       setError(reason instanceof Error ? reason.message : "Prediction failed.");
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function generateDemoLoadingOrders() {
+    const totalOrderKl = Number(demoTotalKl);
+    if (!depotId || !modelId || !Number.isFinite(totalOrderKl) || totalOrderKl <= 0 || totalOrderKl > 40000) {
+      setError("Total order harus lebih dari 0 dan maksimum 40.000 KL.");
+      return;
+    }
+    setDemoLoading(true);
+    setError(null);
+    try {
+      const file = await apiFile(
+        "/api/v1/phase6/demo/loading-order",
+        "POST",
+        { depot_id: depotId, model_id: modelId, total_order_kl: totalOrderKl },
+        "phase6-demo-loading-order.xlsx",
+      );
+      setLoadingOrderFile(file);
+      setLoValidation(null);
+      setResult(null);
+      setDemoDialogOpen(false);
+      const validation = await validateFile("loading-order", file);
+      if (validation) {
+        setDemoNotice(`Data demo ${totalOrderKl.toLocaleString("id-ID", { maximumFractionDigits: 3 })} KL berhasil dibuat dan divalidasi.`);
+      }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Data demo gagal dibuat.");
+    } finally {
+      setDemoLoading(false);
     }
   }
 
@@ -340,23 +442,79 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
     () => [...new Map(visibleShipments.flatMap((shipment) => shipment.candidates.map((candidate) => [candidate.vehicle_id, candidate.vehicle_registration_no]))).entries()],
     [visibleShipments],
   );
+  const timelineOption = useMemo(() => {
+    const vehicles = result?.mt_timeline.map((row) => row.vehicle_registration_no) ?? [];
+    const data = (result?.mt_timeline ?? []).flatMap((row, vehicleIndex) => row.trips.map((trip) => ({
+      value: [new Date(trip.start).getTime(), new Date(trip.next_available).getTime(), vehicleIndex],
+      name: `${trip.trip_id} · ${trip.shipment_id}`,
+      status: trip.status,
+      returnTime: trip.return,
+    })));
+    return {
+      tooltip: { formatter: (item: { data: { name: string; status: string; value: number[]; returnTime: string } }) => `${item.data.name}<br/>${dateTime(new Date(item.data.value[0]).toISOString())} → ${dateTime(new Date(item.data.value[1]).toISOString())}<br/>Return: ${dateTime(item.data.returnTime)}<br/>${item.data.status.replace(/_/g, " ")}` },
+      grid: { left: 120, right: 24, top: 24, bottom: 48 },
+      xAxis: { type: "time", axisLabel: { hideOverlap: true } },
+      yAxis: { type: "category", data: vehicles },
+      dataZoom: [{ type: "inside" }, { type: "slider", height: 18 }],
+      series: [{
+        type: "custom",
+        renderItem: (_params: unknown, api: { value: (index: number) => number; coord: (value: number[]) => number[]; size: (value: number[]) => number[] }) => {
+          const start = api.coord([api.value(0), api.value(2)]);
+          const end = api.coord([api.value(1), api.value(2)]);
+          const height = Math.max(10, api.size([0, 1])[1] * 0.55);
+          return { type: "rect", shape: { x: start[0], y: start[1] - height / 2, width: Math.max(2, end[0] - start[0]), height }, style: { fill: "#0b73bf" } };
+        },
+        encode: { x: [0, 1], y: 2 },
+        data,
+      }],
+    };
+  }, [result]);
 
   return (
     <div className="space-y-5">
       {error && <div className="flex items-start justify-between border border-rust bg-rust/5 px-4 py-3 text-sm text-rust"><span>{error}</span><button onClick={() => setError(null)}><XCircle size={17} /></button></div>}
+
+      {demoDialogOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-petroink/50 p-4" role="dialog" aria-modal="true" aria-labelledby="demo-loading-order-title">
+          <form className="w-full max-w-md border border-line bg-white p-5 shadow-xl" onSubmit={(event) => { event.preventDefault(); void generateDemoLoadingOrders(); }}>
+            <div id="demo-loading-order-title" className="text-base font-semibold text-petroink">Buat Data Demo Loading Order</div>
+            <p className="mt-2 text-sm text-slate-500">Masukkan total order. Sistem membaginya menjadi Loading Order berkapasitas 8 KL, memilih SPBU aktif secara acak, lalu membuat timestamp siap-kirim yang sesuai shift model.</p>
+            <label className="mt-5 grid gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
+              Total Order (KL)
+              <input autoFocus required className="border border-line px-3 py-2 text-base font-normal normal-case tracking-normal text-petroink" type="number" min="0.001" max="40000" step="0.001" value={demoTotalKl} onChange={(event) => setDemoTotalKl(event.target.value)} />
+            </label>
+            <div className="mt-5 flex justify-end gap-2">
+              <button type="button" className="border border-line px-4 py-2 text-sm" disabled={demoLoading} onClick={() => setDemoDialogOpen(false)}>Batal</button>
+              <button type="submit" className="inline-flex items-center gap-2 bg-petroblue px-4 py-2 text-sm font-semibold text-white disabled:opacity-40" disabled={demoLoading}><Sparkles size={15} /> {demoLoading ? "Membuat…" : "Buat Data Demo"}</button>
+            </div>
+          </form>
+        </div>
+      )}
 
       <section className="border border-line bg-white p-5">
         <div className="mb-4">
           <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">1. Prediction Setup</div>
           <p className="mt-1 text-xs text-slate-500">One depot and one saved Phase 5 model per auditable run. Phase 6 does not train models or optimize routes.</p>
         </div>
-        <div className="grid gap-4 lg:grid-cols-3">
+        <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
           <label className="grid gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
             Depot
             <select className="border border-line bg-white px-3 py-2 text-sm font-normal normal-case tracking-normal text-petroink" value={depotId} onChange={(event) => setDepotId(event.target.value)}>
               <option value="">Select Depot</option>
               {depots.map((depot) => <option key={depot.depot_id} value={depot.depot_id}>{depot.depot_name}</option>)}
             </select>
+          </label>
+          <label className="grid gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
+            Max Pairing Gap (min)
+            <input className="border border-line px-3 py-2 text-sm font-normal normal-case tracking-normal text-petroink" type="number" min="0" max="1440" value={maximumPairingGap} onChange={(event) => setMaximumPairingGap(event.target.value)} />
+          </label>
+          <label className="grid gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
+            Assignment Mode
+            <select className="border border-line bg-white px-3 py-2 text-sm font-normal normal-case tracking-normal text-petroink" value={assignmentMode} onChange={(event) => setAssignmentMode(event.target.value)}><option value="STRICT_START">Strict Start</option><option value="ALLOW_DELAY">Allow Delay</option></select>
+          </label>
+          <label className="grid gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
+            Max Delay (min)
+            <input className="border border-line px-3 py-2 text-sm font-normal normal-case tracking-normal text-petroink disabled:bg-slate-50" type="number" min="0" max="1440" disabled={assignmentMode === "STRICT_START"} value={maximumDelay} onChange={(event) => setMaximumDelay(event.target.value)} />
           </label>
           <label className="grid gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
             Prediction Model
@@ -390,24 +548,27 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
       <section className="grid gap-5 lg:grid-cols-2">
         <div className="border border-line bg-white p-5">
           <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">3. Loading Order Upload</div>
-          <p className="mt-1 text-xs text-slate-500">Required: loading_order_no, shift_gate_out, spbu_no</p>
+          <p className="mt-1 text-xs text-slate-500">Required: loading_order_no, shipment_start_datetime, spbu_no. Shift is derived from the model snapshot.</p>
           <div className="mt-4 flex flex-wrap gap-2">
             <button className="inline-flex items-center gap-2 border border-line px-3 py-2 text-sm" onClick={() => downloadFromApi("/api/v1/phase6/templates/loading-order", "phase6-loading-order-template.xlsx")}><Download size={15} /> Download Template</button>
+            <button type="button" className="inline-flex items-center gap-2 border border-petroblue px-3 py-2 text-sm text-petroblue disabled:border-line disabled:text-slate-400" disabled={!modelId || demoLoading} onClick={() => setDemoDialogOpen(true)}><Sparkles size={15} /> Data Demo</button>
             <label className={`inline-flex cursor-pointer items-center gap-2 border px-3 py-2 text-sm ${modelId ? "border-petroblue text-petroblue" : "pointer-events-none border-line text-slate-400"}`}>
               <Upload size={15} /> {loadingOrderFile?.name ?? "Upload Excel"}
               <input className="hidden" type="file" accept=".xlsx" disabled={!modelId} onChange={(event) => {
                 const file = event.target.files?.[0] ?? null;
                 setLoadingOrderFile(file);
                 setLoValidation(null);
+                setDemoNotice(null);
                 if (file) void validateFile("loading-order", file);
               }} />
             </label>
             {loValidation && <Badge value={loValidation.status} />}
           </div>
+          {demoNotice && <div className="mt-3 text-xs text-mint">{demoNotice}</div>}
         </div>
         <div className="border border-line bg-white p-5">
           <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">4. MT Availability Upload</div>
-          <p className="mt-1 text-xs text-slate-500">Required: shift, vehicle_registration_no</p>
+          <p className="mt-1 text-xs text-slate-500">Required: vehicle_registration_no, initial_available_datetime</p>
           <div className="mt-4 flex flex-wrap gap-2">
             <button className="inline-flex items-center gap-2 border border-line px-3 py-2 text-sm" onClick={() => downloadFromApi("/api/v1/phase6/templates/mt-availability", "phase6-mt-availability-template.xlsx")}><Download size={15} /> Download Template</button>
             <label className={`inline-flex cursor-pointer items-center gap-2 border px-3 py-2 text-sm ${modelId ? "border-petroblue text-petroblue" : "pointer-events-none border-line text-slate-400"}`}>
@@ -432,9 +593,10 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
           </div>
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-6">
             <Metric label="Loading Orders" value={loValidation?.row_count ?? 0} />
+            <Metric label="Order Volume" value={`${validatedOrderKl.toLocaleString("id-ID", { maximumFractionDigits: 3 })} KL`} />
             <Metric label="Unique SPBU" value={new Set((loValidation?.normalized_rows ?? []).map((row) => row.spbu_id)).size} />
             <Metric label="Available MT" value={mtValidation?.row_count ?? 0} />
-            <Metric label="Detected Shifts" value={new Set([...(loValidation?.detected_shifts ?? []), ...(mtValidation?.detected_shifts ?? [])]).size} />
+            <Metric label="Derived Shifts" value={new Set(loValidation?.detected_shifts ?? []).size} />
             <Metric label="Errors" value={blockingErrors} />
             <Metric label="Warnings" value={warnings} />
           </div>
@@ -462,33 +624,35 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
         <>
           <section className="border border-line bg-white p-5">
             <div className="mb-4 flex flex-wrap items-center justify-between gap-3"><div><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">6. Prediction Summary · {result.prediction_run_id}</div><p className="mt-1 text-xs text-slate-500">Completed in {result.durations_ms.total} ms · model and input snapshots retained.</p></div><Badge value={result.status} /></div>
-            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-8">
-              <Metric label="Loading Orders" value={result.summary.loading_orders} /><Metric label="Unique SPBU" value={result.summary.unique_spbu} /><Metric label="Shipments" value={result.summary.predicted_shipments} /><Metric label="Available MT" value={result.summary.available_mt} />
-              <Metric label="Assigned" value={result.summary.assigned_shipments} /><Metric label="Unassigned" value={result.summary.unassigned_shipments} /><Metric label="Avg Shipment" value={pct(result.summary.average_shipment_confidence)} /><Metric label="Avg MT" value={pct(result.summary.average_mt_assignment_confidence)} />
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6">
+              <Metric label="Loading Orders" value={result.summary.loading_orders} /><Metric label="Order Volume" value={`${result.summary.total_order_kl.toLocaleString("id-ID", { maximumFractionDigits: 3 })} KL`} /><Metric label="Unique SPBU" value={result.summary.unique_spbu} /><Metric label="Shipments" value={result.summary.predicted_shipments} /><Metric label="Available MT" value={result.summary.available_mt} />
+              <Metric label="Assigned" value={result.summary.assigned_shipments} /><Metric label="Delayed" value={result.summary.assigned_with_delay} /><Metric label="Unassigned" value={result.summary.unassigned_shipments} /><Metric label="Multi-Trip MT" value={result.summary.multi_trip_mt} /><Metric label="Drive Fallback" value={result.summary.fallback_trips} /><Metric label="Avg MT" value={pct(result.summary.average_mt_assignment_confidence)} />
             </div>
-            <div className="mt-4 overflow-x-auto"><table className="min-w-full text-left text-sm"><thead className="bg-slate-50 text-xs uppercase text-slate-500"><tr>{["Shift", "LO", "SPBU", "Predicted Shipment", "Available MT", "Assigned", "Unassigned"].map((item) => <th key={item} className="px-3 py-2">{item}</th>)}</tr></thead><tbody>{result.summary_by_shift.map((row) => <tr key={String(row.shift_id)} className="border-t border-line"><td className="px-3 py-2 font-medium">{row.shift}</td><td className="px-3 py-2">{row.loading_orders}</td><td className="px-3 py-2">{row.unique_spbu}</td><td className="px-3 py-2">{row.predicted_shipments}</td><td className="px-3 py-2">{row.available_mt}</td><td className="px-3 py-2">{row.assigned}</td><td className="px-3 py-2">{row.unassigned}</td></tr>)}</tbody></table></div>
+            <div className="mt-4 overflow-x-auto"><table className="min-w-full text-left text-sm"><thead className="bg-slate-50 text-xs uppercase text-slate-500"><tr>{["Derived Shift", "LO", "Volume (KL)", "SPBU", "Predicted Shipment", "Assigned", "Unassigned"].map((item) => <th key={item} className="px-3 py-2">{item}</th>)}</tr></thead><tbody>{result.summary_by_shift.map((row) => <tr key={String(row.shift_id)} className="border-t border-line"><td className="px-3 py-2 font-medium">{row.shift}</td><td className="px-3 py-2">{row.loading_orders}</td><td className="px-3 py-2">{row.total_order_kl}</td><td className="px-3 py-2">{row.unique_spbu}</td><td className="px-3 py-2">{row.predicted_shipments}</td><td className="px-3 py-2">{row.assigned}</td><td className="px-3 py-2">{row.unassigned}</td></tr>)}</tbody></table></div>
+            <div className="mt-3 flex flex-wrap gap-2 text-xs text-slate-500"><span>Routes calls: {result.routing_metrics.google_routes_request_count ?? 0}</span><span>· Cache hits: {result.routing_metrics.google_routes_cache_hit_count ?? 0}</span><span>· Cache misses: {result.routing_metrics.google_routes_cache_miss_count ?? 0}</span></div>
           </section>
 
           <section className="border border-line bg-white p-5">
             <div className="mb-4"><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">7–8. Predicted Shipment & MT Assignment Result</div><div className="mt-3 flex flex-wrap gap-2"><button className={`border px-3 py-1 text-sm ${shiftTab === "ALL" ? "border-petroblue bg-petroblue text-white" : "border-line"}`} onClick={() => setShiftTab("ALL")}>All</button>{shifts.map((shift) => <button key={String(shift.shift_id)} className={`border px-3 py-1 text-sm ${shiftTab === shift.shift_id ? "border-petroblue bg-petroblue text-white" : "border-line"}`} onClick={() => setShiftTab(String(shift.shift_id))}>{shift.shift}</button>)}</div></div>
             <div className="overflow-x-auto">
-              <table className="min-w-full text-left text-sm"><thead className="bg-slate-50 text-xs uppercase text-slate-500"><tr>{["", "Shift", "Shipment", "Loading Order", "SPBU", "Assigned MT", "Shipment Confidence", "MT Confidence", "Status"].map((item, index) => <th key={`${item}-${index}`} className="px-3 py-2">{item}</th>)}</tr></thead>
+              <table className="min-w-full text-left text-sm"><thead className="bg-slate-50 text-xs uppercase text-slate-500"><tr>{["", "Trip", "MT", "Shipment / SPBU", "Planned Start", "Predicted Departure", "Estimated Return", "Next Available", "Confidence", "Status"].map((item, index) => <th key={`${item}-${index}`} className="px-3 py-2">{item}</th>)}</tr></thead>
                 <tbody>{visibleShipments.map((shipment) => (
                   <>
                     <tr key={shipment.id} className="border-t border-line align-top">
                       <td className="px-3 py-3"><button onClick={() => setExpanded(expanded === shipment.id ? null : shipment.id)}>{expanded === shipment.id ? <ChevronDown size={17} /> : <ChevronRight size={17} />}</button></td>
-                      <td className="px-3 py-3">{shipment.shift}</td><td className="px-3 py-3 font-mono text-xs">{shipment.predicted_shipment_id}</td><td className="px-3 py-3">{shipment.lines.map((line) => line.loading_order_no).join(" + ")}</td><td className="px-3 py-3">{shipment.lines.map((line) => line.spbu_no).join(" + ")}</td><td className="px-3 py-3">{shipment.assignment.assigned_vehicle_registration ?? "—"}</td><td className="px-3 py-3"><div>{pct(shipment.shipment_prediction_score)}</div><Badge value={shipment.shipment_confidence_level} /></td><td className="px-3 py-3">{pct(shipment.assignment.mt_assignment_score)}</td><td className="px-3 py-3"><Badge value={shipment.assignment.assignment_status} />{shipment.assignment.unassigned_reason && <div className="mt-1 text-xs text-rust">{shipment.assignment.unassigned_reason.replace(/_/g, " ")}</div>}</td>
+                      <td className="px-3 py-3 font-mono text-xs">{shipment.trip?.trip_id ?? "—"}<div className="mt-1 text-slate-400">#{shipment.trip?.trip_number ?? "—"}</div></td><td className="px-3 py-3">{shipment.assignment.assigned_vehicle_registration ?? "—"}</td><td className="px-3 py-3"><div className="font-mono text-xs">{shipment.predicted_shipment_id}</div><div className="mt-1">{shipment.lines.map((line) => line.spbu_no).join(" + ")}</div></td><td className="whitespace-nowrap px-3 py-3">{dateTime(shipment.planned_start_datetime)}<div className="mt-1 text-xs text-slate-400">{shipment.shift}</div></td><td className="whitespace-nowrap px-3 py-3">{dateTime(shipment.trip?.predicted_departure_datetime)}{Boolean(shipment.trip?.delay_minutes) && <div className="mt-1 text-xs text-amber">+{shipment.trip?.delay_minutes} min</div>}</td><td className="whitespace-nowrap px-3 py-3">{dateTime(shipment.trip?.estimated_return_datetime)}</td><td className="whitespace-nowrap px-3 py-3">{dateTime(shipment.trip?.next_available_datetime)}</td><td className="px-3 py-3"><div>{pct(shipment.shipment_prediction_score)} / {pct(shipment.assignment.mt_assignment_score)}</div>{shipment.trip?.routing_confidence && <Badge value={shipment.trip.routing_confidence} />}</td><td className="px-3 py-3"><Badge value={shipment.assignment.assignment_status} />{shipment.trip?.fallback_used && <div className="mt-1"><Badge value="DRIVE_FALLBACK" /></div>}{shipment.assignment.unassigned_reason && <div className="mt-1 text-xs text-rust">{shipment.assignment.unassigned_reason.replace(/_/g, " ")}</div>}</td>
                     </tr>
                     {expanded === shipment.id && (
-                      <tr key={`${shipment.id}-detail`} className="border-t border-line bg-slate-50/60"><td colSpan={9} className="p-4">
+                      <tr key={`${shipment.id}-detail`} className="border-t border-line bg-slate-50/60"><td colSpan={10} className="p-4">
                         <div className="grid gap-5 xl:grid-cols-2">
                           <div>
                             <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Loading Orders & Shipment Override</div>
                             <div className="mt-2 space-y-2">{shipment.lines.map((line) => (
-                              <div key={line.id} className="flex flex-wrap items-center justify-between gap-2 border border-line bg-white p-3 text-sm"><div><span className="font-medium">{line.loading_order_no}</span> · {line.spbu_no} {line.spbu_name && `· ${line.spbu_name}`}<div className="mt-1 text-[11px] text-slate-400">Model layer: {line.model_predicted_shipment_id}</div></div><div className="flex flex-wrap gap-2"><button className="inline-flex items-center gap-1 border border-line px-2 py-1 text-xs" disabled={shipment.lines.length === 1 || loading} onClick={() => void adjustShipment(shipment, "SPLIT_SINGLE", [line.id])}><Split size={13} /> New single</button><select className="border border-line bg-white px-2 py-1 text-xs" value={moveTargets[line.id] ?? ""} onChange={(event) => setMoveTargets((current) => ({ ...current, [line.id]: event.target.value }))}><option value="">Move to…</option>{result.shipments.filter((item) => item.shift_id === shipment.shift_id && item.id !== shipment.id).map((item) => <option key={item.id} value={item.id}>{item.predicted_shipment_id}</option>)}</select><button className="border border-line px-2 py-1 text-xs disabled:opacity-40" disabled={!moveTargets[line.id] || loading} onClick={() => void adjustShipment(shipment, "MOVE_LINES", [line.id], moveTargets[line.id])}>Move</button></div></div>
+                              <div key={line.id} className="flex flex-wrap items-center justify-between gap-2 border border-line bg-white p-3 text-sm"><div><span className="font-medium">{line.loading_order_no}</span> · {line.spbu_no} {line.spbu_name && `· ${line.spbu_name}`} {line.order_quantity_kl !== null && `· ${line.order_quantity_kl} KL`}<div className="mt-1 text-[11px] text-slate-400">Ready: {dateTime(line.shipment_start_datetime)} · Model layer: {line.model_predicted_shipment_id}</div></div><div className="flex flex-wrap gap-2"><button className="inline-flex items-center gap-1 border border-line px-2 py-1 text-xs" disabled={shipment.lines.length === 1 || loading} onClick={() => void adjustShipment(shipment, "SPLIT_SINGLE", [line.id])}><Split size={13} /> New single</button><select className="border border-line bg-white px-2 py-1 text-xs" value={moveTargets[line.id] ?? ""} onChange={(event) => setMoveTargets((current) => ({ ...current, [line.id]: event.target.value }))}><option value="">Move to…</option>{result.shipments.filter((item) => item.shift_id === shipment.shift_id && item.id !== shipment.id).map((item) => <option key={item.id} value={item.id}>{item.predicted_shipment_id}</option>)}</select><button className="border border-line px-2 py-1 text-xs disabled:opacity-40" disabled={!moveTargets[line.id] || loading} onClick={() => void adjustShipment(shipment, "MOVE_LINES", [line.id], moveTargets[line.id])}>Move</button></div></div>
                             ))}</div>
                             <div className="mt-4 text-xs font-semibold uppercase tracking-wide text-slate-500">Structured Shipment Explanation</div>
                             <dl className="mt-2 grid gap-2 sm:grid-cols-2">{explanationRows(shipment.explanation).map(([key, value]) => <div key={key} className="border border-line bg-white p-2"><dt className="text-[11px] uppercase text-slate-400">{key.replace(/_/g, " ")}</dt><dd className="mt-1 text-xs">{String(value)}</dd></div>)}</dl>
+                            {shipment.trip && <div className="mt-4 border border-line bg-white p-3 text-xs"><div className="font-semibold uppercase tracking-wide text-slate-500">Preliminary Route Estimate</div><div className="mt-2 grid gap-2 sm:grid-cols-2"><span>Sequence: {shipment.trip.estimated_visit_sequence.join(" → ") || "—"}</span><span>Mode: {shipment.trip.routing_mode ?? "—"}</span><span>Distance: {shipment.trip.route_distance_meters === null ? "—" : `${(shipment.trip.route_distance_meters / 1000).toFixed(1)} km`}</span><span>Travel: {durationMinutes(shipment.trip.route_duration_seconds)}</span><span>Service: {durationMinutes(shipment.trip.service_duration_seconds)}</span><span>Cycle: {durationMinutes(shipment.trip.total_cycle_duration_seconds)}</span><span>Source: {shipment.trip.route_estimation_source ?? "—"}</span><span>Vehicle profile: {shipment.trip.vehicle_profile_snapshot.profile_status ?? "—"}</span></div>{shipment.trip.fallback_used && <div className="mt-3 border border-amber bg-amber/5 p-2 text-amber"><strong>DRIVE FALLBACK.</strong> Truck-specific routing unavailable. Estimated availability may be less reliable.</div>}{Boolean(shipment.trip.vehicle_profile_snapshot.missing_fields?.length) && <div className="mt-2 text-rust">Missing vehicle profile: {shipment.trip.vehicle_profile_snapshot.missing_fields?.join(", ")}</div>}</div>}
                           </div>
                           <div>
                             <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Recommended MT & Change MT</div>
@@ -506,8 +670,9 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
           </section>
 
           <section className="grid gap-5 xl:grid-cols-2">
+            <div className="border border-line bg-white p-5 xl:col-span-2"><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">MT Multi-Trip Timeline</div><p className="mt-1 text-xs text-slate-500">Each bar runs from predicted departure through the turnaround buffer. Bars for one MT must not overlap.</p>{result.mt_timeline.length ? <ReactECharts option={timelineOption} style={{ height: Math.max(280, result.mt_timeline.length * 64) }} /> : <div className="mt-5 border border-dashed border-line p-6 text-center text-sm text-slate-500">No assigned trip timeline.</div>}</div>
             <div className="border border-line bg-white p-5"><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">9A. Shipment Prediction Network</div><p className="mt-1 text-xs text-slate-500">Nodes are SPBU; edges mean predicted same shipment; thickness is model confidence. This is not a route map.</p><ReactECharts option={networkOption} style={{ height: 360 }} /></div>
-            <div className="border border-line bg-white p-5"><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">9B. MT Assignment Matrix</div><p className="mt-1 text-xs text-slate-500">Scores are Phase 4 affinity evidence after availability; X is master-incompatible; outlined cell is assigned.</p><div className="mt-4 max-h-[360px] overflow-auto"><table className="min-w-full text-center text-xs"><thead className="sticky top-0 bg-white"><tr><th className="p-2 text-left">Shipment</th>{matrixVehicles.map(([id, registration]) => <th key={id} className="p-2">{registration}</th>)}</tr></thead><tbody>{visibleShipments.map((shipment) => <tr key={shipment.id} className="border-t border-line"><th className="whitespace-nowrap p-2 text-left">{shipment.predicted_shipment_id}</th>{matrixVehicles.map(([vehicleId]) => {
+            <div className="border border-line bg-white p-5"><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">9B. MT Assignment Matrix</div><p className="mt-1 text-xs text-slate-500">Scores are Phase 4 affinity evidence before rolling-time eligibility; X is master-incompatible; outlined cell is assigned.</p><div className="mt-4 max-h-[360px] overflow-auto"><table className="min-w-full text-center text-xs"><thead className="sticky top-0 bg-white"><tr><th className="p-2 text-left">Shipment</th>{matrixVehicles.map(([id, registration]) => <th key={id} className="p-2">{registration}</th>)}</tr></thead><tbody>{visibleShipments.map((shipment) => <tr key={shipment.id} className="border-t border-line"><th className="whitespace-nowrap p-2 text-left">{shipment.predicted_shipment_id}</th>{matrixVehicles.map(([vehicleId]) => {
               const candidate = shipment.candidates.find((item) => item.vehicle_id === vehicleId);
               const assigned = shipment.assignment.assigned_vehicle_id === vehicleId;
               return <td key={vehicleId} className={`p-2 ${assigned ? "outline outline-2 outline-petroblue" : ""}`} style={{ backgroundColor: candidate?.compatibility_status === "PASS" ? `rgba(184,210,17,${Math.max(0.08, candidate.prediction_score)})` : undefined }}>{candidate ? candidate.compatibility_status === "FAIL" ? "X" : pct(candidate.prediction_score) : "—"}</td>;

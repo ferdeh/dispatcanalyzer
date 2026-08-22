@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from .database import get_db
 from .phase6_auth import Phase6Actor, require_phase6_permission
+from .phase6_demo import generate_demo_loading_orders
 from .phase6_export import loading_order_template, mt_availability_template, prediction_export, validation_report
 from .phase6_service import (
     adjust_shipment,
@@ -19,6 +20,7 @@ from .phase6_service import (
     list_prediction_models,
     list_prediction_runs,
     override_assignment,
+    override_trip_assignment,
 )
 from .phase6_validation import require_prediction_model, validate_loading_orders, validate_mt_availability
 
@@ -39,6 +41,12 @@ class ShipmentOverrideRequest(BaseModel):
 
 class RerunRequest(BaseModel):
     model_id: str | None = None
+
+
+class DemoLoadingOrderRequest(BaseModel):
+    depot_id: str
+    model_id: str
+    total_order_kl: float = Field(gt=0, le=40000)
 
 
 def _excel_response(content: bytes, filename: str) -> StreamingResponse:
@@ -65,11 +73,34 @@ def download_loading_order_template(
     return _excel_response(loading_order_template(), "phase6-loading-order-template.xlsx")
 
 
+@router.post("/demo/loading-order")
+def create_demo_loading_order_file(
+    request: DemoLoadingOrderRequest,
+    db: Session = Depends(get_db),
+    _actor: Phase6Actor = Depends(require_phase6_permission("run")),
+) -> StreamingResponse:
+    model = require_prediction_model(db, request.depot_id, request.model_id)
+    content, filename = generate_demo_loading_orders(
+        db,
+        depot_id=request.depot_id,
+        model=model,
+        total_order_kl=request.total_order_kl,
+    )
+    return _excel_response(content, filename)
+
+
 @router.get("/templates/mt-availability")
 def download_mt_availability_template(
     _actor: Phase6Actor = Depends(require_phase6_permission("view")),
 ) -> StreamingResponse:
     return _excel_response(mt_availability_template(), "phase6-mt-availability-template.xlsx")
+
+
+@router.get("/templates/mt-initial-availability")
+def download_mt_initial_availability_template(
+    _actor: Phase6Actor = Depends(require_phase6_permission("view")),
+) -> StreamingResponse:
+    return _excel_response(mt_availability_template(), "phase6-mt-initial-availability-template.xlsx")
 
 
 @router.post("/validate/loading-order")
@@ -196,6 +227,17 @@ def patch_assignment(
     actor: Phase6Actor = Depends(require_phase6_permission("override")),
 ) -> dict:
     return override_assignment(db, run_id, assignment_id, request.vehicle_id, request.override_reason, actor.user_id)
+
+
+@router.patch("/predictions/{run_id}/trips/{trip_id}")
+def patch_trip_assignment(
+    run_id: str,
+    trip_id: str,
+    request: AssignmentOverrideRequest,
+    db: Session = Depends(get_db),
+    actor: Phase6Actor = Depends(require_phase6_permission("override")),
+) -> dict:
+    return override_trip_assignment(db, run_id, trip_id, request.vehicle_id, request.override_reason, actor.user_id)
 
 
 @router.get("/predictions/{run_id}/export")

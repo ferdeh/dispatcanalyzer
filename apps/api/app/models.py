@@ -129,6 +129,13 @@ class MasterMT(Base):
     source_hub_id: Mapped[str | None] = mapped_column(String(120))
     assignee: Mapped[str | None] = mapped_column(String(255))
     active_status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
+    vehicle_height_mm: Mapped[int | None] = mapped_column(Integer)
+    vehicle_length_mm: Mapped[int | None] = mapped_column(Integer)
+    vehicle_weight_kg: Mapped[int | None] = mapped_column(Integer)
+    vehicle_width_mm: Mapped[int | None] = mapped_column(Integer)
+    vehicle_axle_count: Mapped[int | None] = mapped_column(Integer)
+    hazmat_category: Mapped[str | None] = mapped_column(Text)
+    large_vehicle_profile_status: Mapped[str] = mapped_column(String(20), default="INCOMPLETE")
     effective_start_date = mapped_column(Date, nullable=True)
     effective_end_date = mapped_column(Date, nullable=True)
     source_import_id: Mapped[str | None] = mapped_column(String(64))
@@ -619,7 +626,7 @@ class MLTrainingRun(Base):
     result_payload: Mapped[dict] = mapped_column(JSON, default=dict)
     shift_definition_snapshot: Mapped[list] = mapped_column(JSON, default=list)
     master_compatibility_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
-    algorithm_version: Mapped[str] = mapped_column(String(80), default="phase5.behavioral.n2v_umap_hdbscan.v1")
+    algorithm_version: Mapped[str] = mapped_column(String(80), default="phase5.behavioral.portable_n2v_umap_hdbscan.v2")
     library_versions: Mapped[dict] = mapped_column(JSON, default=dict)
     artifact_temp_path: Mapped[str | None] = mapped_column(Text)
     error_message: Mapped[str | None] = mapped_column(Text)
@@ -658,7 +665,7 @@ class MLBehavioralModel(Base):
     cluster_count: Mapped[int] = mapped_column(Integer, default=0)
     noise_spbu_count: Mapped[int] = mapped_column(Integer, default=0)
     average_membership_probability: Mapped[float] = mapped_column(Float, default=0.0)
-    algorithm_version: Mapped[str] = mapped_column(String(80), default="phase5.behavioral.n2v_umap_hdbscan.v1")
+    algorithm_version: Mapped[str] = mapped_column(String(80), default="phase5.behavioral.portable_n2v_umap_hdbscan.v2")
     library_versions: Mapped[dict] = mapped_column(JSON, default=dict)
     random_seed: Mapped[int] = mapped_column(Integer, default=42)
     model_status: Mapped[str] = mapped_column(String(30), default="SAVED", index=True)
@@ -744,6 +751,9 @@ class PredictionRun(Base):
     parameter_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
     model_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
     original_prediction_snapshot: Mapped[list] = mapped_column(JSON, default=list)
+    final_prediction_snapshot: Mapped[list] = mapped_column(JSON, default=list)
+    routing_configuration_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    routing_metrics_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
     algorithm_version: Mapped[str] = mapped_column(String(100))
     validation_duration_ms: Mapped[int] = mapped_column(Integer, default=0)
     shipment_prediction_duration_ms: Mapped[int] = mapped_column(Integer, default=0)
@@ -768,6 +778,7 @@ class PredictionShipment(Base):
     predicted_shipment_id: Mapped[str] = mapped_column(String(120), index=True)
     shift_id: Mapped[str] = mapped_column(String(80), index=True)
     shift_name: Mapped[str] = mapped_column(String(120))
+    planned_start_datetime = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     shipment_prediction_score: Mapped[float] = mapped_column(Float, default=0.0)
     confidence_level: Mapped[str] = mapped_column(String(20), default="LOW")
     low_confidence: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -793,6 +804,8 @@ class PredictionShipmentLine(Base):
     loading_order_no: Mapped[str] = mapped_column(String(120), index=True)
     spbu_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_spbu.spbu_id"), index=True)
     spbu_no: Mapped[str] = mapped_column(String(120))
+    order_quantity_kl: Mapped[float | None] = mapped_column(Float)
+    shipment_start_datetime = mapped_column(DateTime(timezone=True), nullable=True)
     model_predicted_shipment_id: Mapped[str] = mapped_column(String(120))
 
 
@@ -832,6 +845,104 @@ class PredictionAssignment(Base):
     override_reason: Mapped[str | None] = mapped_column(Text)
     override_user: Mapped[str | None] = mapped_column(String(120))
     override_timestamp = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class PredictionTrip(Base):
+    __tablename__ = "prediction_trip"
+    __table_args__ = (
+        UniqueConstraint("prediction_shipment_id", name="uq_prediction_trip_shipment"),
+        UniqueConstraint("prediction_run_id", "trip_id", name="uq_prediction_trip_run_number"),
+        Index("ix_prediction_trip_vehicle_departure", "vehicle_id", "predicted_departure_datetime"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    prediction_run_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("prediction_run.id", ondelete="CASCADE"), index=True
+    )
+    prediction_shipment_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("prediction_shipment.id", ondelete="CASCADE"), index=True
+    )
+    trip_id: Mapped[str] = mapped_column(String(120), index=True)
+    trip_number: Mapped[int | None] = mapped_column(Integer)
+    vehicle_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("master_mt.mt_id"), index=True)
+    planned_start_datetime = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    predicted_departure_datetime = mapped_column(DateTime(timezone=True), nullable=True)
+    delay_minutes: Mapped[int] = mapped_column(Integer, default=0)
+    estimated_visit_sequence: Mapped[list] = mapped_column(JSON, default=list)
+    routing_provider: Mapped[str | None] = mapped_column(String(80))
+    routing_mode: Mapped[str | None] = mapped_column(String(40))
+    routing_preference: Mapped[str | None] = mapped_column(String(40))
+    large_vehicle_used: Mapped[bool] = mapped_column(Boolean, default=False)
+    route_distance_meters: Mapped[int | None] = mapped_column(Integer)
+    route_duration_seconds: Mapped[int | None] = mapped_column(Integer)
+    static_duration_seconds: Mapped[int | None] = mapped_column(Integer)
+    service_duration_seconds: Mapped[int | None] = mapped_column(Integer)
+    turnaround_buffer_seconds: Mapped[int | None] = mapped_column(Integer)
+    total_cycle_duration_seconds: Mapped[int | None] = mapped_column(Integer)
+    estimated_return_datetime = mapped_column(DateTime(timezone=True), nullable=True)
+    next_available_datetime = mapped_column(DateTime(timezone=True), nullable=True)
+    routing_confidence: Mapped[str | None] = mapped_column(String(20))
+    route_estimation_source: Mapped[str | None] = mapped_column(String(80))
+    service_time_source: Mapped[str | None] = mapped_column(String(80))
+    assignment_status: Mapped[str] = mapped_column(String(40), default="UNASSIGNED")
+    unassigned_reason: Mapped[str | None] = mapped_column(String(120))
+    fallback_used: Mapped[bool] = mapped_column(Boolean, default=False)
+    warning_codes: Mapped[list] = mapped_column(JSON, default=list)
+    vehicle_profile_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class GoogleRoutesConfiguration(Base):
+    __tablename__ = "google_routes_configuration"
+
+    configuration_id: Mapped[str] = mapped_column(String(64), primary_key=True, default="default")
+    encrypted_api_key: Mapped[str | None] = mapped_column(Text)
+    key_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    masked_api_key: Mapped[str | None] = mapped_column(String(40))
+    connection_status: Mapped[str] = mapped_column(String(40), default="NOT_CONFIGURED")
+    truck_routing_status: Mapped[str] = mapped_column(String(40), default="UNKNOWN")
+    routing_mode: Mapped[str] = mapped_column(String(20), default="AUTO")
+    routing_preference: Mapped[str] = mapped_column(String(40), default="TRAFFIC_AWARE")
+    fallback_policy: Mapped[str] = mapped_column(String(50), default="ALLOW_DRIVE_FALLBACK")
+    cache_ttl_minutes: Mapped[int] = mapped_column(Integer, default=60)
+    departure_time_bucket_minutes: Mapped[int] = mapped_column(Integer, default=15)
+    default_depot_processing_minutes: Mapped[int] = mapped_column(Integer, default=30)
+    default_spbu_service_minutes: Mapped[int] = mapped_column(Integer, default=45)
+    default_return_processing_minutes: Mapped[int] = mapped_column(Integer, default=15)
+    default_turnaround_buffer_minutes: Mapped[int] = mapped_column(Integer, default=30)
+    default_route_duration_minutes: Mapped[int] = mapped_column(Integer, default=120)
+    configuration_version: Mapped[int] = mapped_column(Integer, default=1)
+    last_test_result: Mapped[dict] = mapped_column(JSON, default=dict)
+    updated_by: Mapped[str | None] = mapped_column(String(120))
+    updated_at = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class RouteEstimationCache(Base):
+    __tablename__ = "route_estimation_cache"
+    __table_args__ = (
+        Index("ix_route_cache_expires", "expires_at"),
+        Index("ix_route_cache_locations_mode", "origin_location_id", "destination_location_id", "routing_mode"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    cache_key: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    origin_location_id: Mapped[str] = mapped_column(String(120))
+    destination_location_id: Mapped[str] = mapped_column(String(120))
+    origin_latitude: Mapped[float] = mapped_column(Float)
+    origin_longitude: Mapped[float] = mapped_column(Float)
+    destination_latitude: Mapped[float] = mapped_column(Float)
+    destination_longitude: Mapped[float] = mapped_column(Float)
+    departure_time_bucket = mapped_column(DateTime(timezone=True), nullable=True)
+    vehicle_profile_hash: Mapped[str] = mapped_column(String(64))
+    routing_mode: Mapped[str] = mapped_column(String(40))
+    routing_preference: Mapped[str] = mapped_column(String(40))
+    distance_meters: Mapped[int] = mapped_column(Integer)
+    duration_seconds: Mapped[int] = mapped_column(Integer)
+    static_duration_seconds: Mapped[int | None] = mapped_column(Integer)
+    provider_source: Mapped[str] = mapped_column(String(80))
+    response_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
+    calculated_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class DataQualityIssue(Base):
