@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from io import BytesIO
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -14,13 +14,15 @@ from .phase6_demo import generate_demo_loading_orders, generate_demo_mt_availabi
 from .phase6_export import loading_order_template, mt_availability_template, prediction_export, validation_report
 from .phase6_service import (
     adjust_shipment,
-    create_prediction_run,
     duplicate_prediction_run,
+    enqueue_prediction_run,
     get_prediction_run,
+    get_prediction_run_status,
     list_prediction_models,
     list_prediction_runs,
     override_assignment,
     override_trip_assignment,
+    process_prediction_run_in_background,
 )
 from .phase6_validation import require_prediction_model, validate_loading_orders, validate_mt_availability
 
@@ -163,8 +165,9 @@ async def download_validation_report(
     return _excel_response(validation_report([*lo["issues"], *mt["issues"]]), "phase6-validation-report.xlsx")
 
 
-@router.post("/predictions")
+@router.post("/predictions", status_code=status.HTTP_202_ACCEPTED)
 async def run_prediction(
+    background_tasks: BackgroundTasks,
     depot_id: str = Form(...),
     model_id: str = Form(...),
     parameters: str = Form(default="{}"),
@@ -179,7 +182,7 @@ async def run_prediction(
             raise ValueError
     except (json.JSONDecodeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail={"code": "INVALID_PARAMETER", "message": "parameters must be a JSON object."}) from exc
-    return create_prediction_run(
+    queued = enqueue_prediction_run(
         db,
         depot_id=depot_id,
         model_id=model_id,
@@ -190,6 +193,8 @@ async def run_prediction(
         parameters=parsed_parameters,
         created_by=actor.user_id,
     )
+    background_tasks.add_task(process_prediction_run_in_background, db.get_bind(), queued["id"])
+    return queued
 
 
 @router.get("/predictions")
@@ -199,6 +204,15 @@ def prediction_history(
     _actor: Phase6Actor = Depends(require_phase6_permission("view")),
 ) -> list[dict]:
     return list_prediction_runs(db, depot_id)
+
+
+@router.get("/predictions/{run_id}/status")
+def prediction_status(
+    run_id: str,
+    db: Session = Depends(get_db),
+    _actor: Phase6Actor = Depends(require_phase6_permission("view")),
+) -> dict:
+    return get_prediction_run_status(db, run_id)
 
 
 @router.get("/predictions/{run_id}")

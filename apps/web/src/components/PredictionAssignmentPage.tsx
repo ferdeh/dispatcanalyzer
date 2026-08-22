@@ -110,6 +110,8 @@ type PredictionResult = {
   id: string;
   prediction_run_id: string;
   status: string;
+  error_code: string | null;
+  error_message: string | null;
   depot: string;
   model: Record<string, unknown>;
   created_at: string;
@@ -140,10 +142,27 @@ type PredictionResult = {
   routing_metrics: Record<string, number>;
   original_model_prediction: Array<Record<string, unknown>>;
 };
+type PredictionTask = {
+  id: string;
+  prediction_run_id: string;
+  status: "QUEUED";
+  message: string;
+};
+type PredictionRunStatus = {
+  id: string;
+  prediction_run_id: string;
+  status: "QUEUED" | "RUNNING" | "COMPLETED" | "FAILED";
+  created_at: string;
+  completed_at: string | null;
+  error_code: string | null;
+  error_message: string | null;
+  durations_ms: Record<string, number>;
+};
 type HistoryRow = {
   id: string;
   prediction_run_id: string;
   date: string;
+  depot_id: string;
   depot: string;
   model: string;
   loading_orders: number;
@@ -160,7 +179,7 @@ function pct(value: number | null | undefined) {
 
 function badgeClass(value: string) {
   if (["PASS", "HIGH", "ASSIGNED", "COMPLETED", "ACTIVE", "READY"].includes(value)) return "border-mint bg-mint/10 text-mint";
-  if (["WARNING", "MEDIUM", "MANUAL_OVERRIDE", "ASSIGNED_WITH_DELAY", "SAVED", "ROUTE_FALLBACK"].includes(value)) return "border-amber bg-amber/10 text-amber";
+  if (["WARNING", "MEDIUM", "MANUAL_OVERRIDE", "ASSIGNED_WITH_DELAY", "SAVED", "ROUTE_FALLBACK", "QUEUED", "RUNNING"].includes(value)) return "border-amber bg-amber/10 text-amber";
   return "border-rust bg-rust/10 text-rust";
 }
 
@@ -202,6 +221,7 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [runFeedback, setRunFeedback] = useState<{ status: "RUNNING" | "SUCCESS" | "ERROR"; message: string } | null>(null);
+  const [activeRun, setActiveRun] = useState<{ id: string; predictionRunId: string; depotId: string } | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [shiftTab, setShiftTab] = useState("ALL");
   const [overrideReason, setOverrideReason] = useState<Record<string, string>>({});
@@ -234,6 +254,7 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
   const canRun = Boolean(depotId && modelId && loadingOrderFile && mtFile && loValidation && mtValidation && blockingErrors === 0);
 
   useEffect(() => {
+    setActiveRun(null);
     setModelId("");
     setModels([]);
     setLoadingOrderFile(null);
@@ -256,6 +277,14 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
     ]).then(([modelRows, historyRows]) => {
       setModels(modelRows);
       setHistory(historyRows);
+      const pendingRun = historyRows.find((row) => row.status === "QUEUED" || row.status === "RUNNING");
+      if (pendingRun) {
+        setActiveRun({ id: pendingRun.id, predictionRunId: pendingRun.prediction_run_id, depotId: pendingRun.depot_id });
+        setRunFeedback({
+          status: "RUNNING",
+          message: `Prediction ${pendingRun.prediction_run_id} masih berjalan di belakang layar. Hasil akan ditampilkan otomatis.`,
+        });
+      }
     }).catch((reason: Error) => setError(reason.message));
   }, [depotId]);
 
@@ -271,6 +300,60 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
     setMtDemoDialogOpen(false);
     setMtDemoNotice(null);
   }, [modelId]);
+
+  useEffect(() => {
+    if (!activeRun) return;
+    const task = activeRun;
+    let cancelled = false;
+    let timer: number | undefined;
+
+    async function pollPredictionStatus() {
+      try {
+        const runStatus = await apiGet<PredictionRunStatus>(`/api/v1/phase6/predictions/${task.id}/status`);
+        if (cancelled) return;
+        if (runStatus.status === "COMPLETED") {
+          const payload = await apiGet<PredictionResult>(`/api/v1/phase6/predictions/${task.id}`);
+          if (cancelled) return;
+          setResult(payload);
+          setExpanded(payload.shipments[0]?.id ?? null);
+          setShiftTab("ALL");
+          setRunFeedback({ status: "SUCCESS", message: `Prediction ${payload.prediction_run_id} berhasil diselesaikan dan hasilnya telah ditampilkan.` });
+          if (depotId === task.depotId) {
+            setHistory(await apiGet<HistoryRow[]>(`/api/v1/phase6/predictions?depot_id=${encodeURIComponent(task.depotId)}`));
+          }
+          setActiveRun(null);
+          return;
+        }
+        if (runStatus.status === "FAILED") {
+          const message = `${runStatus.error_code ? `[${runStatus.error_code}] ` : ""}${runStatus.error_message ?? "Prediction gagal diproses."}`;
+          setError(message);
+          setRunFeedback({ status: "ERROR", message: `Prediction ${runStatus.prediction_run_id} gagal: ${message}` });
+          if (depotId === task.depotId) {
+            setHistory(await apiGet<HistoryRow[]>(`/api/v1/phase6/predictions?depot_id=${encodeURIComponent(task.depotId)}`));
+          }
+          setActiveRun(null);
+          return;
+        }
+        setRunFeedback({
+          status: "RUNNING",
+          message: `Prediction ${runStatus.prediction_run_id} ${runStatus.status === "QUEUED" ? "menunggu worker" : "sedang diproses"} di belakang layar. Hasil akan ditampilkan otomatis.`,
+        });
+      } catch {
+        if (cancelled) return;
+        setRunFeedback({
+          status: "RUNNING",
+          message: `Prediction ${task.predictionRunId} tetap berjalan di belakang layar. Koneksi status akan dicoba kembali otomatis.`,
+        });
+      }
+      timer = window.setTimeout(() => void pollPredictionStatus(), 1500);
+    }
+
+    void pollPredictionStatus();
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [activeRun, depotId]);
 
   async function validateFile(kind: "loading-order" | "mt-availability", file: File) {
     if (!depotId || !modelId) return null;
@@ -291,12 +374,12 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
   }
 
   async function runPrediction() {
-    if (!canRun || !loadingOrderFile || !mtFile) return;
+    if (!canRun || !loadingOrderFile || !mtFile || activeRun) return;
     setLoading(true);
     setError(null);
     setRunFeedback({
       status: "RUNNING",
-      message: "Prediction sedang diproses. Waktu proses bergantung pada jumlah loading order dan estimasi rute.",
+      message: "Mengirim task prediction ke backend…",
     });
     const body = new FormData();
     body.append("depot_id", depotId);
@@ -310,11 +393,13 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
       maximum_allowed_delay_minutes: Number(maximumDelay),
     }));
     try {
-      const payload = await apiForm<PredictionResult>("/api/v1/phase6/predictions", body);
-      setResult(payload);
-      setExpanded(payload.shipments[0]?.id ?? null);
-      setShiftTab("ALL");
-      setRunFeedback({ status: "SUCCESS", message: `Prediction ${payload.prediction_run_id} berhasil diselesaikan.` });
+      const queued = await apiForm<PredictionTask>("/api/v1/phase6/predictions", body);
+      setResult(null);
+      setActiveRun({ id: queued.id, predictionRunId: queued.prediction_run_id, depotId });
+      setRunFeedback({
+        status: "RUNNING",
+        message: `Prediction ${queued.prediction_run_id} telah dikirim dan berjalan di belakang layar. Anda tetap dapat menggunakan aplikasi.`,
+      });
       setHistory(await apiGet<HistoryRow[]>(`/api/v1/phase6/predictions?depot_id=${encodeURIComponent(depotId)}`));
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : "Prediction failed.";
@@ -435,6 +520,16 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
   }
 
   async function openHistory(runId: string) {
+    const historyRow = history.find((row) => row.id === runId);
+    if (historyRow && (historyRow.status === "QUEUED" || historyRow.status === "RUNNING")) {
+      setResult(null);
+      setActiveRun({ id: historyRow.id, predictionRunId: historyRow.prediction_run_id, depotId: historyRow.depot_id });
+      setRunFeedback({
+        status: "RUNNING",
+        message: `Prediction ${historyRow.prediction_run_id} masih berjalan di belakang layar. Hasil akan ditampilkan otomatis.`,
+      });
+      return;
+    }
     setLoading(true);
     try {
       const payload = await apiGet<PredictionResult>(`/api/v1/phase6/predictions/${runId}`);
@@ -689,7 +784,7 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
           ) : <div className="mt-4 border border-mint bg-mint/5 p-3 text-sm text-mint">Both input files passed validation.</div>}
           <div className="mt-5">
             <div className="flex justify-end">
-              <button className="inline-flex items-center gap-2 bg-petroblue px-5 py-3 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-40" disabled={!canRun || loading} onClick={() => void runPrediction()}>{loading ? <RefreshCw className="animate-spin" size={16} /> : <Play size={16} />} {loading ? "Running Prediction…" : "Run Prediction"}</button>
+              <button className="inline-flex items-center gap-2 bg-petroblue px-5 py-3 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-40" disabled={!canRun || loading || Boolean(activeRun)} onClick={() => void runPrediction()}>{loading || activeRun ? <RefreshCw className="animate-spin" size={16} /> : <Play size={16} />} {loading ? "Mengirim Task…" : activeRun ? "Prediction Berjalan…" : "Run Prediction"}</button>
             </div>
             {runFeedback && (
               <div
@@ -779,7 +874,7 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
 
       <section className="border border-line bg-white p-5">
         <div className="mb-4 flex items-center justify-between"><div><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">10. Prediction Run History</div><p className="mt-1 text-xs text-slate-500">View and export immutable runs, or create a new run from an input snapshot.</p></div>{depotId && <button className="inline-flex items-center gap-2 border border-line px-3 py-2 text-sm" onClick={() => apiGet<HistoryRow[]>(`/api/v1/phase6/predictions?depot_id=${encodeURIComponent(depotId)}`).then(setHistory)}><RefreshCw size={14} /> Refresh</button>}</div>
-        {history.length === 0 ? <div className="border border-dashed border-line p-6 text-center text-sm text-slate-500">No prediction runs for the selected depot.</div> : <div className="overflow-x-auto"><table className="min-w-full text-left text-sm"><thead className="bg-slate-50 text-xs uppercase text-slate-500"><tr>{["Run ID", "Date", "Depot", "Model", "LO", "Shipment", "Assigned", "Unassigned", "User", "Actions"].map((item) => <th key={item} className="px-3 py-2">{item}</th>)}</tr></thead><tbody>{history.map((row) => <tr key={row.id} className="border-t border-line"><td className="px-3 py-2 font-mono text-xs">{row.prediction_run_id}</td><td className="px-3 py-2">{new Date(row.date).toLocaleString()}</td><td className="px-3 py-2">{row.depot}</td><td className="px-3 py-2">{row.model}</td><td className="px-3 py-2">{row.loading_orders}</td><td className="px-3 py-2">{row.shipments}</td><td className="px-3 py-2">{row.assigned}</td><td className="px-3 py-2">{row.unassigned}</td><td className="px-3 py-2">{row.user}</td><td className="px-3 py-2"><div className="flex gap-2"><button title="View" className="border border-line p-2" onClick={() => void openHistory(row.id)}><Eye size={14} /></button><button title="Download" className="border border-line p-2" onClick={() => downloadFromApi(`/api/v1/phase6/predictions/${row.id}/export`, `${row.prediction_run_id}.xlsx`)}><Download size={14} /></button><button title="Duplicate / Re-run" className="border border-line p-2" onClick={() => void rerun(row.id)}><RefreshCw size={14} /></button></div></td></tr>)}</tbody></table></div>}
+        {history.length === 0 ? <div className="border border-dashed border-line p-6 text-center text-sm text-slate-500">No prediction runs for the selected depot.</div> : <div className="overflow-x-auto"><table className="min-w-full text-left text-sm"><thead className="bg-slate-50 text-xs uppercase text-slate-500"><tr>{["Run ID", "Date", "Status", "Depot", "Model", "LO", "Shipment", "Assigned", "Unassigned", "User", "Actions"].map((item) => <th key={item} className="px-3 py-2">{item}</th>)}</tr></thead><tbody>{history.map((row) => <tr key={row.id} className="border-t border-line"><td className="px-3 py-2 font-mono text-xs">{row.prediction_run_id}</td><td className="px-3 py-2">{new Date(row.date).toLocaleString()}</td><td className="px-3 py-2"><Badge value={row.status} /></td><td className="px-3 py-2">{row.depot}</td><td className="px-3 py-2">{row.model}</td><td className="px-3 py-2">{row.loading_orders}</td><td className="px-3 py-2">{row.shipments}</td><td className="px-3 py-2">{row.assigned}</td><td className="px-3 py-2">{row.unassigned}</td><td className="px-3 py-2">{row.user}</td><td className="px-3 py-2"><div className="flex gap-2"><button title="View" className="border border-line p-2" onClick={() => void openHistory(row.id)}><Eye size={14} /></button><button title="Download" className="border border-line p-2 disabled:opacity-40" disabled={row.status !== "COMPLETED"} onClick={() => downloadFromApi(`/api/v1/phase6/predictions/${row.id}/export`, `${row.prediction_run_id}.xlsx`)}><Download size={14} /></button><button title="Duplicate / Re-run" className="border border-line p-2 disabled:opacity-40" disabled={row.status !== "COMPLETED" || loading || Boolean(activeRun)} onClick={() => void rerun(row.id)}><RefreshCw size={14} /></button></div></td></tr>)}</tbody></table></div>}
       </section>
 
       <section className="border border-line bg-white p-5">

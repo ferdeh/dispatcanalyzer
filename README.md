@@ -823,6 +823,8 @@ Dispatcher dapat:
 
 Persistence migration `0010_phase6_prediction` menambah prediction core; `0011_phase6_demo_lo` menambah audit quantity KL; `0012_phase6_multitrip` menambah timestamp planning, `prediction_trip`, encrypted Google configuration, route cache, routing metrics, serta original/final snapshots. Migration `0013_phase6_drive_only` menormalisasi konfigurasi dan seluruh status profile MT ke mode DRIVE/NOT_REQUIRED. Prediction run snapshot menyimpan model/config version, traffic/cycle parameters, tetapi tidak menyimpan raw API key.
 
+Run Prediction diproses secara asynchronous. `POST /api/v1/phase6/predictions` memvalidasi dan menyimpan snapshot input, membuat run berstatus `QUEUED`, lalu langsung mengembalikan `202 Accepted`. Backend menjalankan inference dan assignment menggunakan session database terpisah dengan transisi `QUEUED → RUNNING → COMPLETED/FAILED`. Frontend memantau endpoint status secara berkala, tetap dapat digunakan selama task berjalan, melanjutkan pemantauan run aktif saat halaman Phase 6 dibuka kembali, dan otomatis mengambil serta menampilkan hasil lengkap ketika status menjadi `COMPLETED`.
+
 History menyediakan View, Download, dan Duplicate/Re-run. Export `.xlsx` berisi Summary, Shipment Result, Trip Timeline, MT Assignment, MT Candidates, dan Validation. UI main table menampilkan trip, MT, shipment/SPBU, planned/departure/return/next-available, confidence, status; expandable detail menampilkan LO, preliminary sequence, mode, distance, travel/service/cycle, fallback, dan missing vehicle-profile fields. MT Multi-Trip Timeline menampilkan period kendaraan sampai turnaround selesai.
 
 Authorization mengikuti seam existing melalui `X-User` dan `X-Permissions`: `phase6:view`, `phase6:run`, `phase6:export`, `phase6:override`, `google_routes:view`, dan `google_routes:manage`. Local requests tetap permissive sampai identity provider production menggantikan dependency ini.
@@ -836,8 +838,8 @@ Phase 7 tetap bertanggung jawab atas final route optimization, fleet-wide constr
 Verification terakhir:
 
 - migration PostgreSQL memiliki single head revision `0013_phase6_drive_only`
-- seluruh **55 backend tests** lulus pada deployment image
-- **14 focused Phase 6 tests** lulus pada deployment image
+- seluruh **57 backend tests** lulus pada deployment image
+- **16 focused Phase 6 tests** lulus pada deployment image
 - TypeScript type checking dan Vite production build lulus
 - API health, kedua generator Data Demo, closest-capacity MT subset, timestamp validation, rolling assignment, DRIVE route cache/fallback, encrypted settings, exports, dan persistence telah diuji
 - Vite memberi non-blocking warning untuk application chunk sekitar 1.71 MB; code splitting ECharts/page modules menjadi technical debt performance
@@ -906,6 +908,7 @@ Setiap phase harus melewati gate berikut sebelum phase berikutnya dimulai:
 - `POST /api/v1/phase6/validate/mt-availability`
 - `POST /api/v1/phase6/predictions`
 - `GET /api/v1/phase6/predictions`
+- `GET /api/v1/phase6/predictions/{run_id}/status`
 - `GET /api/v1/phase6/predictions/{run_id}`
 - `POST /api/v1/phase6/predictions/{run_id}/recalculate`
 - `PATCH /api/v1/phase6/predictions/{run_id}/shipments/{shipment_id}`

@@ -7,12 +7,14 @@ from pathlib import Path
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 from openpyxl import Workbook, load_workbook
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.config import get_settings
+from app.database import get_db
 from app.google_routes import (
     GoogleRoutesClient,
     GoogleRoutesError,
@@ -21,9 +23,16 @@ from app.google_routes import (
     save_google_routes_configuration,
 )
 from app.models import Base, MLBehavioralModel, MLSPBUClusterAssignment, MasterDepot, MasterMT, MasterSPBU
+from app.main import app
 from app.phase6_demo import generate_demo_loading_orders, generate_demo_mt_availability
 from app.phase6_routing import Phase6RouteEstimationService
-from app.phase6_service import create_prediction_run, override_assignment
+from app.phase6_service import (
+    create_prediction_run,
+    enqueue_prediction_run,
+    get_prediction_run_status,
+    override_assignment,
+    process_prediction_run,
+)
 from app.phase6_validation import validate_loading_orders, validate_mt_availability
 
 
@@ -119,6 +128,79 @@ def run_prediction(session, lo_rows: list[list], mt_rows: list[list], parameters
         parameters=parameters,
         created_by="tester",
     )
+
+
+def test_prediction_run_can_be_queued_then_processed() -> None:
+    Session = make_session()
+    with Session() as session:
+        seed(session)
+        queued = enqueue_prediction_run(
+            session,
+            depot_id="D1",
+            model_id="M1",
+            loading_order_content=workbook(
+                ["loading_order_no", "shipment_start_datetime", "spbu_no"],
+                [["LO1", "2026-08-22 09:00:00", "SPBU-A"]],
+            ),
+            loading_order_filename="lo.xlsx",
+            availability_content=workbook(
+                ["vehicle_registration_no", "initial_available_datetime"],
+                [["B1001AA", "2026-08-22 08:00:00"]],
+            ),
+            availability_filename="mt.xlsx",
+            parameters=None,
+            created_by="tester",
+        )
+        assert queued["status"] == "QUEUED"
+        assert get_prediction_run_status(session, queued["id"])["status"] == "QUEUED"
+
+        completed = process_prediction_run(session, queued["id"])
+        assert completed["status"] == "COMPLETED"
+        assert completed["summary"]["loading_orders"] == 1
+        assert get_prediction_run_status(session, queued["id"])["status"] == "COMPLETED"
+
+
+def test_prediction_api_accepts_background_task_with_202() -> None:
+    Session = make_session()
+    with Session() as session:
+        seed(session)
+
+    def override_db():
+        with Session() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        response = client.post(
+            "/api/v1/phase6/predictions",
+            data={"depot_id": "D1", "model_id": "M1", "parameters": "{}"},
+            files={
+                "loading_order_file": (
+                    "lo.xlsx",
+                    workbook(
+                        ["loading_order_no", "shipment_start_datetime", "spbu_no"],
+                        [["LO1", "2026-08-22 09:00:00", "SPBU-A"]],
+                    ),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                ),
+                "mt_availability_file": (
+                    "mt.xlsx",
+                    workbook(
+                        ["vehicle_registration_no", "initial_available_datetime"],
+                        [["B1001AA", "2026-08-22 08:00:00"]],
+                    ),
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                ),
+            },
+        )
+        assert response.status_code == 202
+        queued = response.json()
+        assert queued["status"] == "QUEUED"
+        with Session() as session:
+            assert get_prediction_run_status(session, queued["id"])["status"] == "COMPLETED"
+    finally:
+        app.dependency_overrides.clear()
 
 
 def test_timestamp_validation_derives_shift_and_rejects_bad_inputs() -> None:

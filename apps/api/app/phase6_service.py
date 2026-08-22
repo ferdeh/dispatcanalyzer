@@ -10,7 +10,7 @@ from time import perf_counter
 from fastapi import HTTPException
 from openpyxl import Workbook
 from sqlalchemy import delete, desc, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from .config import get_settings
 from .google_routes import GoogleRoutesError, configuration_snapshot, get_google_routes_configuration
@@ -131,7 +131,7 @@ def _persist_candidates(
             )
 
 
-def create_prediction_run(
+def enqueue_prediction_run(
     db: Session,
     *,
     depot_id: str,
@@ -143,7 +143,6 @@ def create_prediction_run(
     parameters: dict | None,
     created_by: str,
 ) -> dict:
-    total_started = perf_counter()
     model = require_prediction_model(db, depot_id, model_id)
     parameter_snapshot = _parameters(parameters)
     lo_validation = validate_loading_orders(
@@ -176,7 +175,7 @@ def create_prediction_run(
         depot_id=depot_id,
         model_id=model_id,
         model_version=model.model_version,
-        status="RUNNING",
+        status="QUEUED",
         created_by=created_by,
         input_loading_order_filename=loading_order_filename,
         input_mt_availability_filename=availability_filename,
@@ -202,20 +201,51 @@ def create_prediction_run(
     )
     db.add(run)
     db.commit()
-    logger.info("prediction_run_started", extra={"prediction_run_id": run_number, "model_id": model_id, "depot_id": depot_id})
+    logger.info("prediction_run_queued", extra={"prediction_run_id": run_number, "model_id": model_id, "depot_id": depot_id})
+    return {
+        "id": run.id,
+        "prediction_run_id": run.prediction_run_no,
+        "status": run.status,
+        "message": "Prediction was queued for background processing.",
+    }
+
+
+def process_prediction_run(db: Session, run_id: str) -> dict:
+    run = db.get(PredictionRun, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail={"code": "PREDICTION_RUN_NOT_FOUND", "message": "Prediction run was not found."})
+    if run.status == "COMPLETED":
+        return get_prediction_run(db, run.id)
+    if run.status == "FAILED":
+        raise HTTPException(
+            status_code=409,
+            detail={"code": run.error_code or "INFERENCE_FAILED", "message": run.error_message or "Prediction run has failed."},
+        )
+
+    total_started = perf_counter()
+    run.status = "RUNNING"
+    run.error_code = None
+    run.error_message = None
+    db.commit()
+    logger.info(
+        "prediction_run_started",
+        extra={"prediction_run_id": run.prediction_run_no, "model_id": run.model_id, "depot_id": run.depot_id},
+    )
     try:
+        model = require_prediction_model(db, run.depot_id, run.model_id)
+        parameter_snapshot = run.parameter_snapshot
         shipment_started = perf_counter()
         evidence = load_model_inference_evidence(db, model)
         run.model_snapshot = {**run.model_snapshot, **{key: evidence[key] for key in ("artifact_checksum", "artifact_source")}}
-        predictions = predict_shipments(lo_validation["normalized_rows"], model, evidence, parameter_snapshot)
+        predictions = predict_shipments(run.input_loading_order_snapshot, model, evidence, parameter_snapshot)
         run.shipment_prediction_duration_ms = round((perf_counter() - shipment_started) * 1000)
 
         candidate_started = perf_counter()
         candidate_map = predict_mt_candidates(
             db,
-            depot_id=depot_id,
+            depot_id=run.depot_id,
             shipments=predictions,
-            availability=mt_validation["normalized_rows"],
+            availability=run.input_mt_availability_snapshot,
             vehicle_compatibility_mode=get_settings().vehicle_compatibility_mode,
         )
         run.mt_prediction_duration_ms = round((perf_counter() - candidate_started) * 1000)
@@ -225,7 +255,7 @@ def create_prediction_run(
         for prediction in predictions:
             entity = PredictionShipment(
                 id=uuid.uuid4().hex,
-                prediction_run_id=run_id,
+                prediction_run_id=run.id,
                 predicted_shipment_id=prediction["predicted_shipment_id"],
                 shift_id=prediction["shift_id"],
                 shift_name=prediction["shift"],
@@ -259,7 +289,7 @@ def create_prediction_run(
                 db.add(
                     PredictionShipmentLine(
                         id=uuid.uuid4().hex,
-                        prediction_run_id=run_id,
+                        prediction_run_id=run.id,
                         prediction_shipment_id=entity.id,
                         loading_order_no=line["loading_order_no"],
                         spbu_id=line["spbu_id"],
@@ -279,15 +309,60 @@ def create_prediction_run(
         run.status = "COMPLETED"
         run.completed_at = datetime.now(timezone.utc)
         db.commit()
-        logger.info("rolling_assignment_completed", extra={"prediction_run_id": run_number, "model_id": model_id, "depot_id": depot_id})
-        return get_prediction_run(db, run_id)
+        logger.info(
+            "rolling_assignment_completed",
+            extra={"prediction_run_id": run.prediction_run_no, "model_id": run.model_id, "depot_id": run.depot_id},
+        )
+        return get_prediction_run(db, run.id)
     except HTTPException as exc:
-        _mark_run_failed(db, run_id, total_started, exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)})
+        _mark_run_failed(db, run.id, total_started, exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)})
         raise
     except Exception as exc:
-        _mark_run_failed(db, run_id, total_started, {"code": "INFERENCE_FAILED", "message": f"{type(exc).__name__}: {exc}"})
-        logger.exception("prediction_run_failed", extra={"prediction_run_id": run_number, "model_id": model_id, "depot_id": depot_id})
+        _mark_run_failed(db, run.id, total_started, {"code": "INFERENCE_FAILED", "message": f"{type(exc).__name__}: {exc}"})
+        logger.exception(
+            "prediction_run_failed",
+            extra={"prediction_run_id": run.prediction_run_no, "model_id": run.model_id, "depot_id": run.depot_id},
+        )
         raise HTTPException(status_code=500, detail={"code": "INFERENCE_FAILED", "message": "Prediction failed; the run was retained for audit."}) from exc
+
+
+def process_prediction_run_in_background(bind, run_id: str) -> None:
+    """Run one queued prediction outside the request session/thread."""
+    task_session = sessionmaker(bind=bind, autoflush=False, autocommit=False, expire_on_commit=False)
+    with task_session() as db:
+        try:
+            process_prediction_run(db, run_id)
+        except HTTPException:
+            # process_prediction_run has already persisted an auditable FAILED
+            # state; the browser learns the error through the status endpoint.
+            return
+
+
+def create_prediction_run(
+    db: Session,
+    *,
+    depot_id: str,
+    model_id: str,
+    loading_order_content: bytes,
+    loading_order_filename: str,
+    availability_content: bytes,
+    availability_filename: str,
+    parameters: dict | None,
+    created_by: str,
+) -> dict:
+    """Synchronous compatibility wrapper used by internal callers and tests."""
+    queued = enqueue_prediction_run(
+        db,
+        depot_id=depot_id,
+        model_id=model_id,
+        loading_order_content=loading_order_content,
+        loading_order_filename=loading_order_filename,
+        availability_content=availability_content,
+        availability_filename=availability_filename,
+        parameters=parameters,
+        created_by=created_by,
+    )
+    return process_prediction_run(db, queued["id"])
 
 
 def _mark_run_failed(db: Session, run_id: str, started: float, detail: dict) -> None:
@@ -503,6 +578,28 @@ def list_prediction_runs(db: Session, depot_id: str | None = None) -> list[dict]
     return [_run_history_row(db, run) for run in db.scalars(statement.order_by(desc(PredictionRun.created_at))).all()]
 
 
+def get_prediction_run_status(db: Session, run_id: str) -> dict:
+    run = db.get(PredictionRun, run_id) or db.scalar(select(PredictionRun).where(PredictionRun.prediction_run_no == run_id))
+    if not run:
+        raise HTTPException(status_code=404, detail={"code": "PREDICTION_RUN_NOT_FOUND", "message": "Prediction run was not found."})
+    return {
+        "id": run.id,
+        "prediction_run_id": run.prediction_run_no,
+        "status": run.status,
+        "created_at": _iso(run.created_at),
+        "completed_at": _iso(run.completed_at),
+        "error_code": run.error_code,
+        "error_message": run.error_message,
+        "durations_ms": {
+            "validation": run.validation_duration_ms,
+            "shipment_prediction": run.shipment_prediction_duration_ms,
+            "mt_prediction": run.mt_prediction_duration_ms,
+            "assignment_optimization": run.assignment_optimization_duration_ms,
+            "total": run.total_prediction_duration_ms,
+        },
+    }
+
+
 def _run_history_row(db: Session, run: PredictionRun) -> dict:
     shipments = db.scalars(select(PredictionShipment).where(PredictionShipment.prediction_run_id == run.id)).all()
     trips = db.scalars(select(PredictionTrip).where(PredictionTrip.prediction_run_id == run.id)).all()
@@ -659,6 +756,8 @@ def get_prediction_run(db: Session, run_id: str) -> dict:
         "created_by": run.created_by,
         "created_at": _iso(run.created_at),
         "completed_at": _iso(run.completed_at),
+        "error_code": run.error_code,
+        "error_message": run.error_message,
         "parameters": run.parameter_snapshot,
         "routing_configuration": run.routing_configuration_snapshot,
         "routing_metrics": run.routing_metrics_snapshot,
