@@ -78,10 +78,10 @@ The repository includes read-only Phase 2–4 intelligence, persisted Phase 5 ML
 - MT score: Phase 4 historical affinity; master compatibility remains a separate Phase 1 hard filter
 - Multi-SPBU compatibility: intersection across all shipment SPBU
 - Assignment: chronological rolling vehicle state with `STRICT_START` or bounded `ALLOW_DELAY`; the same MT can serve multiple non-overlapping trips
-- Route estimate: server-side Google Compute Routes/Matrix client, TRUCK profile when capability/profile allow, visibly marked DRIVE fallback, profile/time/mode-aware cache, historical/default fallback
+- Route estimate: server-side Google Compute Routes/Matrix client in enforced DRIVE-only mode for Indonesia, time/config-aware cache, and visibly marked historical/default fallback
 - Cycle time: depot processing + travel legs + per-stop service + return processing; turnaround buffer is added once to return for next availability
 - Persistence: run, shipment, line, candidate, assignment, trip, Google configuration, route cache, routing metrics, original/final snapshots, and audit
-- Overrides: compatible MT change or same-shift shipment restructure recalculates vehicle profile, route estimate, return, next availability, and downstream rolling state without Phase 5 training
+- Overrides: compatible MT change or same-shift shipment restructure recalculates route estimate, return, next availability, and downstream rolling state without Phase 5 training
 - Export: Summary, Shipment Result, Trip Timeline, MT Assignment, MT Candidates, Validation
 - Visualization: predicted same-shipment network, assignment matrix, and MT multi-trip Gantt timeline
 - Algorithm: `phase6.time_aware_multitrip.v2`

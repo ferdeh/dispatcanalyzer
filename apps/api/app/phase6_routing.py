@@ -15,7 +15,6 @@ from .google_routes import (
     GoogleRoutesClient,
     GoogleRoutesError,
     decrypt_api_key,
-    large_vehicle_profile,
 )
 from .models import (
     GoogleRoutesConfiguration,
@@ -68,8 +67,6 @@ class Phase6RouteEstimationService:
             "google_routes_cache_hit_count",
             "google_routes_cache_miss_count",
             "google_routes_failed_request_count",
-            "truck_routes_request_count",
-            "drive_fallback_count",
         ):
             self.metrics.setdefault(key, 0)
         self.client = google_client
@@ -250,37 +247,21 @@ class Phase6RouteEstimationService:
             "warning_codes": ["DEFAULT_ROUTE_ESTIMATE"],
         }
 
-    def _resolve_mode(self, mt: MasterMT) -> dict:
-        configured = self.configuration.routing_mode
-        if configured == "DRIVE":
-            return {
-                "api_mode": "DRIVE",
-                "result_mode": "DRIVE",
-                "profile": large_vehicle_profile(mt, required=False),
-                "fallback_used": False,
-                "warning_codes": [],
-            }
-        profile = large_vehicle_profile(mt, required=True)
-        truck_available = self.configuration.truck_routing_status == "AVAILABLE"
-        if profile["status"] == "COMPLETE" and truck_available:
-            return {
-                "api_mode": "TRUCK",
-                "result_mode": "TRUCK",
-                "profile": profile,
-                "fallback_used": False,
-                "warning_codes": [],
-            }
-        if self.configuration.fallback_policy == "BLOCK_IF_TRUCK_UNAVAILABLE":
-            code = "INVALID_VEHICLE_PROFILE" if profile["status"] != "COMPLETE" else "TRUCK_ROUTING_REQUIRED_BUT_UNAVAILABLE"
-            raise GoogleRoutesError(code, "Truck routing or a complete large-vehicle profile is required.", status_code=409)
-        self.metrics["drive_fallback_count"] += 1
-        warning = "LARGE_VEHICLE_PROFILE_INCOMPLETE" if profile["status"] != "COMPLETE" else "TRUCK_ROUTING_NOT_AVAILABLE"
+    @staticmethod
+    def _resolve_mode(_mt: MasterMT) -> dict:
+        # Phase 6 Indonesia is deliberately DRIVE-only. Vehicle-specific TRUCK
+        # profiles are not sent to Google Routes and cannot be enabled by stale settings.
         return {
             "api_mode": "DRIVE",
-            "result_mode": "DRIVE_FALLBACK",
-            "profile": profile,
-            "fallback_used": True,
-            "warning_codes": [warning, "DRIVE_FALLBACK"],
+            "result_mode": "DRIVE",
+            "profile": {
+                "status": "NOT_REQUIRED",
+                "missing_fields": [],
+                "unsupported_hazmat_categories": [],
+                "profile_hash": "drive-generic",
+            },
+            "fallback_used": False,
+            "warning_codes": [],
         }
 
     def _estimate_leg(
@@ -296,7 +277,7 @@ class Phase6RouteEstimationService:
         destination_id = destination_entity.depot_id if isinstance(destination_entity, MasterDepot) else destination_entity.spbu_id
         origin = self._coordinates(origin_entity)
         destination = self._coordinates(destination_entity)
-        profile_hash = mode["profile"]["profile_hash"] if mode["api_mode"] == "TRUCK" else "drive-generic"
+        profile_hash = "drive-generic"
         cache_key = self._cache_key(
             origin_id=origin_id,
             destination_id=destination_id,
@@ -313,58 +294,26 @@ class Phase6RouteEstimationService:
         estimate = None
         if self.client and origin and destination:
             self.metrics["google_routes_request_count"] += 1
-            if mode["api_mode"] == "TRUCK":
-                self.metrics["truck_routes_request_count"] += 1
             try:
                 response = self.client.compute_route(
                     origin=origin,
                     destination=destination,
                     departure_datetime=departure,
-                    routing_mode=mode["api_mode"],
+                    routing_mode="DRIVE",
                     routing_preference=self.configuration.routing_preference,
-                    vehicle_info=mode["profile"]["google_vehicle_info"] or None,
                 )
                 warnings = list(mode["warning_codes"])
                 if response["restrictions_partially_ignored"]:
                     warnings.append("ROUTE_RESTRICTIONS_PARTIALLY_IGNORED")
                 estimate = {
                     **response,
-                    "source": "GOOGLE_ROUTES_TRUCK" if mode["api_mode"] == "TRUCK" else "GOOGLE_ROUTES_DRIVE",
+                    "source": "GOOGLE_ROUTES_DRIVE",
                     "routing_confidence": "MEDIUM" if response["restrictions_partially_ignored"] else "HIGH",
                     "fallback_used": mode["fallback_used"],
                     "warning_codes": sorted(set(warnings)),
                 }
             except GoogleRoutesError:
                 self.metrics["google_routes_failed_request_count"] += 1
-                if mode["api_mode"] == "TRUCK" and self.configuration.fallback_policy == "ALLOW_DRIVE_FALLBACK":
-                    self.metrics["drive_fallback_count"] += 1
-                    mode = {
-                        **mode,
-                        "api_mode": "DRIVE",
-                        "result_mode": "DRIVE_FALLBACK",
-                        "fallback_used": True,
-                        "warning_codes": sorted(set(mode["warning_codes"] + ["TRUCK_ROUTING_NOT_AVAILABLE", "DRIVE_FALLBACK"])),
-                    }
-                    try:
-                        self.metrics["google_routes_request_count"] += 1
-                        response = self.client.compute_route(
-                            origin=origin,
-                            destination=destination,
-                            departure_datetime=departure,
-                            routing_mode="DRIVE",
-                            routing_preference=self.configuration.routing_preference,
-                        )
-                        estimate = {
-                            **response,
-                            "source": "GOOGLE_ROUTES_DRIVE",
-                            "routing_confidence": "MEDIUM",
-                            "fallback_used": True,
-                            "warning_codes": mode["warning_codes"],
-                        }
-                    except GoogleRoutesError:
-                        self.metrics["google_routes_failed_request_count"] += 1
-                elif self.configuration.fallback_policy == "BLOCK_IF_TRUCK_UNAVAILABLE" and mode["api_mode"] == "TRUCK":
-                    raise
         if estimate is None:
             estimate = self._historical_fallback(origin_entity, destination_entity, origin, destination)
             estimate["warning_codes"] = sorted(set(estimate["warning_codes"] + mode["warning_codes"]))
@@ -449,14 +398,13 @@ class Phase6RouteEstimationService:
         sources = sorted({leg["source"] for leg in legs})
         warnings = sorted({code for leg in legs for code in leg["warning_codes"]})
         fallback_used = mode["fallback_used"] or any(leg["fallback_used"] for leg in legs)
-        effective_mode = "DRIVE_FALLBACK" if "DRIVE_FALLBACK" in warnings else mode["result_mode"]
         return {
             "estimated_visit_sequence": [spbu.spbu_id for spbu in sequence],
             "estimated_visit_sequence_codes": [spbu.spbu_code for spbu in sequence],
             "routing_provider": "GOOGLE_ROUTES" if all(source.startswith("GOOGLE_ROUTES") or source == "ROUTE_CACHE" for source in sources) else "FALLBACK_ESTIMATE",
-            "routing_mode": effective_mode,
-            "routing_preference": "TRAFFIC_AWARE_OPTIMAL" if effective_mode == "TRUCK" else self.configuration.routing_preference,
-            "large_vehicle_used": effective_mode == "TRUCK" and not fallback_used,
+            "routing_mode": "DRIVE",
+            "routing_preference": self.configuration.routing_preference,
+            "large_vehicle_used": False,
             "route_distance_meters": sum(leg["distance_meters"] for leg in legs),
             "route_duration_seconds": travel_duration,
             "static_duration_seconds": sum(leg.get("static_duration_seconds") or leg["duration_seconds"] for leg in legs),

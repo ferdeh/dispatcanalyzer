@@ -19,9 +19,7 @@ router = APIRouter(prefix="/api/v1/settings/google-routes", tags=["Settings - Go
 
 class GoogleRoutesSettingsRequest(BaseModel):
     api_key: str | None = Field(default=None, max_length=512)
-    routing_mode: str = "AUTO"
     routing_preference: str = "TRAFFIC_AWARE"
-    fallback_policy: str = "ALLOW_DRIVE_FALLBACK"
     cache_ttl_minutes: int = 60
     departure_time_bucket_minutes: int = 15
     default_depot_processing_minutes: int = 30

@@ -1,17 +1,14 @@
-import { KeyRound, RefreshCw, Save, TestTube2, Trash2, XCircle } from "lucide-react";
+import { KeyRound, Save, TestTube2, Trash2, XCircle } from "lucide-react";
 import { useEffect, useState } from "react";
 import { apiGet, apiSend } from "../lib/api";
 
-type Depot = { depot_id: string; depot_name: string };
 type Settings = {
   api_key_configured: boolean;
   masked_api_key: string | null;
   encryption_ready: boolean;
   connection_status: string;
-  truck_routing_status: string;
   routing_mode: string;
   routing_preference: string;
-  fallback_policy: string;
   cache_ttl_minutes: number;
   departure_time_bucket_minutes: number;
   default_depot_processing_minutes: number;
@@ -20,16 +17,10 @@ type Settings = {
   default_turnaround_buffer_minutes: number;
   default_route_duration_minutes: number;
   last_test_result: { checks?: Record<string, string>; error_code?: string };
-  vehicle_profile_readiness: {
-    total_active_mt: number;
-    complete: number;
-    incomplete: number;
-    profiles: Array<{ vehicle_id: string; vehicle_registration_no: string; profile_status: string; missing_fields: string[]; unsupported_hazmat_categories: string[] }>;
-  };
 };
 
 function Badge({ value }: { value: string }) {
-  const good = ["CONNECTED", "AVAILABLE", "PASS", "COMPLETE"].includes(value);
+  const good = ["CONNECTED", "AVAILABLE", "PASS", "COMPLETE", "DRIVE ONLY"].includes(value);
   const warning = ["UNKNOWN", "NOT_TESTED", "NOT_AVAILABLE", "INCOMPLETE", "NOT_RUN"].includes(value);
   return <span className={`inline-flex border px-2 py-1 text-[11px] font-semibold uppercase ${good ? "border-mint bg-mint/10 text-mint" : warning ? "border-amber bg-amber/10 text-amber" : "border-rust bg-rust/10 text-rust"}`}>{value.replace(/_/g, " ")}</span>;
 }
@@ -44,8 +35,7 @@ const numericFields: Array<[keyof Settings, string]> = [
   ["default_route_duration_minutes", "Default One-Leg Duration (minutes)"],
 ];
 
-export function GoogleMapsIntegrationPage({ depots }: { depots: Depot[] }) {
-  const [depotId, setDepotId] = useState("");
+export function GoogleMapsIntegrationPage() {
   const [settings, setSettings] = useState<Settings | null>(null);
   const [apiKey, setApiKey] = useState("");
   const [loading, setLoading] = useState(false);
@@ -56,8 +46,7 @@ export function GoogleMapsIntegrationPage({ depots }: { depots: Depot[] }) {
     setLoading(true);
     setError(null);
     try {
-      const query = depotId ? `?depot_id=${encodeURIComponent(depotId)}` : "";
-      setSettings(await apiGet<Settings>(`/api/v1/settings/google-routes${query}`));
+      setSettings(await apiGet<Settings>("/api/v1/settings/google-routes"));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Google Routes settings could not be loaded.");
     } finally {
@@ -65,7 +54,7 @@ export function GoogleMapsIntegrationPage({ depots }: { depots: Depot[] }) {
     }
   }
 
-  useEffect(() => { void load(); }, [depotId]);
+  useEffect(() => { void load(); }, []);
 
   function update<K extends keyof Settings>(field: K, value: Settings[K]) {
     setSettings((current) => current ? { ...current, [field]: value } : current);
@@ -80,9 +69,7 @@ export function GoogleMapsIntegrationPage({ depots }: { depots: Depot[] }) {
       const payload = Object.fromEntries(numericFields.map(([field]) => [field, settings[field]]));
       const next = await apiSend<Settings>("/api/v1/settings/google-routes", "PUT", {
         ...payload,
-        routing_mode: settings.routing_mode,
         routing_preference: settings.routing_preference,
-        fallback_policy: settings.fallback_policy,
         ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
       });
       setSettings(next);
@@ -132,7 +119,7 @@ export function GoogleMapsIntegrationPage({ depots }: { depots: Depot[] }) {
       {notice && <div className="border border-mint bg-mint/5 px-4 py-3 text-sm text-mint">{notice}</div>}
 
       <section className="border border-line bg-white p-5">
-        <div className="flex flex-wrap items-start justify-between gap-3"><div><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Settings · Google Maps Integration</div><p className="mt-1 text-xs text-slate-500">The API key is encrypted at rest and used only by the backend. It is never returned in full or stored in browser storage.</p></div><div className="flex gap-2"><Badge value={settings.connection_status} /><Badge value={settings.truck_routing_status} /></div></div>
+        <div className="flex flex-wrap items-start justify-between gap-3"><div><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Settings · Google Maps Integration</div><p className="mt-1 text-xs text-slate-500">The API key is encrypted at rest and used only by the backend. It is never returned in full or stored in browser storage.</p></div><div className="flex gap-2"><Badge value={settings.connection_status} /><Badge value="DRIVE ONLY" /></div></div>
         {!settings.encryption_ready && <div className="mt-4 border border-rust bg-rust/5 p-3 text-sm text-rust">Server encryption is not configured. Set GOOGLE_ROUTES_ENCRYPTION_KEY before saving an API key.</div>}
       </section>
 
@@ -147,21 +134,16 @@ export function GoogleMapsIntegrationPage({ depots }: { depots: Depot[] }) {
 
         <div className="border border-line bg-white p-5">
           <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Route Configuration</div>
+          <div className="mt-4 border border-petroblue bg-petroblue/5 p-3 text-sm text-petroblue"><strong>DRIVE only for Indonesia.</strong> Phase 6 does not send TRUCK or Large Vehicle Routing requests.</div>
           <div className="mt-4 grid gap-4 sm:grid-cols-2">
-            <label className="grid gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">Vehicle Routing Mode<select className="border border-line bg-white px-3 py-2 text-sm font-normal normal-case" value={settings.routing_mode} onChange={(event) => update("routing_mode", event.target.value)}><option>AUTO</option><option>TRUCK</option><option>DRIVE</option></select></label>
+            <div className="grid gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">Vehicle Routing Mode<div className="border border-line bg-slate-50 px-3 py-2 text-sm font-normal normal-case text-slate-700">{settings.routing_mode}</div></div>
             <label className="grid gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">Traffic Preference<select className="border border-line bg-white px-3 py-2 text-sm font-normal normal-case" value={settings.routing_preference} onChange={(event) => update("routing_preference", event.target.value)}><option>TRAFFIC_UNAWARE</option><option>TRAFFIC_AWARE</option><option>TRAFFIC_AWARE_OPTIMAL</option></select></label>
-            <label className="grid gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500 sm:col-span-2">Large Vehicle Fallback<select className="border border-line bg-white px-3 py-2 text-sm font-normal normal-case" value={settings.fallback_policy} onChange={(event) => update("fallback_policy", event.target.value)}><option>ALLOW_DRIVE_FALLBACK</option><option>BLOCK_IF_TRUCK_UNAVAILABLE</option></select></label>
             {numericFields.map(([field, label]) => <label key={String(field)} className="grid gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">{label}<input className="border border-line px-3 py-2 text-sm font-normal normal-case" type="number" min="0" value={Number(settings[field])} onChange={(event) => update(field, Number(event.target.value) as never)} /></label>)}
           </div>
           <button className="mt-5 inline-flex items-center gap-2 bg-petroblue px-4 py-2 text-sm font-semibold text-white disabled:opacity-40" disabled={loading} onClick={() => void save()}><Save size={15} /> Save Route Configuration</button>
         </div>
       </section>
 
-      <section className="border border-line bg-white p-5">
-        <div className="flex flex-wrap items-center justify-between gap-3"><div><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Large Vehicle Profile Readiness</div><p className="mt-1 text-xs text-slate-500">Profiles are vehicle-specific; incomplete fields are never replaced with a generic truck.</p></div><div className="flex items-center gap-2"><select className="border border-line bg-white px-3 py-2 text-sm" value={depotId} onChange={(event) => setDepotId(event.target.value)}><option value="">All depots</option>{depots.map((depot) => <option key={depot.depot_id} value={depot.depot_id}>{depot.depot_name}</option>)}</select><button title="Refresh" className="border border-line p-2" onClick={() => void load()}><RefreshCw size={16} /></button></div></div>
-        <div className="mt-4 grid gap-3 sm:grid-cols-3"><div className="border border-line p-3"><div className="text-xs uppercase text-slate-500">Active MT</div><div className="mt-1 text-2xl font-semibold">{settings.vehicle_profile_readiness.total_active_mt}</div></div><div className="border border-mint p-3"><div className="text-xs uppercase text-slate-500">Complete</div><div className="mt-1 text-2xl font-semibold text-mint">{settings.vehicle_profile_readiness.complete}</div></div><div className="border border-amber p-3"><div className="text-xs uppercase text-slate-500">Incomplete</div><div className="mt-1 text-2xl font-semibold text-amber">{settings.vehicle_profile_readiness.incomplete}</div></div></div>
-        <div className="mt-4 overflow-x-auto"><table className="min-w-full text-left text-sm"><thead className="bg-slate-50 text-xs uppercase text-slate-500"><tr><th className="px-3 py-2">MT</th><th className="px-3 py-2">Status</th><th className="px-3 py-2">Missing / Invalid</th></tr></thead><tbody>{settings.vehicle_profile_readiness.profiles.map((profile) => <tr key={profile.vehicle_id} className="border-t border-line"><td className="px-3 py-2">{profile.vehicle_registration_no}</td><td className="px-3 py-2"><Badge value={profile.profile_status} /></td><td className="px-3 py-2 text-xs text-rust">{[...profile.missing_fields, ...profile.unsupported_hazmat_categories.map((item) => `hazmat:${item}`)].join(", ") || "—"}</td></tr>)}</tbody></table></div>
-      </section>
     </div>
   );
 }

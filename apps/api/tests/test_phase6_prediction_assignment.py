@@ -7,7 +7,6 @@ from pathlib import Path
 
 import httpx
 import pytest
-from fastapi import HTTPException
 from openpyxl import Workbook, load_workbook
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -18,7 +17,6 @@ from app.google_routes import (
     GoogleRoutesClient,
     GoogleRoutesError,
     get_google_routes_configuration,
-    large_vehicle_profile,
     public_google_routes_configuration,
     save_google_routes_configuration,
 )
@@ -228,7 +226,7 @@ def test_demo_loading_order_uses_timestamps_and_requested_total() -> None:
         assert sum(row["order_quantity_kl"] for row in validated["normalized_rows"]) == 18
 
 
-def test_google_client_truck_request_uses_vehicle_specific_supported_fields() -> None:
+def test_google_client_is_drive_only_and_rejects_truck() -> None:
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -239,38 +237,39 @@ def test_google_client_truck_request_uses_vehicle_specific_supported_fields() ->
     client = GoogleRoutesClient("secret-test-key", transport=httpx.MockTransport(handler))
     response = client.compute_route(
         origin=(-6.2, 106.8), destination=(-6.3, 106.9), departure_datetime=datetime(2099, 1, 1, tzinfo=timezone.utc),
-        routing_mode="TRUCK", routing_preference="TRAFFIC_AWARE",
-        vehicle_info={"totalHeightMm": 3500, "totalWidthMm": 2500, "totalLengthMm": 9000, "totalWeightKg": 16000, "totalAxleCount": 3},
+        routing_mode="DRIVE", routing_preference="TRAFFIC_AWARE",
     )
-    assert captured["travelMode"] == "TRUCK"
-    assert captured["routingPreference"] == "TRAFFIC_AWARE_OPTIMAL"
-    assert captured["routeModifiers"]["vehicleInfo"]["totalHeightMm"] == 3500
+    assert captured["travelMode"] == "DRIVE"
+    assert captured["routingPreference"] == "TRAFFIC_AWARE"
+    assert "routeModifiers" not in captured
     assert response["duration_seconds"] == 600
+
+    with pytest.raises(GoogleRoutesError) as raised:
+        client.compute_route(
+            origin=(-6.2, 106.8), destination=(-6.3, 106.9), departure_datetime=None,
+            routing_mode="TRUCK", routing_preference="TRAFFIC_AWARE",
+        )
+    assert raised.value.code == "UNSUPPORTED_ROUTING_MODE"
 
 
 class FakeRoutesClient:
     def __init__(self):
         self.calls = 0
+        self.routing_modes: list[str] = []
 
-    def compute_route(self, **_kwargs):
+    def compute_route(self, **kwargs):
         self.calls += 1
+        self.routing_modes.append(kwargs["routing_mode"])
         return {"distance_meters": 1000, "duration_seconds": 600, "static_duration_seconds": 550, "restrictions_partially_ignored": False, "warnings": []}
 
 
-def test_route_cache_separates_vehicle_profiles_and_reuses_exact_profile() -> None:
+def test_route_cache_uses_generic_drive_profile_across_vehicles() -> None:
     Session = make_session()
     with Session() as session:
         seed(session)
         mt1, mt2 = session.get(MasterMT, "T1"), session.get(MasterMT, "T2")
-        for mt, height in ((mt1, 3500), (mt2, 3800)):
-            mt.vehicle_height_mm = height
-            mt.vehicle_width_mm = 2500
-            mt.vehicle_length_mm = 9000
-            mt.vehicle_weight_kg = 16000
-            mt.vehicle_axle_count = 3
         configuration = get_google_routes_configuration(session)
-        configuration.routing_mode = "TRUCK"
-        configuration.truck_routing_status = "AVAILABLE"
+        configuration.routing_mode = "DRIVE"
         fake = FakeRoutesClient()
         metrics = {}
         service = Phase6RouteEstimationService(session, configuration=configuration, model_id="M1", metrics=metrics, google_client=fake)
@@ -280,34 +279,28 @@ def test_route_cache_separates_vehicle_profiles_and_reuses_exact_profile() -> No
         session.flush()
         service.estimate_trip(depot=depot, spbus=[spbu], mt=mt1, predicted_departure_datetime=departure, max_exact_sequence_stops=4)
         service.estimate_trip(depot=depot, spbus=[spbu], mt=mt2, predicted_departure_datetime=departure, max_exact_sequence_stops=4)
-        assert fake.calls == 4  # outbound + return for each distinct profile; exact repeat uses cache
-        assert metrics["google_routes_cache_hit_count"] == 2
+        assert fake.calls == 2  # outbound + return once; DRIVE cache is vehicle agnostic
+        assert metrics["google_routes_cache_hit_count"] == 4
 
 
-def test_drive_fallback_visible_and_block_policy_errors() -> None:
+def test_route_estimation_forces_drive_even_with_legacy_truck_configuration() -> None:
     Session = make_session()
     with Session() as session:
         seed(session)
         configuration = get_google_routes_configuration(session)
         configuration.routing_mode = "TRUCK"
-        configuration.truck_routing_status = "NOT_AVAILABLE"
-        configuration.fallback_policy = "ALLOW_DRIVE_FALLBACK"
-        service = Phase6RouteEstimationService(session, configuration=configuration, model_id="M1")
+        configuration.truck_routing_status = "AVAILABLE"
+        fake = FakeRoutesClient()
+        service = Phase6RouteEstimationService(session, configuration=configuration, model_id="M1", google_client=fake)
         estimate = service.estimate_trip(
             depot=session.get(MasterDepot, "D1"), spbus=[session.get(MasterSPBU, "A")], mt=session.get(MasterMT, "T1"),
             predicted_departure_datetime=datetime(2099, 1, 1, tzinfo=timezone.utc), max_exact_sequence_stops=4,
         )
-        assert estimate["routing_mode"] == "DRIVE_FALLBACK"
-        assert estimate["fallback_used"] is True
-        assert "DRIVE_FALLBACK" in estimate["warning_codes"]
-
-        configuration.fallback_policy = "BLOCK_IF_TRUCK_UNAVAILABLE"
-        with pytest.raises(GoogleRoutesError) as raised:
-            service.estimate_trip(
-                depot=session.get(MasterDepot, "D1"), spbus=[session.get(MasterSPBU, "A")], mt=session.get(MasterMT, "T1"),
-                predicted_departure_datetime=datetime(2099, 1, 1, tzinfo=timezone.utc), max_exact_sequence_stops=4,
-            )
-        assert raised.value.code == "INVALID_VEHICLE_PROFILE"
+        assert estimate["routing_mode"] == "DRIVE"
+        assert estimate["large_vehicle_used"] is False
+        assert estimate["vehicle_profile_snapshot"]["profile_status"] == "NOT_REQUIRED"
+        assert fake.calls == 2
+        assert set(fake.routing_modes) == {"DRIVE"}
 
 
 def test_api_key_is_encrypted_masked_and_never_returned(monkeypatch, caplog) -> None:
@@ -327,6 +320,9 @@ def test_api_key_is_encrypted_masked_and_never_returned(monkeypatch, caplog) -> 
             assert raw_key not in caplog.text
             public = public_google_routes_configuration(session)
             assert raw_key not in json.dumps(public)
+            assert public["routing_mode"] == "DRIVE"
+            assert public["truck_routing_status"] == "DISABLED_FOR_INDONESIA"
+            assert "vehicle_profile_readiness" not in public
     finally:
         get_settings.cache_clear()
 

@@ -467,7 +467,7 @@ function crudConfigs(depots: Depot[], tagTypes: TagType[]): Record<string, CrudD
       idKey: "mt_id",
       titleKey: "vehicle_registration",
       depotFilter: true,
-      columns: ["vehicle_registration", "vehicle_name_raw", "capacity_label", "number_of_compartments", "large_vehicle_profile_status", ...mtTagColumns, "active_status"],
+      columns: ["vehicle_registration", "vehicle_name_raw", "capacity_label", "number_of_compartments", ...mtTagColumns, "active_status"],
       fields: [
         { key: "vehicle_name_raw", label: "Raw Name", required: true },
         { key: "vehicle_registration", label: "Registration" },
@@ -475,12 +475,6 @@ function crudConfigs(depots: Depot[], tagTypes: TagType[]): Record<string, CrudD
         { key: "vehicle_type_tag", label: "Tag Vehicle Class", kind: "number" },
         ...editableTagFields,
         { key: "number_of_compartments", label: "Compartments", kind: "number" },
-        { key: "vehicle_height_mm", label: "Vehicle Height (mm)", kind: "number" },
-        { key: "vehicle_width_mm", label: "Vehicle Width (mm)", kind: "number" },
-        { key: "vehicle_length_mm", label: "Vehicle Length (mm)", kind: "number" },
-        { key: "vehicle_weight_kg", label: "Vehicle Weight (kg)", kind: "number" },
-        { key: "vehicle_axle_count", label: "Axle Count", kind: "number" },
-        { key: "hazmat_category", label: "Hazardous Goods Categories", kind: "textarea" },
         { key: "depot_id", label: "Depot", kind: "select", options: depotOptions },
         { key: "assignee", label: "Assignee" },
         { key: "active_status", label: "Status", kind: "select", options: statusOptions }
@@ -2198,7 +2192,7 @@ function App() {
                           : currentPage === "prediction-assignment"
                             ? "Phase 6 time-aware shipment prediction, rolling multi-trip MT assignment, and availability estimates."
                             : currentPage === "google-maps-integration"
-                              ? "Secure Google Routes integration, truck-routing capability, fallback, cache, and cycle-time settings."
+                              ? "Secure Google Routes integration with DRIVE-only estimation, cache, fallback, and cycle-time settings."
                   : "Data Foundation Overview"}
             </p>
           </div>
@@ -2304,7 +2298,7 @@ function App() {
         )}
 
         {currentPage === "google-maps-integration" && (
-          <GoogleMapsIntegrationPage depots={depots} />
+          <GoogleMapsIntegrationPage />
         )}
 
         {currentPage === "pairing-intelligence" && (

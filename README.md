@@ -775,7 +775,7 @@ Assignment diproses ascending `planned_start_datetime`. State awal tiap MT adala
 - `STRICT_START`: MT harus available pada planned start
 - `ALLOW_DELAY`: departure boleh bergeser sampai `maximum_allowed_delay_minutes`, dengan status `ASSIGNED_WITH_DELAY`
 
-Unassigned reason meliputi `NO_MT_AVAILABLE_AT_REQUIRED_TIME`, `NO_COMPATIBLE_MT`, `LOW_PREDICTION_CONFIDENCE`, `ROUTING_ESTIMATE_FAILED`, dan `TRUCK_ROUTING_REQUIRED_BUT_UNAVAILABLE`.
+Unassigned reason meliputi `NO_MT_AVAILABLE_AT_REQUIRED_TIME`, `NO_COMPATIBLE_MT`, `LOW_PREDICTION_CONFIDENCE`, dan `ROUTING_ESTIMATE_FAILED`.
 
 #### Google Maps Routes Integration
 
@@ -785,7 +785,7 @@ Semua request Google berlangsung server-side melalui Compute Routes atau Compute
 - tidak pernah dikembalikan penuh, disimpan di localStorage, dicatat dalam log, snapshot run, atau export
 - dikelola melalui `/settings/google-maps-integration` dengan Save/Replace/Delete/Test Connection
 
-Mode routing adalah `AUTO`, `TRUCK`, atau `DRIVE`. TRUCK memakai profile MT spesifik (`vehicle_height_mm`, `vehicle_width_mm`, `vehicle_length_mm`, `vehicle_weight_kg`, `vehicle_axle_count`, dan supported `hazmat_category`) hanya bila capability tersedia dan profile complete. `ALLOW_DRIVE_FALLBACK` menghasilkan `routing_mode=DRIVE_FALLBACK`, warning terlihat, dan confidence lebih konservatif; `BLOCK_IF_TRUCK_UNAVAILABLE` memblokir trip yang membutuhkan truck route.
+Phase 6 Indonesia menggunakan mode `DRIVE` secara tetap. Dukungan `TRUCK`/Large Vehicle Routing dimatikan karena belum tersedia untuk wilayah operasi Indonesia. Backend menolak mode selain DRIVE, test connection hanya memeriksa Compute Routes dan Compute Route Matrix, dan UI tidak menyediakan kontrol maupun profile large-vehicle. Jika Google Routes tidak tersedia, sistem tetap menggunakan historical route, cluster median, atau configured default dengan warning `ROUTE_FALLBACK` yang terlihat.
 
 Route cache memisahkan origin, destination, departure bucket, routing preference, routing mode, configuration version, dan vehicle-profile hash. Estimasi fallback tidak menjadikan Google single point of failure:
 
@@ -815,12 +815,12 @@ Turnaround buffer disimpan terpisah dan tidak dihitung dua kali dalam `total_cyc
 
 Dispatcher dapat:
 
-- mengganti MT hanya ke candidate yang compatible; route memakai profile MT baru dan timeline downstream dihitung ulang
+- mengganti MT hanya ke candidate yang compatible; route dan timeline downstream dihitung ulang dalam mode DRIVE
 - move LO/SPBU ke shipment same-shift, membuat shipment baru/single, atau combine same-shift shipment
 - memicu ulang candidate scoring, compatibility filter, rolling state, route duration, return, dan affected future availability tanpa training ulang
 - membandingkan immutable `original_model_prediction` dengan `final_dispatch_prediction`
 
-Persistence migration `0010_phase6_prediction` menambah prediction core; `0011_phase6_demo_lo` menambah audit quantity KL; `0012_phase6_multitrip` menambah timestamp planning, `prediction_trip`, encrypted Google configuration, route cache, profile large-vehicle MT, routing metrics, serta original/final snapshots. Prediction run snapshot menyimpan model/config version, traffic/fallback/cycle parameters, tetapi tidak menyimpan raw API key.
+Persistence migration `0010_phase6_prediction` menambah prediction core; `0011_phase6_demo_lo` menambah audit quantity KL; `0012_phase6_multitrip` menambah timestamp planning, `prediction_trip`, encrypted Google configuration, route cache, routing metrics, serta original/final snapshots. Migration `0013_phase6_drive_only` menormalisasi konfigurasi dan seluruh status profile MT ke mode DRIVE/NOT_REQUIRED. Prediction run snapshot menyimpan model/config version, traffic/cycle parameters, tetapi tidak menyimpan raw API key.
 
 History menyediakan View, Download, dan Duplicate/Re-run. Export `.xlsx` berisi Summary, Shipment Result, Trip Timeline, MT Assignment, MT Candidates, dan Validation. UI main table menampilkan trip, MT, shipment/SPBU, planned/departure/return/next-available, confidence, status; expandable detail menampilkan LO, preliminary sequence, mode, distance, travel/service/cycle, fallback, dan missing vehicle-profile fields. MT Multi-Trip Timeline menampilkan period kendaraan sampai turnaround selesai.
 
@@ -834,7 +834,7 @@ Phase 7 tetap bertanggung jawab atas final route optimization, fleet-wide constr
 
 Verification terakhir:
 
-- migration PostgreSQL memiliki single head revision `0012_phase6_multitrip`
+- migration PostgreSQL memiliki single head revision `0013_phase6_drive_only`
 - seluruh **54 backend tests** lulus pada deployment image
 - **13 focused Phase 6 tests** lulus pada deployment image
 - TypeScript type checking dan Vite production build lulus

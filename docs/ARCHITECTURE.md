@@ -24,13 +24,13 @@ Timestamped LO + Initial MT Availability
     → Phase 5 time-feasible shipment prediction
     → Phase 4 MT score + Phase 1 compatibility
     → rolling chronological vehicle state
-    → vehicle-specific Google/fallback travel estimate
+    → DRIVE-only Google/fallback travel estimate
     → cycle time, estimated return, next availability
     → persisted final trip timeline + Phase 7 input
 ```
 
 `Phase6RouteEstimationService` estimates one predicted shipment at a time. It may evaluate small permutations or nearest-neighbor stop order solely to estimate cycle time. It never calls Google Route Optimization, GMPRO `optimizeTours`, or a fleet-wide VRP solver. That boundary keeps preliminary `estimated_visit_sequence` distinct from the final optimized route owned by Phase 7.
 
-Google Routes requests are backend-only. The global API key is encrypted using an environment-provided application secret; the database stores ciphertext/fingerprint/mask, the frontend receives only the mask, and prediction snapshots retain configuration version—not key material. Route cache identity includes endpoints, departure bucket, routing preference, effective routing mode, configuration version, and vehicle profile hash. `TRUCK` uses the selected MT profile; unavailable or invalid truck routing either produces a visible `DRIVE_FALLBACK` or blocks, according to policy.
+Google Routes requests are backend-only. The global API key is encrypted using an environment-provided application secret; the database stores ciphertext/fingerprint/mask, the frontend receives only the mask, and prediction snapshots retain configuration version—not key material. Phase 6 Indonesia enforces `DRIVE`; no TRUCK/Large Vehicle request or profile is sent. Route cache identity includes endpoints, departure bucket, routing preference, DRIVE mode, and configuration version. Google failures use visibly marked historical/default route estimates.
 
 Phase 6 run rows retain immutable input/model/routing/parameter/original-result snapshots and a separate final dispatch snapshot. Audited overrides recalculate route/cycle/availability and downstream rolling state without retraining Phase 5 or rewriting the original model layer. `phase6_auth` exposes `phase6:view`, `phase6:run`, `phase6:export`, `phase6:override`, `google_routes:view`, and `google_routes:manage` through the same replaceable header seam.
