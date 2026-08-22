@@ -226,6 +226,8 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
   const [shiftTab, setShiftTab] = useState("ALL");
   const [shipmentPage, setShipmentPage] = useState(1);
   const [shipmentsPerPage, setShipmentsPerPage] = useState(25);
+  const [timelinePage, setTimelinePage] = useState(1);
+  const [mtPerTimelinePage, setMtPerTimelinePage] = useState(10);
   const [overrideReason, setOverrideReason] = useState<Record<string, string>>({});
   const [moveTargets, setMoveTargets] = useState<Record<string, string>>({});
   const [minimumConfidence, setMinimumConfidence] = useState("0.60");
@@ -622,9 +624,33 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
     () => [...new Map(visibleShipments.flatMap((shipment) => shipment.candidates.map((candidate) => [candidate.vehicle_id, candidate.vehicle_registration_no]))).entries()],
     [visibleShipments],
   );
+  const timelineRows = result?.mt_timeline ?? [];
+  const timelinePageCount = Math.max(1, Math.ceil(timelineRows.length / mtPerTimelinePage));
+  const currentTimelinePage = Math.min(timelinePage, timelinePageCount);
+  const paginatedTimelineRows = useMemo(() => {
+    const start = (currentTimelinePage - 1) * mtPerTimelinePage;
+    return timelineRows.slice(start, start + mtPerTimelinePage);
+  }, [currentTimelinePage, mtPerTimelinePage, timelineRows]);
+  const timelinePaginationPages = useMemo(
+    () => [...new Set([1, currentTimelinePage - 1, currentTimelinePage, currentTimelinePage + 1, timelinePageCount])]
+      .filter((page) => page >= 1 && page <= timelinePageCount)
+      .sort((left, right) => left - right),
+    [currentTimelinePage, timelinePageCount],
+  );
+  const timelineRangeStart = timelineRows.length === 0 ? 0 : (currentTimelinePage - 1) * mtPerTimelinePage + 1;
+  const timelineRangeEnd = Math.min(currentTimelinePage * mtPerTimelinePage, timelineRows.length);
+
+  useEffect(() => {
+    setTimelinePage(1);
+  }, [result?.id, mtPerTimelinePage]);
+
+  function goToTimelinePage(page: number) {
+    setTimelinePage(Math.min(Math.max(1, page), timelinePageCount));
+  }
+
   const timelineOption = useMemo(() => {
-    const vehicles = result?.mt_timeline.map((row) => row.vehicle_registration_no) ?? [];
-    const data = (result?.mt_timeline ?? []).flatMap((row, vehicleIndex) => row.trips.map((trip) => ({
+    const vehicles = paginatedTimelineRows.map((row) => row.vehicle_registration_no);
+    const data = paginatedTimelineRows.flatMap((row, vehicleIndex) => row.trips.map((trip) => ({
       value: [new Date(trip.start).getTime(), new Date(trip.next_available).getTime(), vehicleIndex],
       name: `${trip.trip_id} · ${trip.shipment_id}`,
       status: trip.status,
@@ -648,7 +674,7 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
         data,
       }],
     };
-  }, [result]);
+  }, [paginatedTimelineRows]);
 
   return (
     <div className="space-y-5">
@@ -908,7 +934,35 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
           </section>
 
           <section className="grid gap-5 xl:grid-cols-2">
-            <div className="border border-line bg-white p-5 xl:col-span-2"><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">MT Multi-Trip Timeline</div><p className="mt-1 text-xs text-slate-500">Each bar runs from predicted departure through the turnaround buffer. Bars for one MT must not overlap.</p>{result.mt_timeline.length ? <ReactECharts option={timelineOption} style={{ height: Math.max(280, result.mt_timeline.length * 64) }} /> : <div className="mt-5 border border-dashed border-line p-6 text-center text-sm text-slate-500">No assigned trip timeline.</div>}</div>
+            <div className="border border-line bg-white p-5 xl:col-span-2">
+              <div className="flex flex-wrap items-end justify-between gap-4">
+                <div><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">MT Multi-Trip Timeline</div><p className="mt-1 text-xs text-slate-500">Each bar runs from predicted departure through the turnaround buffer. Bars for one MT must not overlap.</p></div>
+                <label className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                  MT per page
+                  <select className="border border-line bg-white px-3 py-2 text-sm font-normal normal-case tracking-normal text-petroink" value={mtPerTimelinePage} onChange={(event) => setMtPerTimelinePage(Number(event.target.value))}>
+                    {[10, 25, 50].map((size) => <option key={size} value={size}>{size}</option>)}
+                  </select>
+                </label>
+              </div>
+              {timelineRows.length ? (
+                <>
+                  <ReactECharts option={timelineOption} style={{ height: Math.max(280, paginatedTimelineRows.length * 64) }} />
+                  <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-line pt-4 text-sm">
+                    <div className="text-slate-500">Showing {timelineRangeStart.toLocaleString("id-ID")}–{timelineRangeEnd.toLocaleString("id-ID")} of {timelineRows.length.toLocaleString("id-ID")} MT</div>
+                    <div className="flex items-center gap-1">
+                      <button className="border border-line px-3 py-2 disabled:cursor-not-allowed disabled:opacity-40" disabled={currentTimelinePage === 1} onClick={() => goToTimelinePage(currentTimelinePage - 1)}>Previous MT</button>
+                      {timelinePaginationPages.map((page, index) => (
+                        <span key={page} className="contents">
+                          {index > 0 && page - timelinePaginationPages[index - 1] > 1 && <span className="px-1 text-slate-400">…</span>}
+                          <button className={`min-w-9 border px-3 py-2 ${page === currentTimelinePage ? "border-petroblue bg-petroblue text-white" : "border-line"}`} aria-label={`MT timeline page ${page}`} aria-current={page === currentTimelinePage ? "page" : undefined} onClick={() => goToTimelinePage(page)}>{page}</button>
+                        </span>
+                      ))}
+                      <button className="border border-line px-3 py-2 disabled:cursor-not-allowed disabled:opacity-40" disabled={currentTimelinePage === timelinePageCount} onClick={() => goToTimelinePage(currentTimelinePage + 1)}>Next MT</button>
+                    </div>
+                  </div>
+                </>
+              ) : <div className="mt-5 border border-dashed border-line p-6 text-center text-sm text-slate-500">No assigned trip timeline.</div>}
+            </div>
             <div className="border border-line bg-white p-5"><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">9A. Shipment Prediction Network</div><p className="mt-1 text-xs text-slate-500">Nodes are SPBU; edges mean predicted same shipment; thickness is model confidence. This is not a route map.</p><ReactECharts option={networkOption} style={{ height: 360 }} /></div>
             <div className="border border-line bg-white p-5"><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">9B. MT Assignment Matrix</div><p className="mt-1 text-xs text-slate-500">Scores are Phase 4 affinity evidence before rolling-time eligibility; X is master-incompatible; outlined cell is assigned.</p><div className="mt-4 max-h-[360px] overflow-auto"><table className="min-w-full text-center text-xs"><thead className="sticky top-0 bg-white"><tr><th className="p-2 text-left">Shipment</th>{matrixVehicles.map(([id, registration]) => <th key={id} className="p-2">{registration}</th>)}</tr></thead><tbody>{visibleShipments.map((shipment) => <tr key={shipment.id} className="border-t border-line"><th className="whitespace-nowrap p-2 text-left">{shipment.predicted_shipment_id}</th>{matrixVehicles.map(([vehicleId]) => {
               const candidate = shipment.candidates.find((item) => item.vehicle_id === vehicleId);
