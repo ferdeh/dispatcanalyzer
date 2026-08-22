@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 
@@ -22,10 +22,11 @@ from app.google_routes import (
     public_google_routes_configuration,
     save_google_routes_configuration,
 )
-from app.models import Base, MLBehavioralModel, MLSPBUClusterAssignment, MasterDepot, MasterMT, MasterSPBU
+from app.models import Base, MLBehavioralModel, MLSPBUClusterAssignment, MasterDepot, MasterMT, MasterSPBU, PredictionJob
 from app.main import app
 from app.phase6_demo import generate_demo_loading_orders, generate_demo_mt_availability
 from app.phase6_routing import Phase6RouteEstimationService
+from app.phase6_jobs import claim_next_prediction_job, heartbeat_prediction_job, recover_stale_prediction_jobs, utc_now
 from app.phase6_service import (
     create_prediction_run,
     enqueue_prediction_run,
@@ -154,13 +155,24 @@ def test_prediction_run_can_be_queued_then_processed() -> None:
         assert queued["status"] == "QUEUED"
         assert get_prediction_run_status(session, queued["id"])["status"] == "QUEUED"
 
-        completed = process_prediction_run(session, queued["id"])
+        claimed = claim_next_prediction_job(session, worker_id="test-worker", lease_seconds=30)
+        assert claimed is not None
+        assert claimed.run_id == queued["id"]
+        assert heartbeat_prediction_job(
+            session,
+            run_id=claimed.run_id,
+            lease_token=claimed.lease_token,
+            lease_seconds=30,
+        )
+
+        completed = process_prediction_run(session, queued["id"], lease_token=claimed.lease_token)
         assert completed["status"] == "COMPLETED"
         assert completed["summary"]["loading_orders"] == 1
         assert get_prediction_run_status(session, queued["id"])["status"] == "COMPLETED"
+        assert session.get(PredictionJob, queued["id"]).status == "COMPLETED"
 
 
-def test_prediction_api_accepts_background_task_with_202() -> None:
+def test_prediction_api_persists_queue_task_with_202() -> None:
     Session = make_session()
     with Session() as session:
         seed(session)
@@ -198,9 +210,51 @@ def test_prediction_api_accepts_background_task_with_202() -> None:
         queued = response.json()
         assert queued["status"] == "QUEUED"
         with Session() as session:
-            assert get_prediction_run_status(session, queued["id"])["status"] == "COMPLETED"
+            status_payload = get_prediction_run_status(session, queued["id"])
+            assert status_payload["status"] == "QUEUED"
+            assert status_payload["queue"]["attempt_count"] == 0
     finally:
         app.dependency_overrides.clear()
+
+
+def test_stale_worker_job_is_requeued_then_fails_at_retry_limit() -> None:
+    Session = make_session()
+    with Session() as session:
+        seed(session)
+        queued = enqueue_prediction_run(
+            session,
+            depot_id="D1",
+            model_id="M1",
+            loading_order_content=workbook(
+                ["loading_order_no", "shipment_start_datetime", "spbu_no"],
+                [["LO1", "2026-08-22 09:00:00", "SPBU-A"]],
+            ),
+            loading_order_filename="lo.xlsx",
+            availability_content=workbook(
+                ["vehicle_registration_no", "initial_available_datetime"],
+                [["B1001AA", "2026-08-22 08:00:00"]],
+            ),
+            availability_filename="mt.xlsx",
+            parameters=None,
+            created_by="tester",
+        )
+        job = session.get(PredictionJob, queued["id"])
+        job.max_attempts = 2
+        session.commit()
+
+        first = claim_next_prediction_job(session, worker_id="worker-1", lease_seconds=1)
+        assert first is not None
+        recovered = recover_stale_prediction_jobs(session, now=utc_now() + timedelta(seconds=2))
+        assert recovered == {"requeued": 1, "failed": 0}
+        assert get_prediction_run_status(session, queued["id"])["status"] == "QUEUED"
+
+        second = claim_next_prediction_job(session, worker_id="worker-2", lease_seconds=1)
+        assert second is not None
+        recovered = recover_stale_prediction_jobs(session, now=utc_now() + timedelta(seconds=2))
+        assert recovered == {"requeued": 0, "failed": 1}
+        payload = get_prediction_run_status(session, queued["id"])
+        assert payload["status"] == "FAILED"
+        assert payload["error_code"] == "WORKER_HEARTBEAT_TIMEOUT"
 
 
 def test_timestamp_validation_derives_shift_and_rejects_bad_inputs() -> None:
@@ -402,6 +456,31 @@ def test_route_cache_uses_generic_drive_profile_across_vehicles() -> None:
         service.estimate_trip(depot=depot, spbus=[spbu], mt=mt2, predicted_departure_datetime=departure, max_exact_sequence_stops=4)
         assert fake.calls == 2  # outbound + return once; DRIVE cache is vehicle agnostic
         assert metrics["google_routes_cache_hit_count"] == 4
+
+
+def test_route_cache_reuses_pending_rows_before_session_flush() -> None:
+    Session = make_session()
+    with Session() as session:
+        seed(session)
+        configuration = get_google_routes_configuration(session)
+        fake = FakeRoutesClient()
+        service = Phase6RouteEstimationService(
+            session,
+            configuration=configuration,
+            model_id="M1",
+            google_client=fake,
+        )
+        arguments = {
+            "depot": session.get(MasterDepot, "D1"),
+            "spbus": [session.get(MasterSPBU, "A")],
+            "mt": session.get(MasterMT, "T1"),
+            "predicted_departure_datetime": datetime(2099, 1, 1, 1, tzinfo=timezone.utc),
+            "max_exact_sequence_stops": 4,
+        }
+        service.estimate_trip(**arguments)
+        service.estimate_trip(**arguments)
+        session.flush()
+        assert fake.calls == 2
 
 
 def test_route_estimation_forces_drive_even_with_legacy_truck_configuration() -> None:

@@ -23,6 +23,7 @@ Services:
 - API: `http://localhost:8000/api/v1/health`
 - Web: `http://localhost:3000`
 - PostgreSQL/PostGIS: `localhost:5432`
+- Phase 6 worker: service internal `phase6-worker`; status/log dapat diperiksa dengan `docker compose ps phase6-worker` dan `docker compose logs -f phase6-worker`
 
 Catatan lokal: jika port `3000` sudah terpakai, jalankan web dengan port lain, misalnya:
 
@@ -821,9 +822,13 @@ Dispatcher dapat:
 - memicu ulang candidate scoring, compatibility filter, rolling state, route duration, return, dan affected future availability tanpa training ulang
 - membandingkan immutable `original_model_prediction` dengan `final_dispatch_prediction`
 
-Persistence migration `0010_phase6_prediction` menambah prediction core; `0011_phase6_demo_lo` menambah audit quantity KL; `0012_phase6_multitrip` menambah timestamp planning, `prediction_trip`, encrypted Google configuration, route cache, routing metrics, serta original/final snapshots. Migration `0013_phase6_drive_only` menormalisasi konfigurasi dan seluruh status profile MT ke mode DRIVE/NOT_REQUIRED. Prediction run snapshot menyimpan model/config version, traffic/cycle parameters, tetapi tidak menyimpan raw API key.
+Persistence migration `0010_phase6_prediction` menambah prediction core; `0011_phase6_demo_lo` menambah audit quantity KL; `0012_phase6_multitrip` menambah timestamp planning, `prediction_trip`, encrypted Google configuration, route cache, routing metrics, serta original/final snapshots. Migration `0013_phase6_drive_only` menormalisasi konfigurasi dan seluruh status profile MT ke mode DRIVE/NOT_REQUIRED. Migration `0014_phase6_worker` menambah durable PostgreSQL job queue, worker lease, heartbeat, attempt count, dan recovery metadata. Prediction run snapshot menyimpan model/config version, traffic/cycle parameters, tetapi tidak menyimpan raw API key.
 
-Run Prediction diproses secara asynchronous. `POST /api/v1/phase6/predictions` memvalidasi dan menyimpan snapshot input, membuat run berstatus `QUEUED`, lalu langsung mengembalikan `202 Accepted`. Backend menjalankan inference dan assignment menggunakan session database terpisah dengan transisi `QUEUED → RUNNING → COMPLETED/FAILED`. Frontend memantau endpoint status secara berkala, tetap dapat digunakan selama task berjalan, melanjutkan pemantauan run aktif saat halaman Phase 6 dibuka kembali, dan otomatis mengambil serta menampilkan hasil lengkap ketika status menjadi `COMPLETED`.
+Run Prediction diproses secara asynchronous oleh service Docker `phase6-worker`, terpisah dari proses FastAPI. `POST /api/v1/phase6/predictions` hanya memvalidasi input, menyimpan snapshot serta row `prediction_job`, membuat run berstatus `QUEUED`, lalu langsung mengembalikan `202 Accepted`. Worker mengklaim job memakai PostgreSQL row lock dan lease token, menjalankan inference dalam child process terisolasi, serta memperbarui heartbeat tanpa mengunci transaction hasil prediction. Default heartbeat adalah 5 detik, lease timeout 30 detik, execution timeout 3.600 detik, dan maksimum tiga attempt; seluruh nilai dapat diubah melalui environment `PHASE6_*` di `.env.example`.
+
+Jika worker/container berhenti, lease yang kedaluwarsa otomatis direcovery menjadi `QUEUED` dan dicoba ulang. Setelah retry limit tercapai, run ditutup sebagai `FAILED` dengan diagnostic `WORKER_HEARTBEAT_TIMEOUT`, `PREDICTION_TIMEOUT`, atau worker-exit terkait. Lease token menjadi fencing token: worker lama yang hidup kembali tidak dapat menimpa hasil attempt baru. Re-run dari history juga membuat job baru dari immutable input snapshot dan kembali melalui antrean, termasuk untuk run `FAILED`.
+
+Frontend memantau endpoint status secara berkala, menampilkan attempt serta heartbeat pada history, tetap dapat digunakan selama task berjalan, melanjutkan pemantauan run aktif saat page dibuka kembali, dan otomatis mengambil hasil lengkap ketika status menjadi `COMPLETED`. Tombol **Refresh** mempunyai loading spinner, disabled state selama request, timestamp keberhasilan, dan pesan error yang terlihat sehingga klik tidak lagi tampak tanpa respons.
 
 History menyediakan View, Download, dan Duplicate/Re-run. Export `.xlsx` berisi Summary, Shipment Result, Trip Timeline, MT Assignment, MT Candidates, dan Validation. UI main table menampilkan trip, MT, shipment/SPBU, planned/departure/return/next-available, confidence, status; card 7–8 menggunakan pagination 25 shipment per halaman dengan pilihan 25/50/100 dan reset otomatis ketika filter shift berubah. Expandable detail menampilkan LO, preliminary sequence, mode, distance, travel/service/cycle, fallback, dan missing vehicle-profile fields. MT Multi-Trip Timeline menampilkan periode kendaraan sampai turnaround selesai dengan pagination terpisah 10 MT per halaman dan pilihan 10/25/50 agar chart tetap ringkas pada hasil besar.
 
@@ -837,9 +842,9 @@ Phase 7 tetap bertanggung jawab atas final route optimization, fleet-wide constr
 
 Verification terakhir:
 
-- migration PostgreSQL memiliki single head revision `0013_phase6_drive_only`
-- seluruh **57 backend tests** lulus pada deployment image
-- **16 focused Phase 6 tests** lulus pada deployment image
+- migration PostgreSQL memiliki single head revision `0014_phase6_worker`
+- seluruh **59 backend tests** lulus pada deployment image
+- **18 focused Phase 6 tests** lulus pada deployment image
 - TypeScript type checking dan Vite production build lulus
 - API health, kedua generator Data Demo, closest-capacity MT subset, timestamp validation, rolling assignment, DRIVE route cache/fallback, encrypted settings, exports, dan persistence telah diuji
 - Vite memberi non-blocking warning untuk application chunk sekitar 1.71 MB; code splitting ECharts/page modules menjadi technical debt performance

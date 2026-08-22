@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from io import BytesIO
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -22,7 +22,6 @@ from .phase6_service import (
     list_prediction_runs,
     override_assignment,
     override_trip_assignment,
-    process_prediction_run_in_background,
 )
 from .phase6_validation import require_prediction_model, validate_loading_orders, validate_mt_availability
 
@@ -167,7 +166,6 @@ async def download_validation_report(
 
 @router.post("/predictions", status_code=status.HTTP_202_ACCEPTED)
 async def run_prediction(
-    background_tasks: BackgroundTasks,
     depot_id: str = Form(...),
     model_id: str = Form(...),
     parameters: str = Form(default="{}"),
@@ -193,7 +191,6 @@ async def run_prediction(
         parameters=parsed_parameters,
         created_by=actor.user_id,
     )
-    background_tasks.add_task(process_prediction_run_in_background, db.get_bind(), queued["id"])
     return queued
 
 
@@ -224,7 +221,7 @@ def prediction_detail(
     return get_prediction_run(db, run_id)
 
 
-@router.post("/predictions/{run_id}/recalculate")
+@router.post("/predictions/{run_id}/recalculate", status_code=status.HTTP_202_ACCEPTED)
 def rerun_prediction(
     run_id: str,
     request: RerunRequest,

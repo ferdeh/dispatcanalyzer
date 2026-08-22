@@ -18,6 +18,8 @@ The repository has no authentication provider. Phase 5 exposes a replacement sea
 
 Phase 6 extends the same modular monolith through validation, inference, rolling assignment, route estimation, persistence, export, settings, and authorization modules. Phase 5 artifact integrity is checked before inference when a joblib package exists; normalized model-registry assignments remain the persisted representation for legacy development databases. Phase 4 affinity creates ranking evidence, while `compatibility.evaluate_compatibility_entities` remains the single master-rule evaluator.
 
+Phase 6 prediction execution is outside the FastAPI process. The API transaction persists a `prediction_run` and `prediction_job`, then returns `202`; the dedicated `phase6-worker` service claims queue rows with PostgreSQL `FOR UPDATE SKIP LOCKED`. Each attempt receives a lease/fencing token and runs in an isolated child process. The parent worker updates heartbeat/lease metadata, enforces a hard execution timeout, and recovers an expired lease to `QUEUED` until `max_attempts` is reached. Final prediction rows and the job `COMPLETED` state commit atomically after validating the fencing token, preventing an obsolete worker from committing after recovery. API/container restarts therefore do not lose queued work or leave permanent orphan `RUNNING` rows.
+
 ```text
 Timestamped LO + Initial MT Availability
     → Phase 2 shift derivation

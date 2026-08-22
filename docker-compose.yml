@@ -40,6 +40,29 @@ services:
       timeout: 5s
       retries: 10
 
+  phase6-worker:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "app.phase6_worker"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://dispatch:dispatch@db:5432/dispatch_intelligence}
+      EXAMPLE_DATA_DIR: /app/example data
+      ML_ARTIFACT_DIR: /app/ml_artifacts
+      GOOGLE_ROUTES_ENCRYPTION_KEY: ${GOOGLE_ROUTES_ENCRYPTION_KEY:-}
+      PHASE6_WORKER_POLL_SECONDS: ${PHASE6_WORKER_POLL_SECONDS:-1}
+      PHASE6_WORKER_HEARTBEAT_SECONDS: ${PHASE6_WORKER_HEARTBEAT_SECONDS:-5}
+      PHASE6_WORKER_LEASE_SECONDS: ${PHASE6_WORKER_LEASE_SECONDS:-30}
+      PHASE6_PREDICTION_TIMEOUT_SECONDS: ${PHASE6_PREDICTION_TIMEOUT_SECONDS:-3600}
+      PHASE6_PREDICTION_MAX_ATTEMPTS: ${PHASE6_PREDICTION_MAX_ATTEMPTS:-3}
+    volumes:
+      - ./example data:/app/example data:ro
+      - ml_artifacts:/app/ml_artifacts
+    depends_on:
+      api:
+        condition: service_healthy
+
   web:
     build:
       context: apps/web

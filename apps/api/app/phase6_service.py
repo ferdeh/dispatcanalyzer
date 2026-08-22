@@ -10,7 +10,7 @@ from time import perf_counter
 from fastapi import HTTPException
 from openpyxl import Workbook
 from sqlalchemy import delete, desc, select
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session
 
 from .config import get_settings
 from .google_routes import GoogleRoutesError, configuration_snapshot, get_google_routes_configuration
@@ -25,6 +25,13 @@ from .models import (
     PredictionShipment,
     PredictionShipmentLine,
     PredictionTrip,
+)
+from .phase6_jobs import (
+    PredictionLeaseLost,
+    complete_prediction_job,
+    enqueue_prediction_job,
+    fail_prediction_job,
+    prediction_job_payload,
 )
 from .phase5_registry import _model_summary
 from .phase6_constants import DEFAULT_PREDICTION_PARAMETERS, PHASE6_ALGORITHM_VERSION
@@ -200,6 +207,10 @@ def enqueue_prediction_run(
         validation_duration_ms=lo_validation["duration_ms"] + mt_validation["duration_ms"],
     )
     db.add(run)
+    # PredictionJob intentionally has no ORM relationship; persist its parent
+    # first so databases with immediate FK checks cannot reorder both inserts.
+    db.flush()
+    enqueue_prediction_job(db, run.id)
     db.commit()
     logger.info("prediction_run_queued", extra={"prediction_run_id": run_number, "model_id": model_id, "depot_id": depot_id})
     return {
@@ -210,7 +221,7 @@ def enqueue_prediction_run(
     }
 
 
-def process_prediction_run(db: Session, run_id: str) -> dict:
+def process_prediction_run(db: Session, run_id: str, *, lease_token: str | None = None) -> dict:
     run = db.get(PredictionRun, run_id)
     if not run:
         raise HTTPException(status_code=404, detail={"code": "PREDICTION_RUN_NOT_FOUND", "message": "Prediction run was not found."})
@@ -222,6 +233,11 @@ def process_prediction_run(db: Session, run_id: str) -> dict:
             detail={"code": run.error_code or "INFERENCE_FAILED", "message": run.error_message or "Prediction run has failed."},
         )
 
+    run_db_id = run.id
+    run_no = run.prediction_run_no
+    run_model_id = run.model_id
+    run_depot_id = run.depot_id
+
     total_started = perf_counter()
     run.status = "RUNNING"
     run.error_code = None
@@ -229,7 +245,7 @@ def process_prediction_run(db: Session, run_id: str) -> dict:
     db.commit()
     logger.info(
         "prediction_run_started",
-        extra={"prediction_run_id": run.prediction_run_no, "model_id": run.model_id, "depot_id": run.depot_id},
+        extra={"prediction_run_id": run_no, "model_id": run_model_id, "depot_id": run_depot_id},
     )
     try:
         model = require_prediction_model(db, run.depot_id, run.model_id)
@@ -306,37 +322,41 @@ def process_prediction_run(db: Session, run_id: str) -> dict:
         _rolling_assign_and_persist(db, run, initial=True)
         run.assignment_optimization_duration_ms = round((perf_counter() - assignment_started) * 1000)
         run.total_prediction_duration_ms = round((perf_counter() - total_started) * 1000)
+        complete_prediction_job(db, run_id=run_db_id, lease_token=lease_token)
         run.status = "COMPLETED"
         run.completed_at = datetime.now(timezone.utc)
         db.commit()
         logger.info(
             "rolling_assignment_completed",
-            extra={"prediction_run_id": run.prediction_run_no, "model_id": run.model_id, "depot_id": run.depot_id},
+            extra={"prediction_run_id": run_no, "model_id": run_model_id, "depot_id": run_depot_id},
         )
-        return get_prediction_run(db, run.id)
+        return get_prediction_run(db, run_db_id)
+    except PredictionLeaseLost:
+        db.rollback()
+        logger.warning("prediction_run_lease_lost", extra={"prediction_run_id": run_no})
+        raise
     except HTTPException as exc:
-        _mark_run_failed(db, run.id, total_started, exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)})
+        _mark_run_failed(
+            db,
+            run_db_id,
+            total_started,
+            exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)},
+            lease_token=lease_token,
+        )
         raise
     except Exception as exc:
-        _mark_run_failed(db, run.id, total_started, {"code": "INFERENCE_FAILED", "message": f"{type(exc).__name__}: {exc}"})
+        _mark_run_failed(
+            db,
+            run_db_id,
+            total_started,
+            {"code": "INFERENCE_FAILED", "message": f"{type(exc).__name__}: {exc}"},
+            lease_token=lease_token,
+        )
         logger.exception(
             "prediction_run_failed",
-            extra={"prediction_run_id": run.prediction_run_no, "model_id": run.model_id, "depot_id": run.depot_id},
+            extra={"prediction_run_id": run_no, "model_id": run_model_id, "depot_id": run_depot_id},
         )
         raise HTTPException(status_code=500, detail={"code": "INFERENCE_FAILED", "message": "Prediction failed; the run was retained for audit."}) from exc
-
-
-def process_prediction_run_in_background(bind, run_id: str) -> None:
-    """Run one queued prediction outside the request session/thread."""
-    task_session = sessionmaker(bind=bind, autoflush=False, autocommit=False, expire_on_commit=False)
-    with task_session() as db:
-        try:
-            process_prediction_run(db, run_id)
-        except HTTPException:
-            # process_prediction_run has already persisted an auditable FAILED
-            # state; the browser learns the error through the status endpoint.
-            return
-
 
 def create_prediction_run(
     db: Session,
@@ -365,7 +385,14 @@ def create_prediction_run(
     return process_prediction_run(db, queued["id"])
 
 
-def _mark_run_failed(db: Session, run_id: str, started: float, detail: dict) -> None:
+def _mark_run_failed(
+    db: Session,
+    run_id: str,
+    started: float,
+    detail: dict,
+    *,
+    lease_token: str | None = None,
+) -> None:
     db.rollback()
     run = db.get(PredictionRun, run_id)
     if run:
@@ -373,6 +400,13 @@ def _mark_run_failed(db: Session, run_id: str, started: float, detail: dict) -> 
         run.error_code = detail.get("code", "INFERENCE_FAILED")
         run.error_message = detail.get("message", "Prediction failed.")
         run.total_prediction_duration_ms = round((perf_counter() - started) * 1000)
+        run.completed_at = datetime.now(timezone.utc)
+        fail_prediction_job(
+            db,
+            run_id=run_id,
+            lease_token=lease_token,
+            message=run.error_message,
+        )
         db.commit()
 
 
@@ -582,6 +616,7 @@ def get_prediction_run_status(db: Session, run_id: str) -> dict:
     run = db.get(PredictionRun, run_id) or db.scalar(select(PredictionRun).where(PredictionRun.prediction_run_no == run_id))
     if not run:
         raise HTTPException(status_code=404, detail={"code": "PREDICTION_RUN_NOT_FOUND", "message": "Prediction run was not found."})
+    job = prediction_job_payload(db, run.id)
     return {
         "id": run.id,
         "prediction_run_id": run.prediction_run_no,
@@ -590,6 +625,11 @@ def get_prediction_run_status(db: Session, run_id: str) -> dict:
         "completed_at": _iso(run.completed_at),
         "error_code": run.error_code,
         "error_message": run.error_message,
+        "queue": {
+            **job,
+            "heartbeat_at": _iso(job["heartbeat_at"]),
+            "lease_expires_at": _iso(job["lease_expires_at"]),
+        },
         "durations_ms": {
             "validation": run.validation_duration_ms,
             "shipment_prediction": run.shipment_prediction_duration_ms,
@@ -604,6 +644,7 @@ def _run_history_row(db: Session, run: PredictionRun) -> dict:
     shipments = db.scalars(select(PredictionShipment).where(PredictionShipment.prediction_run_id == run.id)).all()
     trips = db.scalars(select(PredictionTrip).where(PredictionTrip.prediction_run_id == run.id)).all()
     depot = db.get(MasterDepot, run.depot_id)
+    job = prediction_job_payload(db, run.id)
     return {
         "id": run.id,
         "prediction_run_id": run.prediction_run_no,
@@ -619,6 +660,10 @@ def _run_history_row(db: Session, run: PredictionRun) -> dict:
         "unassigned": sum(trip.vehicle_id is None for trip in trips),
         "user": run.created_by,
         "status": run.status,
+        "attempt_count": job["attempt_count"],
+        "max_attempts": job["max_attempts"],
+        "heartbeat_at": _iso(job["heartbeat_at"]),
+        "queue_error": job["last_error"],
     }
 
 
@@ -1017,7 +1062,7 @@ def duplicate_prediction_run(db: Session, run_id: str, *, model_id: str | None, 
         ["vehicle_registration_no", "initial_available_datetime"],
         [[row["vehicle_registration_no"], row["initial_available_datetime_local"]] for row in source.input_mt_availability_snapshot],
     )
-    return create_prediction_run(
+    return enqueue_prediction_run(
         db,
         depot_id=source.depot_id,
         model_id=model_id or source.model_id,

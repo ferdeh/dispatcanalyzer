@@ -156,6 +156,14 @@ type PredictionRunStatus = {
   completed_at: string | null;
   error_code: string | null;
   error_message: string | null;
+  queue: {
+    attempt_count: number;
+    max_attempts: number;
+    worker_id: string | null;
+    heartbeat_at: string | null;
+    lease_expires_at: string | null;
+    last_error: string | null;
+  };
   durations_ms: Record<string, number>;
 };
 type HistoryRow = {
@@ -171,6 +179,10 @@ type HistoryRow = {
   unassigned: number;
   user: string;
   status: string;
+  attempt_count: number;
+  max_attempts: number;
+  heartbeat_at: string | null;
+  queue_error: string | null;
 };
 
 function pct(value: number | null | undefined) {
@@ -218,6 +230,8 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
   const [mtValidation, setMtValidation] = useState<Validation | null>(null);
   const [result, setResult] = useState<PredictionResult | null>(null);
   const [history, setHistory] = useState<HistoryRow[]>([]);
+  const [historyRefreshing, setHistoryRefreshing] = useState(false);
+  const [historyFeedback, setHistoryFeedback] = useState<{ status: "SUCCESS" | "ERROR"; message: string } | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [runFeedback, setRunFeedback] = useState<{ status: "RUNNING" | "SUCCESS" | "ERROR"; message: string } | null>(null);
@@ -340,7 +354,7 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
         }
         setRunFeedback({
           status: "RUNNING",
-          message: `Prediction ${runStatus.prediction_run_id} ${runStatus.status === "QUEUED" ? "menunggu worker" : "sedang diproses"} di belakang layar. Hasil akan ditampilkan otomatis.`,
+          message: `Prediction ${runStatus.prediction_run_id} ${runStatus.status === "QUEUED" ? "menunggu worker" : "sedang diproses"} di belakang layar (percobaan ${Math.max(1, runStatus.queue.attempt_count)}/${Math.max(1, runStatus.queue.max_attempts)}). Hasil akan ditampilkan otomatis.`,
         });
       } catch {
         if (cancelled) return;
@@ -546,12 +560,41 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
     }
   }
 
-  async function rerun(runId: string) {
-    setLoading(true);
+  async function refreshHistory(silent = false) {
+    if (!depotId || historyRefreshing) return;
+    setHistoryRefreshing(true);
+    if (!silent) setHistoryFeedback(null);
     try {
-      const payload = await apiSend<PredictionResult>(`/api/v1/phase6/predictions/${runId}/recalculate`, "POST", { model_id: modelId || null });
-      setResult(payload);
-      setHistory(await apiGet<HistoryRow[]>(`/api/v1/phase6/predictions?depot_id=${encodeURIComponent(depotId)}`));
+      const rows = await apiGet<HistoryRow[]>(`/api/v1/phase6/predictions?depot_id=${encodeURIComponent(depotId)}`);
+      setHistory(rows);
+      if (!silent) {
+        setHistoryFeedback({
+          status: "SUCCESS",
+          message: `History diperbarui pada ${new Date().toLocaleTimeString("id-ID")}.`,
+        });
+      }
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : "History prediction gagal diperbarui.";
+      setHistoryFeedback({ status: "ERROR", message });
+      setError(message);
+    } finally {
+      setHistoryRefreshing(false);
+    }
+  }
+
+  async function rerun(runId: string) {
+    if (activeRun) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const queued = await apiSend<PredictionTask>(`/api/v1/phase6/predictions/${runId}/recalculate`, "POST", { model_id: modelId || null });
+      setResult(null);
+      setActiveRun({ id: queued.id, predictionRunId: queued.prediction_run_id, depotId });
+      setRunFeedback({
+        status: "RUNNING",
+        message: `Prediction ${queued.prediction_run_id} telah masuk antrean retry/re-run dan akan diproses worker terpisah.`,
+      });
+      await refreshHistory(true);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Re-run failed.");
     } finally {
@@ -974,8 +1017,8 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
       )}
 
       <section className="border border-line bg-white p-5">
-        <div className="mb-4 flex items-center justify-between"><div><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">10. Prediction Run History</div><p className="mt-1 text-xs text-slate-500">View and export immutable runs, or create a new run from an input snapshot.</p></div>{depotId && <button className="inline-flex items-center gap-2 border border-line px-3 py-2 text-sm" onClick={() => apiGet<HistoryRow[]>(`/api/v1/phase6/predictions?depot_id=${encodeURIComponent(depotId)}`).then(setHistory)}><RefreshCw size={14} /> Refresh</button>}</div>
-        {history.length === 0 ? <div className="border border-dashed border-line p-6 text-center text-sm text-slate-500">No prediction runs for the selected depot.</div> : <div className="overflow-x-auto"><table className="min-w-full text-left text-sm"><thead className="bg-slate-50 text-xs uppercase text-slate-500"><tr>{["Run ID", "Date", "Status", "Depot", "Model", "LO", "Shipment", "Assigned", "Unassigned", "User", "Actions"].map((item) => <th key={item} className="px-3 py-2">{item}</th>)}</tr></thead><tbody>{history.map((row) => <tr key={row.id} className="border-t border-line"><td className="px-3 py-2 font-mono text-xs">{row.prediction_run_id}</td><td className="px-3 py-2">{new Date(row.date).toLocaleString()}</td><td className="px-3 py-2"><Badge value={row.status} /></td><td className="px-3 py-2">{row.depot}</td><td className="px-3 py-2">{row.model}</td><td className="px-3 py-2">{row.loading_orders}</td><td className="px-3 py-2">{row.shipments}</td><td className="px-3 py-2">{row.assigned}</td><td className="px-3 py-2">{row.unassigned}</td><td className="px-3 py-2">{row.user}</td><td className="px-3 py-2"><div className="flex gap-2"><button title="View" className="border border-line p-2" onClick={() => void openHistory(row.id)}><Eye size={14} /></button><button title="Download" className="border border-line p-2 disabled:opacity-40" disabled={row.status !== "COMPLETED"} onClick={() => downloadFromApi(`/api/v1/phase6/predictions/${row.id}/export`, `${row.prediction_run_id}.xlsx`)}><Download size={14} /></button><button title="Duplicate / Re-run" className="border border-line p-2 disabled:opacity-40" disabled={row.status !== "COMPLETED" || loading || Boolean(activeRun)} onClick={() => void rerun(row.id)}><RefreshCw size={14} /></button></div></td></tr>)}</tbody></table></div>}
+        <div className="mb-4 flex flex-wrap items-start justify-between gap-3"><div><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">10. Prediction Run History</div><p className="mt-1 text-xs text-slate-500">View and export immutable runs, or create a new run from an input snapshot.</p>{historyFeedback && <p className={`mt-2 text-xs ${historyFeedback.status === "SUCCESS" ? "text-mint" : "text-rust"}`} role="status" aria-live="polite">{historyFeedback.message}</p>}</div>{depotId && <button className="inline-flex items-center gap-2 border border-line px-3 py-2 text-sm disabled:cursor-wait disabled:opacity-50" disabled={historyRefreshing} onClick={() => void refreshHistory()}><RefreshCw className={historyRefreshing ? "animate-spin" : ""} size={14} /> {historyRefreshing ? "Memperbarui…" : "Refresh"}</button>}</div>
+        {history.length === 0 ? <div className="border border-dashed border-line p-6 text-center text-sm text-slate-500">No prediction runs for the selected depot.</div> : <div className="overflow-x-auto"><table className="min-w-full text-left text-sm"><thead className="bg-slate-50 text-xs uppercase text-slate-500"><tr>{["Run ID", "Date", "Status", "Depot", "Model", "LO", "Shipment", "Assigned", "Unassigned", "User", "Actions"].map((item) => <th key={item} className="px-3 py-2">{item}</th>)}</tr></thead><tbody>{history.map((row) => <tr key={row.id} className="border-t border-line"><td className="px-3 py-2 font-mono text-xs">{row.prediction_run_id}</td><td className="px-3 py-2">{new Date(row.date).toLocaleString()}</td><td className="px-3 py-2"><Badge value={row.status} />{["QUEUED", "RUNNING"].includes(row.status) && <div className="mt-1 whitespace-nowrap text-[11px] text-slate-500">Attempt {Math.max(1, row.attempt_count)}/{Math.max(1, row.max_attempts)}{row.heartbeat_at ? ` · heartbeat ${new Date(row.heartbeat_at).toLocaleTimeString("id-ID")}` : ""}</div>}</td><td className="px-3 py-2">{row.depot}</td><td className="px-3 py-2">{row.model}</td><td className="px-3 py-2">{row.loading_orders}</td><td className="px-3 py-2">{row.shipments}</td><td className="px-3 py-2">{row.assigned}</td><td className="px-3 py-2">{row.unassigned}</td><td className="px-3 py-2">{row.user}</td><td className="px-3 py-2"><div className="flex gap-2"><button title="View" className="border border-line p-2" onClick={() => void openHistory(row.id)}><Eye size={14} /></button><button title="Download" className="border border-line p-2 disabled:opacity-40" disabled={row.status !== "COMPLETED"} onClick={() => downloadFromApi(`/api/v1/phase6/predictions/${row.id}/export`, `${row.prediction_run_id}.xlsx`)}><Download size={14} /></button><button title={row.status === "FAILED" ? "Retry from saved input" : "Duplicate / Re-run"} className="border border-line p-2 disabled:opacity-40" disabled={!(["COMPLETED", "FAILED"].includes(row.status)) || loading || Boolean(activeRun)} onClick={() => void rerun(row.id)}><RefreshCw size={14} /></button></div></td></tr>)}</tbody></table></div>}
       </section>
 
       <section className="border border-line bg-white p-5">

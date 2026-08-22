@@ -69,6 +69,9 @@ class Phase6RouteEstimationService:
             "google_routes_failed_request_count",
         ):
             self.metrics.setdefault(key, 0)
+        # SessionLocal disables autoflush. Track cache rows added by this
+        # prediction transaction so repeated legs reuse them before final flush.
+        self._pending_cache: dict[str, RouteEstimationCache] = {}
         self.client = google_client
         if self.client is None and configuration.encrypted_api_key:
             try:
@@ -111,12 +114,14 @@ class Phase6RouteEstimationService:
 
     def _cached_leg(self, cache_key: str) -> dict | None:
         now = datetime.now(timezone.utc)
-        row = self.db.scalar(
-            select(RouteEstimationCache).where(
-                RouteEstimationCache.cache_key == cache_key,
-                RouteEstimationCache.expires_at > now,
+        row = self._pending_cache.get(cache_key)
+        if not row:
+            row = self.db.scalar(
+                select(RouteEstimationCache).where(
+                    RouteEstimationCache.cache_key == cache_key,
+                    RouteEstimationCache.expires_at > now,
+                )
             )
-        )
         if not row:
             self.metrics["google_routes_cache_miss_count"] += 1
             return None
@@ -148,7 +153,9 @@ class Phase6RouteEstimationService:
         estimate: dict,
     ) -> None:
         now = datetime.now(timezone.utc)
-        existing = self.db.scalar(select(RouteEstimationCache).where(RouteEstimationCache.cache_key == cache_key))
+        existing = self._pending_cache.get(cache_key)
+        if not existing:
+            existing = self.db.scalar(select(RouteEstimationCache).where(RouteEstimationCache.cache_key == cache_key))
         values = {
             "origin_location_id": origin_id,
             "destination_location_id": destination_id,
@@ -176,7 +183,9 @@ class Phase6RouteEstimationService:
             for key, value in values.items():
                 setattr(existing, key, value)
         else:
-            self.db.add(RouteEstimationCache(id=uuid.uuid4().hex, cache_key=cache_key, **values))
+            existing = RouteEstimationCache(id=uuid.uuid4().hex, cache_key=cache_key, **values)
+            self.db.add(existing)
+        self._pending_cache[cache_key] = existing
 
     def _historical_fallback(
         self,

@@ -764,6 +764,32 @@ class PredictionRun(Base):
     error_message: Mapped[str | None] = mapped_column(Text)
 
 
+class PredictionJob(Base):
+    """Durable queue/lease state kept separate from the prediction transaction."""
+
+    __tablename__ = "prediction_job"
+    __table_args__ = (
+        Index("ix_prediction_job_status_queued", "status", "queued_at"),
+        Index("ix_prediction_job_lease", "status", "lease_expires_at"),
+    )
+
+    prediction_run_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("prediction_run.id", ondelete="CASCADE"), primary_key=True
+    )
+    status: Mapped[str] = mapped_column(String(40), default="QUEUED", index=True)
+    worker_id: Mapped[str | None] = mapped_column(String(160))
+    lease_token: Mapped[str | None] = mapped_column(String(64), unique=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    queued_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    started_at = mapped_column(DateTime(timezone=True), nullable=True)
+    heartbeat_at = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_expires_at = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at = mapped_column(DateTime(timezone=True), nullable=True)
+    last_recovered_at = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+
 class PredictionShipment(Base):
     __tablename__ = "prediction_shipment"
     __table_args__ = (

@@ -57,6 +57,7 @@ All Phase 5 run/model facts retain `depot_id`. Unique/index constraints cover ru
 Phase 6 prediction persistence:
 
 - `prediction_run`: human-readable/UUID identity, depot/model/version, filenames, normalized LO/MT input, validation, parameter/model/original-prediction snapshots, algorithm version, status, duration metrics, creator, timestamps, and failure diagnostic.
+- `prediction_job`: durable one-to-one queue state for a run, including worker/lease token, heartbeat and lease expiry, attempt/retry limit, recovery timestamps, completion, and last worker diagnostic. Keeping this row separate lets heartbeat commits proceed while the larger prediction result transaction is open.
 - `prediction_shipment`: current final shipment structure per run/shift with model score, confidence, explanation, and manual flag.
 - `prediction_shipment_line`: canonical LO/SPBU membership plus `model_predicted_shipment_id`, which preserves the original model grouping when the dispatcher moves a line.
 - `prediction_mt_candidate`: available-shift candidates including historical score, compatibility pass/fail, rank, exclusion reason, and structured evidence. Failed master compatibility may be retained for explainability but cannot be optimized.
