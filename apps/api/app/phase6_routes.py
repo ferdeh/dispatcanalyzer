@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from .database import get_db
 from .phase6_auth import Phase6Actor, require_phase6_permission
-from .phase6_demo import generate_demo_loading_orders
+from .phase6_demo import generate_demo_loading_orders, generate_demo_mt_availability
 from .phase6_export import loading_order_template, mt_availability_template, prediction_export, validation_report
 from .phase6_service import (
     adjust_shipment,
@@ -49,6 +49,12 @@ class DemoLoadingOrderRequest(BaseModel):
     total_order_kl: float = Field(gt=0, le=40000)
 
 
+class DemoMTAvailabilityRequest(BaseModel):
+    depot_id: str
+    model_id: str
+    total_capacity_kl: float = Field(gt=0, le=40000)
+
+
 def _excel_response(content: bytes, filename: str) -> StreamingResponse:
     return StreamingResponse(
         BytesIO(content),
@@ -85,6 +91,21 @@ def create_demo_loading_order_file(
         depot_id=request.depot_id,
         model=model,
         total_order_kl=request.total_order_kl,
+    )
+    return _excel_response(content, filename)
+
+
+@router.post("/demo/mt-availability")
+def create_demo_mt_availability_file(
+    request: DemoMTAvailabilityRequest,
+    db: Session = Depends(get_db),
+    _actor: Phase6Actor = Depends(require_phase6_permission("run")),
+) -> StreamingResponse:
+    require_prediction_model(db, request.depot_id, request.model_id)
+    content, filename = generate_demo_mt_availability(
+        db,
+        depot_id=request.depot_id,
+        total_capacity_kl=request.total_capacity_kl,
     )
     return _excel_response(content, filename)
 

@@ -213,6 +213,10 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
   const [demoTotalKl, setDemoTotalKl] = useState("80");
   const [demoLoading, setDemoLoading] = useState(false);
   const [demoNotice, setDemoNotice] = useState<string | null>(null);
+  const [mtDemoDialogOpen, setMtDemoDialogOpen] = useState(false);
+  const [mtDemoTotalKl, setMtDemoTotalKl] = useState("160");
+  const [mtDemoLoading, setMtDemoLoading] = useState(false);
+  const [mtDemoNotice, setMtDemoNotice] = useState<string | null>(null);
 
   const selectedModel = models.find((model) => model.model_id === modelId) ?? null;
   const issues = [...(loValidation?.issues ?? []), ...(mtValidation?.issues ?? [])];
@@ -220,6 +224,10 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
   const warnings = (loValidation?.warning_count ?? 0) + (mtValidation?.warning_count ?? 0);
   const validatedOrderKl = (loValidation?.normalized_rows ?? []).reduce(
     (total, row) => total + (typeof row.order_quantity_kl === "number" ? row.order_quantity_kl : Number(row.order_quantity_kl ?? 0)),
+    0,
+  );
+  const validatedMtCapacityKl = (mtValidation?.normalized_rows ?? []).reduce(
+    (total, row) => total + (typeof row.capacity_kl === "number" ? row.capacity_kl : Number(row.capacity_kl ?? 0)),
     0,
   );
   const canRun = Boolean(depotId && modelId && loadingOrderFile && mtFile && loValidation && mtValidation && blockingErrors === 0);
@@ -234,6 +242,8 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
     setResult(null);
     setDemoDialogOpen(false);
     setDemoNotice(null);
+    setMtDemoDialogOpen(false);
+    setMtDemoNotice(null);
     if (!depotId) {
       setHistory([]);
       return;
@@ -255,6 +265,8 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
     setResult(null);
     setDemoDialogOpen(false);
     setDemoNotice(null);
+    setMtDemoDialogOpen(false);
+    setMtDemoNotice(null);
   }, [modelId]);
 
   async function validateFile(kind: "loading-order" | "mt-availability", file: File) {
@@ -330,6 +342,43 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
       setError(reason instanceof Error ? reason.message : "Data demo gagal dibuat.");
     } finally {
       setDemoLoading(false);
+    }
+  }
+
+  async function generateDemoMtAvailability() {
+    const targetCapacityKl = Number(mtDemoTotalKl);
+    if (!depotId || !modelId || !Number.isFinite(targetCapacityKl) || targetCapacityKl <= 0 || targetCapacityKl > 40000) {
+      setError("Total kapasitas MT harus lebih dari 0 dan maksimum 40.000 KL.");
+      return;
+    }
+    setMtDemoLoading(true);
+    setError(null);
+    setMtDemoNotice(null);
+    try {
+      const file = await apiFile(
+        "/api/v1/phase6/demo/mt-availability",
+        "POST",
+        { depot_id: depotId, model_id: modelId, total_capacity_kl: targetCapacityKl },
+        "phase6-demo-mt-availability.xlsx",
+      );
+      setMtFile(file);
+      setMtValidation(null);
+      setResult(null);
+      setMtDemoDialogOpen(false);
+      const validation = await validateFile("mt-availability", file);
+      if (validation) {
+        const selectedCapacity = validation.normalized_rows.reduce(
+          (total, row) => total + (typeof row.capacity_kl === "number" ? row.capacity_kl : Number(row.capacity_kl ?? 0)),
+          0,
+        );
+        setMtDemoNotice(
+          `Data demo memilih ${validation.row_count.toLocaleString("id-ID")} MT dengan total ${selectedCapacity.toLocaleString("id-ID", { maximumFractionDigits: 3 })} KL, mendekati target ${targetCapacityKl.toLocaleString("id-ID", { maximumFractionDigits: 3 })} KL.`,
+        );
+      }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Data demo MT availability gagal dibuat.");
+    } finally {
+      setMtDemoLoading(false);
     }
   }
 
@@ -491,6 +540,23 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
         </div>
       )}
 
+      {mtDemoDialogOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-petroink/50 p-4" role="dialog" aria-modal="true" aria-labelledby="demo-mt-availability-title">
+          <form className="w-full max-w-md border border-line bg-white p-5 shadow-xl" onSubmit={(event) => { event.preventDefault(); void generateDemoMtAvailability(); }}>
+            <div id="demo-mt-availability-title" className="text-base font-semibold text-petroink">Buat Data Demo MT Availability</div>
+            <p className="mt-2 text-sm text-slate-500">Masukkan total kapasitas MT yang tersedia hari itu. Sistem memilih MT aktif dari master data secara acak dengan total kapasitas paling dekat ke target, lalu membuat jam availability acak.</p>
+            <label className="mt-5 grid gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
+              Total Tonase / Kapasitas MT (KL)
+              <input autoFocus required className="border border-line px-3 py-2 text-base font-normal normal-case tracking-normal text-petroink" type="number" min="0.001" max="40000" step="0.001" value={mtDemoTotalKl} onChange={(event) => setMtDemoTotalKl(event.target.value)} />
+            </label>
+            <div className="mt-5 flex justify-end gap-2">
+              <button type="button" className="border border-line px-4 py-2 text-sm" disabled={mtDemoLoading} onClick={() => setMtDemoDialogOpen(false)}>Batal</button>
+              <button type="submit" className="inline-flex items-center gap-2 bg-petroblue px-4 py-2 text-sm font-semibold text-white disabled:opacity-40" disabled={mtDemoLoading}><Sparkles size={15} /> {mtDemoLoading ? "Membuat…" : "Buat Data Demo"}</button>
+            </div>
+          </form>
+        </div>
+      )}
+
       <section className="border border-line bg-white p-5">
         <div className="mb-4">
           <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">1. Prediction Setup</div>
@@ -571,17 +637,20 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
           <p className="mt-1 text-xs text-slate-500">Required: vehicle_registration_no, initial_available_datetime</p>
           <div className="mt-4 flex flex-wrap gap-2">
             <button className="inline-flex items-center gap-2 border border-line px-3 py-2 text-sm" onClick={() => downloadFromApi("/api/v1/phase6/templates/mt-availability", "phase6-mt-availability-template.xlsx")}><Download size={15} /> Download Template</button>
+            <button type="button" className="inline-flex items-center gap-2 border border-petroblue px-3 py-2 text-sm text-petroblue disabled:border-line disabled:text-slate-400" disabled={!modelId || mtDemoLoading} onClick={() => setMtDemoDialogOpen(true)}><Sparkles size={15} /> Data Demo</button>
             <label className={`inline-flex cursor-pointer items-center gap-2 border px-3 py-2 text-sm ${modelId ? "border-petroblue text-petroblue" : "pointer-events-none border-line text-slate-400"}`}>
               <Upload size={15} /> {mtFile?.name ?? "Upload Excel"}
               <input className="hidden" type="file" accept=".xlsx" disabled={!modelId} onChange={(event) => {
                 const file = event.target.files?.[0] ?? null;
                 setMtFile(file);
                 setMtValidation(null);
+                setMtDemoNotice(null);
                 if (file) void validateFile("mt-availability", file);
               }} />
             </label>
             {mtValidation && <Badge value={mtValidation.status} />}
           </div>
+          {mtDemoNotice && <div className="mt-3 text-xs text-mint">{mtDemoNotice}</div>}
         </div>
       </section>
 
@@ -596,6 +665,7 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
             <Metric label="Order Volume" value={`${validatedOrderKl.toLocaleString("id-ID", { maximumFractionDigits: 3 })} KL`} />
             <Metric label="Unique SPBU" value={new Set((loValidation?.normalized_rows ?? []).map((row) => row.spbu_id)).size} />
             <Metric label="Available MT" value={mtValidation?.row_count ?? 0} />
+            <Metric label="MT Capacity" value={`${validatedMtCapacityKl.toLocaleString("id-ID", { maximumFractionDigits: 3 })} KL`} />
             <Metric label="Derived Shifts" value={new Set(loValidation?.detected_shifts ?? []).size} />
             <Metric label="Errors" value={blockingErrors} />
             <Metric label="Warnings" value={warnings} />

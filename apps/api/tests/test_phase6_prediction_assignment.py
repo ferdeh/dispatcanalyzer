@@ -21,7 +21,7 @@ from app.google_routes import (
     save_google_routes_configuration,
 )
 from app.models import Base, MLBehavioralModel, MLSPBUClusterAssignment, MasterDepot, MasterMT, MasterSPBU
-from app.phase6_demo import generate_demo_loading_orders
+from app.phase6_demo import generate_demo_loading_orders, generate_demo_mt_availability
 from app.phase6_routing import Phase6RouteEstimationService
 from app.phase6_service import create_prediction_run, override_assignment
 from app.phase6_validation import validate_loading_orders, validate_mt_availability
@@ -49,9 +49,9 @@ def seed(session) -> MLBehavioralModel:
         [
             MasterDepot(depot_id="D1", depot_code="D1", depot_name="Depot One", latitude=-6.20, longitude=106.84, timezone="Asia/Jakarta"),
             MasterDepot(depot_id="D2", depot_code="D2", depot_name="Depot Two", timezone="Asia/Jakarta"),
-            MasterMT(mt_id="T1", vehicle_name_raw="Truck 1", vehicle_registration="B1001AA", vehicle_type_tag=8, depot_id="D1", active_status="ACTIVE"),
-            MasterMT(mt_id="T2", vehicle_name_raw="Truck 2", vehicle_registration="B1002AA", vehicle_type_tag=8, depot_id="D1", active_status="ACTIVE"),
-            MasterMT(mt_id="T3", vehicle_name_raw="Truck 3", vehicle_registration="B1003AA", vehicle_type_tag=16, depot_id="D1", active_status="ACTIVE"),
+            MasterMT(mt_id="T1", vehicle_name_raw="Truck 1", vehicle_registration="B1001AA", capacity_label="8KL", vehicle_type_tag=8, depot_id="D1", active_status="ACTIVE"),
+            MasterMT(mt_id="T2", vehicle_name_raw="Truck 2", vehicle_registration="B1002AA", capacity_label="8 KL", vehicle_type_tag=8, depot_id="D1", active_status="ACTIVE"),
+            MasterMT(mt_id="T3", vehicle_name_raw="Truck 3", vehicle_registration="B1003AA", capacity_label="16KL", vehicle_type_tag=16, depot_id="D1", active_status="ACTIVE"),
             MasterMT(mt_id="INACTIVE", vehicle_name_raw="Inactive", vehicle_registration="B1999AA", vehicle_type_tag=8, depot_id="D1", active_status="INACTIVE"),
             MasterMT(mt_id="OTHER-MT", vehicle_name_raw="Other", vehicle_registration="B2001BB", vehicle_type_tag=8, depot_id="D2", active_status="ACTIVE"),
             MasterSPBU(spbu_id="A", spbu_code="SPBU-A", spbu_name="A", latitude=-6.21, longitude=106.85, master_travel_time_min=10, vehicle_type_tag=8, primary_depot_id="D1"),
@@ -224,6 +224,32 @@ def test_demo_loading_order_uses_timestamps_and_requested_total() -> None:
         validated = validate_loading_orders(session, depot_id="D1", model=model, content=content, file_name=filename)
         assert validated["status"] == "PASS"
         assert sum(row["order_quantity_kl"] for row in validated["normalized_rows"]) == 18
+
+
+def test_demo_mt_availability_selects_random_active_mt_near_capacity_target() -> None:
+    Session = make_session()
+    with Session() as session:
+        model = seed(session)
+        content, filename = generate_demo_mt_availability(session, depot_id="D1", total_capacity_kl=24, random_seed=42)
+        sheet = load_workbook(BytesIO(content), read_only=True, data_only=True).active
+        assert [cell.value for cell in next(sheet.iter_rows(max_row=1))][:3] == [
+            "vehicle_registration_no",
+            "initial_available_datetime",
+            "capacity_kl",
+        ]
+        rows = list(sheet.iter_rows(min_row=2, values_only=True))
+        assert filename.startswith("phase6-demo-mt-availability-")
+        assert len(rows) == 2
+        assert sum(row[2] for row in rows) == 24
+        assert {row[0] for row in rows} <= {"B1001AA", "B1002AA", "B1003AA"}
+        assert all(datetime.fromisoformat(row[1]) for row in rows)
+        validated = validate_mt_availability(session, depot_id="D1", model=model, content=content, file_name=filename)
+        assert validated["status"] == "PASS"
+        assert sum(row["capacity_kl"] for row in validated["normalized_rows"]) == 24
+
+        near_content, _ = generate_demo_mt_availability(session, depot_id="D1", total_capacity_kl=18, random_seed=7)
+        near_sheet = load_workbook(BytesIO(near_content), read_only=True, data_only=True).active
+        assert sum(row[2] for row in near_sheet.iter_rows(min_row=2, values_only=True)) == 16
 
 
 def test_google_client_is_drive_only_and_rejects_truck() -> None:

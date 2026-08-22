@@ -74,6 +74,23 @@ def source_int(value: Any) -> int | None:
     return int(number) if number is not None and float(number).is_integer() else None
 
 
+def mt_capacity_kl(capacity_label: Any, vehicle_type_tag: Any) -> float | None:
+    """Resolve an MT capacity in KL from canonical master fields.
+
+    The explicit capacity label is preferred; the numeric vehicle class remains
+    a compatibility fallback for older imported MT rows.
+    """
+    label = clean_str(capacity_label)
+    if label:
+        match = re.search(r"([0-9]+(?:[\.,][0-9]+)?)", label)
+        if match:
+            capacity = float(match.group(1).replace(",", "."))
+            if math.isfinite(capacity) and capacity > 0:
+                return capacity
+    capacity = source_number(vehicle_type_tag)
+    return capacity if capacity is not None and math.isfinite(capacity) and capacity > 0 else None
+
+
 def parse_mt_name(raw: Any) -> tuple[str | None, str | None, list[str]]:
     text = clean_str(raw)
     if not text:

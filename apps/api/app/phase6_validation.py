@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from .departure_intelligence import shift_for_minute, validate_shift_config
 from .models import MLBehavioralModel, MasterDepot, MasterMT, MasterSPBU, SpbuIdentifierAlias
-from .normalization import clean_str, normalize_key
+from .normalization import clean_str, mt_capacity_kl, normalize_key
 
 
 MAX_WORKBOOK_BYTES = 10 * 1024 * 1024
@@ -274,6 +274,7 @@ def validate_mt_availability(db: Session, *, depot_id: str, model: MLBehavioralM
                     "source_row_number": row_number,
                     "vehicle_id": mt.mt_id,
                     "vehicle_registration_no": mt.vehicle_registration or mt.mt_id,
+                    "capacity_kl": mt_capacity_kl(mt.capacity_label, mt.vehicle_type_tag),
                     "initial_available_datetime": parsed.isoformat(),
                     "initial_available_datetime_local": parsed.astimezone(timezone_info).isoformat(),
                 }

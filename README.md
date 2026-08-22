@@ -734,7 +734,8 @@ Input workbook:
 - MT Availability: `vehicle_registration_no`, `initial_available_datetime`
 - template dapat diunduh dari page atau API; `.xlsx` dibatasi 10 MB
 - card **Loading Order Upload** menyediakan **Data Demo**: user memasukkan total order dalam KL, sistem membaginya menjadi LO 8 KL (LO terakhir menampung sisa), memilih SPBU aktif secara acak, dan membuat timestamp siap-kirim sesuai shift snapshot model
-- workbook demo langsung dipasang sebagai file upload aktif dan melewati validator yang sama dengan file manual; nama SPBU dan kuantitas KL ikut dipertahankan untuk audit
+- card **MT Availability Upload** menyediakan **Data Demo**: user memasukkan target total kapasitas MT dalam KL, sistem memilih kombinasi acak MT aktif dari master depot dengan total kapasitas paling dekat ke target dan membuat jam availability acak pada planning day
+- workbook demo langsung dipasang sebagai file upload aktif dan melewati validator yang sama dengan file manual; nama SPBU, kuantitas order, kapasitas MT terpilih, dan timestamp ikut dipertahankan untuk audit
 - timestamp tanpa offset dibaca memakai timezone depot; normalized snapshot disimpan dalam UTC dan local time
 - shift bukan input utama: shift diturunkan dari `shipment_start_datetime` menggunakan exact full-day shift-definition snapshot model Phase 5/Phase 2
 - LO divalidasi terhadap planning horizon; MT harus unik, aktif, ada di master, dan berada pada depot run
@@ -835,10 +836,10 @@ Phase 7 tetap bertanggung jawab atas final route optimization, fleet-wide constr
 Verification terakhir:
 
 - migration PostgreSQL memiliki single head revision `0013_phase6_drive_only`
-- seluruh **54 backend tests** lulus pada deployment image
-- **13 focused Phase 6 tests** lulus pada deployment image
+- seluruh **55 backend tests** lulus pada deployment image
+- **14 focused Phase 6 tests** lulus pada deployment image
 - TypeScript type checking dan Vite production build lulus
-- API health, timestamp template/demo, rolling assignment, route cache/profile isolation, fallback, encrypted settings, exports, dan persistence telah diuji
+- API health, kedua generator Data Demo, closest-capacity MT subset, timestamp validation, rolling assignment, DRIVE route cache/fallback, encrypted settings, exports, dan persistence telah diuji
 - Vite memberi non-blocking warning untuk application chunk sekitar 1.71 MB; code splitting ECharts/page modules menjadi technical debt performance
 - host Python tanpa dependency ML lengkap tidak dapat menjalankan dua training tests Phase 5; deployment image adalah verification environment canonical dan membutuhkan `NUMBA_CPU_NAME=generic` serta `NUMBA_DISABLE_JIT=1` pada ARM untuk menghindari illegal-instruction dari Numba/UMAP
 
@@ -900,6 +901,7 @@ Setiap phase harus melewati gate berikut sebelum phase berikutnya dimulai:
 - `GET /api/v1/phase6/templates/mt-availability`
 - `GET /api/v1/phase6/templates/mt-initial-availability`
 - `POST /api/v1/phase6/demo/loading-order`
+- `POST /api/v1/phase6/demo/mt-availability`
 - `POST /api/v1/phase6/validate/loading-order`
 - `POST /api/v1/phase6/validate/mt-availability`
 - `POST /api/v1/phase6/predictions`

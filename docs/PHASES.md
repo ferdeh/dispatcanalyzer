@@ -72,6 +72,7 @@ The repository includes read-only Phase 2–4 intelligence, persisted Phase 5 ML
 - Scope: exactly one depot and one `SAVED`/`ACTIVE` Phase 5 model per run
 - Inputs: Loading Order (`loading_order_no`, `shipment_start_datetime`, `spbu_no`) and initial MT availability (`vehicle_registration_no`, `initial_available_datetime`) workbooks
 - Demo input: total KL is split into 8 KL Loading Orders (with a remainder), using random active depot SPBU and generated timestamps valid for the selected model shift snapshot
+- Demo MT availability: target KL is matched to the closest random subset of active depot MT master capacities, with randomized availability timestamps on the planning day
 - Validation: complete datetime, planning horizon, unique LO/MT, canonical master, active MT, depot, timezone, and full-day model shift snapshot
 - Derived shift: `shipment_start_datetime` is mapped through the immutable Phase 2/Phase 5 shift snapshot; shift is not the availability input
 - Shipment inference: deterministic, time-aware within `maximum_pairing_time_gap_minutes`, same-derived-shift only; planned start is the latest LO timestamp
