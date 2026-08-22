@@ -224,6 +224,8 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
   const [activeRun, setActiveRun] = useState<{ id: string; predictionRunId: string; depotId: string } | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [shiftTab, setShiftTab] = useState("ALL");
+  const [shipmentPage, setShipmentPage] = useState(1);
+  const [shipmentsPerPage, setShipmentsPerPage] = useState(25);
   const [overrideReason, setOverrideReason] = useState<Record<string, string>>({});
   const [moveTargets, setMoveTargets] = useState<Record<string, string>>({});
   const [minimumConfidence, setMinimumConfidence] = useState("0.60");
@@ -559,6 +561,30 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
     () => result?.shipments.filter((shipment) => shiftTab === "ALL" || shipment.shift_id === shiftTab) ?? [],
     [result, shiftTab],
   );
+  const shipmentPageCount = Math.max(1, Math.ceil(visibleShipments.length / shipmentsPerPage));
+  const currentShipmentPage = Math.min(shipmentPage, shipmentPageCount);
+  const paginatedShipments = useMemo(() => {
+    const start = (currentShipmentPage - 1) * shipmentsPerPage;
+    return visibleShipments.slice(start, start + shipmentsPerPage);
+  }, [currentShipmentPage, shipmentsPerPage, visibleShipments]);
+  const shipmentPaginationPages = useMemo(
+    () => [...new Set([1, currentShipmentPage - 1, currentShipmentPage, currentShipmentPage + 1, shipmentPageCount])]
+      .filter((page) => page >= 1 && page <= shipmentPageCount)
+      .sort((left, right) => left - right),
+    [currentShipmentPage, shipmentPageCount],
+  );
+  const shipmentRangeStart = visibleShipments.length === 0 ? 0 : (currentShipmentPage - 1) * shipmentsPerPage + 1;
+  const shipmentRangeEnd = Math.min(currentShipmentPage * shipmentsPerPage, visibleShipments.length);
+
+  useEffect(() => {
+    setShipmentPage(1);
+    setExpanded(null);
+  }, [result?.id, shiftTab, shipmentsPerPage]);
+
+  function goToShipmentPage(page: number) {
+    setShipmentPage(Math.min(Math.max(1, page), shipmentPageCount));
+    setExpanded(null);
+  }
   const shifts = result?.summary_by_shift ?? [];
   const networkOption = useMemo(() => {
     const nodeMap = new Map<string, { id: string; name: string; value: string; category: number }>();
@@ -824,10 +850,18 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
           </section>
 
           <section className="border border-line bg-white p-5">
-            <div className="mb-4"><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">7–8. Predicted Shipment & MT Assignment Result</div><div className="mt-3 flex flex-wrap gap-2"><button className={`border px-3 py-1 text-sm ${shiftTab === "ALL" ? "border-petroblue bg-petroblue text-white" : "border-line"}`} onClick={() => setShiftTab("ALL")}>All</button>{shifts.map((shift) => <button key={String(shift.shift_id)} className={`border px-3 py-1 text-sm ${shiftTab === shift.shift_id ? "border-petroblue bg-petroblue text-white" : "border-line"}`} onClick={() => setShiftTab(String(shift.shift_id))}>{shift.shift}</button>)}</div></div>
+            <div className="mb-4 flex flex-wrap items-end justify-between gap-4">
+              <div><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">7–8. Predicted Shipment & MT Assignment Result</div><div className="mt-3 flex flex-wrap gap-2"><button className={`border px-3 py-1 text-sm ${shiftTab === "ALL" ? "border-petroblue bg-petroblue text-white" : "border-line"}`} onClick={() => setShiftTab("ALL")}>All</button>{shifts.map((shift) => <button key={String(shift.shift_id)} className={`border px-3 py-1 text-sm ${shiftTab === shift.shift_id ? "border-petroblue bg-petroblue text-white" : "border-line"}`} onClick={() => setShiftTab(String(shift.shift_id))}>{shift.shift}</button>)}</div></div>
+              <label className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                Rows per page
+                <select className="border border-line bg-white px-3 py-2 text-sm font-normal normal-case tracking-normal text-petroink" value={shipmentsPerPage} onChange={(event) => setShipmentsPerPage(Number(event.target.value))}>
+                  {[25, 50, 100].map((size) => <option key={size} value={size}>{size}</option>)}
+                </select>
+              </label>
+            </div>
             <div className="overflow-x-auto">
               <table className="min-w-full text-left text-sm"><thead className="bg-slate-50 text-xs uppercase text-slate-500"><tr>{["", "Trip", "MT", "Shipment / SPBU", "Planned Start", "Predicted Departure", "Estimated Return", "Next Available", "Confidence", "Status"].map((item, index) => <th key={`${item}-${index}`} className="px-3 py-2">{item}</th>)}</tr></thead>
-                <tbody>{visibleShipments.map((shipment) => (
+                <tbody>{paginatedShipments.map((shipment) => (
                   <>
                     <tr key={shipment.id} className="border-t border-line align-top">
                       <td className="px-3 py-3"><button onClick={() => setExpanded(expanded === shipment.id ? null : shipment.id)}>{expanded === shipment.id ? <ChevronDown size={17} /> : <ChevronRight size={17} />}</button></td>
@@ -857,6 +891,19 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
                   </>
                 ))}</tbody>
               </table>
+            </div>
+            <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-line pt-4 text-sm">
+              <div className="text-slate-500">Showing {shipmentRangeStart.toLocaleString("id-ID")}–{shipmentRangeEnd.toLocaleString("id-ID")} of {visibleShipments.length.toLocaleString("id-ID")} shipments</div>
+              <div className="flex items-center gap-1">
+                <button className="border border-line px-3 py-2 disabled:cursor-not-allowed disabled:opacity-40" disabled={currentShipmentPage === 1} onClick={() => goToShipmentPage(currentShipmentPage - 1)}>Previous</button>
+                {shipmentPaginationPages.map((page, index) => (
+                  <span key={page} className="contents">
+                    {index > 0 && page - shipmentPaginationPages[index - 1] > 1 && <span className="px-1 text-slate-400">…</span>}
+                    <button className={`min-w-9 border px-3 py-2 ${page === currentShipmentPage ? "border-petroblue bg-petroblue text-white" : "border-line"}`} aria-current={page === currentShipmentPage ? "page" : undefined} onClick={() => goToShipmentPage(page)}>{page}</button>
+                  </span>
+                ))}
+                <button className="border border-line px-3 py-2 disabled:cursor-not-allowed disabled:opacity-40" disabled={currentShipmentPage === shipmentPageCount} onClick={() => goToShipmentPage(currentShipmentPage + 1)}>Next</button>
+              </div>
             </div>
           </section>
 
