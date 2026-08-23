@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import itertools
 import json
 import math
 import statistics
@@ -45,7 +44,7 @@ def _haversine_meters(first: tuple[float, float], second: tuple[float, float]) -
 class Phase6RouteEstimationService:
     """Estimate one predicted trip at a time; never solve a fleet-wide VRP.
 
-    Small stop permutations are allowed only to estimate this trip's cycle time.
+    Stops are sequenced from nearest to farthest relative to the depot.
     No Google Route Optimization / GMPRO endpoint is present in this service.
     """
 
@@ -112,7 +111,7 @@ class Phase6RouteEstimationService:
         }
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
-    def _cached_leg(self, cache_key: str) -> dict | None:
+    def _cached_leg(self, cache_key: str, *, require_road_geometry: bool = False) -> dict | None:
         now = datetime.now(timezone.utc)
         row = self._pending_cache.get(cache_key)
         if not row:
@@ -125,14 +124,30 @@ class Phase6RouteEstimationService:
         if not row:
             self.metrics["google_routes_cache_miss_count"] += 1
             return None
-        self.metrics["google_routes_cache_hit_count"] += 1
         metadata = row.response_metadata or {}
+        geometry = metadata.get("route_geometry") or []
+        geometry_source = metadata.get("route_geometry_source")
+        if require_road_geometry and self.client and (
+            geometry_source != "GOOGLE_ROUTES_GEOJSON" or len(geometry) < 2
+        ) and not metadata.get("road_geometry_attempted"):
+            self.metrics["google_routes_cache_miss_count"] += 1
+            return None
+        if not geometry:
+            geometry = [
+                {"latitude": row.origin_latitude, "longitude": row.origin_longitude},
+                {"latitude": row.destination_latitude, "longitude": row.destination_longitude},
+            ]
+            geometry_source = "MASTER_COORDINATE_FALLBACK"
+        self.metrics["google_routes_cache_hit_count"] += 1
         return {
             "distance_meters": row.distance_meters,
             "duration_seconds": row.duration_seconds,
             "static_duration_seconds": row.static_duration_seconds,
             "source": "ROUTE_CACHE",
             "underlying_source": row.provider_source,
+            "route_geometry": geometry,
+            "route_geometry_source": geometry_source,
+            "road_geometry_attempted": bool(metadata.get("road_geometry_attempted", False)),
             "routing_confidence": metadata.get("routing_confidence", "HIGH"),
             "fallback_used": bool(metadata.get("fallback_used", False)),
             "warning_codes": metadata.get("warning_codes", []),
@@ -175,6 +190,9 @@ class Phase6RouteEstimationService:
                 "routing_confidence": estimate["routing_confidence"],
                 "fallback_used": estimate.get("fallback_used", False),
                 "warning_codes": estimate.get("warning_codes", []),
+                "route_geometry": estimate.get("route_geometry", []),
+                "route_geometry_source": estimate.get("route_geometry_source"),
+                "road_geometry_attempted": bool(estimate.get("road_geometry_attempted", False)),
             },
             "calculated_at": now,
             "expires_at": now + timedelta(minutes=int(self.configuration.cache_ttl_minutes)),
@@ -194,6 +212,14 @@ class Phase6RouteEstimationService:
         origin: tuple[float, float] | None,
         destination: tuple[float, float] | None,
     ) -> dict:
+        straight_geometry = (
+            [
+                {"latitude": origin[0], "longitude": origin[1]},
+                {"latitude": destination[0], "longitude": destination[1]},
+            ]
+            if origin and destination
+            else []
+        )
         spbu = destination_entity if isinstance(destination_entity, MasterSPBU) else origin_entity if isinstance(origin_entity, MasterSPBU) else None
         if isinstance(spbu, MasterSPBU) and spbu.master_travel_time_min and spbu.master_travel_time_min > 0:
             duration = round(float(spbu.master_travel_time_min) * 60)
@@ -204,6 +230,8 @@ class Phase6RouteEstimationService:
                 "distance_meters": distance,
                 "duration_seconds": duration,
                 "static_duration_seconds": duration,
+                "route_geometry": straight_geometry,
+                "route_geometry_source": "MASTER_COORDINATE_FALLBACK",
                 "source": "HISTORICAL_ROUTE",
                 "routing_confidence": "MEDIUM",
                 "fallback_used": True,
@@ -239,6 +267,8 @@ class Phase6RouteEstimationService:
                         "distance_meters": distance,
                         "duration_seconds": duration,
                         "static_duration_seconds": duration,
+                        "route_geometry": straight_geometry,
+                        "route_geometry_source": "MASTER_COORDINATE_FALLBACK",
                         "source": "HISTORICAL_CLUSTER",
                         "routing_confidence": "MEDIUM",
                         "fallback_used": True,
@@ -250,6 +280,8 @@ class Phase6RouteEstimationService:
             "distance_meters": distance,
             "duration_seconds": duration,
             "static_duration_seconds": duration,
+            "route_geometry": straight_geometry,
+            "route_geometry_source": "MASTER_COORDINATE_FALLBACK",
             "source": "DEFAULT_ESTIMATE",
             "routing_confidence": "LOW",
             "fallback_used": True,
@@ -281,6 +313,7 @@ class Phase6RouteEstimationService:
         departure: datetime,
         mt: MasterMT,
         mode: dict,
+        require_road_geometry: bool = False,
     ) -> dict:
         origin_id = origin_entity.depot_id if isinstance(origin_entity, MasterDepot) else origin_entity.spbu_id
         destination_id = destination_entity.depot_id if isinstance(destination_entity, MasterDepot) else destination_entity.spbu_id
@@ -295,13 +328,15 @@ class Phase6RouteEstimationService:
             routing_mode=mode["result_mode"],
             routing_preference=self.configuration.routing_preference,
         )
-        cached = self._cached_leg(cache_key)
+        cached = self._cached_leg(cache_key, require_road_geometry=require_road_geometry)
         if cached:
             cached["warning_codes"] = sorted(set(cached["warning_codes"] + mode["warning_codes"]))
             cached["fallback_used"] = cached["fallback_used"] or mode["fallback_used"]
             return cached
         estimate = None
+        road_geometry_attempted = False
         if self.client and origin and destination:
+            road_geometry_attempted = True
             self.metrics["google_routes_request_count"] += 1
             try:
                 response = self.client.compute_route(
@@ -319,12 +354,14 @@ class Phase6RouteEstimationService:
                     "source": "GOOGLE_ROUTES_DRIVE",
                     "routing_confidence": "MEDIUM" if response["restrictions_partially_ignored"] else "HIGH",
                     "fallback_used": mode["fallback_used"],
+                    "road_geometry_attempted": True,
                     "warning_codes": sorted(set(warnings)),
                 }
             except GoogleRoutesError:
                 self.metrics["google_routes_failed_request_count"] += 1
         if estimate is None:
             estimate = self._historical_fallback(origin_entity, destination_entity, origin, destination)
+            estimate["road_geometry_attempted"] = road_geometry_attempted
             estimate["warning_codes"] = sorted(set(estimate["warning_codes"] + mode["warning_codes"]))
             estimate["fallback_used"] = True
         if origin and destination:
@@ -342,22 +379,21 @@ class Phase6RouteEstimationService:
             )
         return estimate
 
-    def _nearest_neighbor_sequence(self, depot: MasterDepot, spbus: list[MasterSPBU]) -> list[MasterSPBU]:
-        remaining = list(spbus)
-        current = self._coordinates(depot)
-        sequence: list[MasterSPBU] = []
-        while remaining:
-            if current is None:
-                selected = sorted(remaining, key=lambda item: item.spbu_code)[0]
+    def _nearest_to_farthest_from_depot(self, depot: MasterDepot, spbus: list[MasterSPBU]) -> list[MasterSPBU]:
+        """Order stops by radial distance from the depot, never by the previous stop."""
+        depot_coordinates = self._coordinates(depot)
+
+        def distance_key(spbu: MasterSPBU) -> tuple[float, str]:
+            spbu_coordinates = self._coordinates(spbu)
+            if depot_coordinates and spbu_coordinates:
+                distance = _haversine_meters(depot_coordinates, spbu_coordinates)
+            elif spbu.master_distance_km is not None:
+                distance = float(spbu.master_distance_km) * 1000
             else:
-                selected = min(
-                    remaining,
-                    key=lambda item: _haversine_meters(current, self._coordinates(item)) if self._coordinates(item) else math.inf,
-                )
-            sequence.append(selected)
-            remaining.remove(selected)
-            current = self._coordinates(selected) or current
-        return sequence
+                distance = math.inf
+            return distance, spbu.spbu_code
+
+        return sorted(spbus, key=distance_key)
 
     def estimate_trip(
         self,
@@ -367,33 +403,31 @@ class Phase6RouteEstimationService:
         mt: MasterMT,
         predicted_departure_datetime: datetime,
         max_exact_sequence_stops: int,
+        require_road_geometry: bool = False,
     ) -> dict:
         if not spbus:
             raise GoogleRoutesError("GOOGLE_ROUTE_NOT_FOUND", "Shipment has no SPBU stops.", status_code=422)
         mode = self._resolve_mode(mt)
         unique_spbus = list({spbu.spbu_id: spbu for spbu in spbus}.values())
-        if len(unique_spbus) <= max_exact_sequence_stops:
-            candidate_sequences = list(itertools.permutations(unique_spbus))
-        else:
-            candidate_sequences = [tuple(self._nearest_neighbor_sequence(depot, unique_spbus))]
-        best: tuple[int, list[MasterSPBU], list[dict]] | None = None
-        for sequence in candidate_sequences:
-            entities: list[MasterDepot | MasterSPBU] = [depot, *sequence, depot]
-            legs = [
-                self._estimate_leg(
-                    origin_entity=entities[index],
-                    destination_entity=entities[index + 1],
-                    departure=predicted_departure_datetime,
-                    mt=mt,
-                    mode=mode,
-                )
-                for index in range(len(entities) - 1)
-            ]
-            duration = sum(leg["duration_seconds"] for leg in legs)
-            if best is None or duration < best[0]:
-                best = duration, list(sequence), legs
-        assert best is not None
-        travel_duration, sequence, legs = best
+        # Operations explicitly require the SPBU sequence to progress from the
+        # nearest stop to the farthest stop relative to the depot. The
+        # max_exact_sequence_stops argument remains in the public contract for
+        # backward-compatible run snapshots but no longer changes this rule.
+        _ = max_exact_sequence_stops
+        sequence = self._nearest_to_farthest_from_depot(depot, unique_spbus)
+        entities: list[MasterDepot | MasterSPBU] = [depot, *sequence, depot]
+        legs = [
+            self._estimate_leg(
+                origin_entity=entities[index],
+                destination_entity=entities[index + 1],
+                departure=predicted_departure_datetime,
+                mt=mt,
+                mode=mode,
+                require_road_geometry=require_road_geometry,
+            )
+            for index in range(len(entities) - 1)
+        ]
+        travel_duration = sum(leg["duration_seconds"] for leg in legs)
         depot_processing = int(self.configuration.default_depot_processing_minutes) * 60
         spbu_service = int(self.configuration.default_spbu_service_minutes) * 60 * len(sequence)
         return_processing = int(self.configuration.default_return_processing_minutes) * 60
@@ -407,6 +441,12 @@ class Phase6RouteEstimationService:
         sources = sorted({leg["source"] for leg in legs})
         warnings = sorted({code for leg in legs for code in leg["warning_codes"]})
         fallback_used = mode["fallback_used"] or any(leg["fallback_used"] for leg in legs)
+        route_geometry = []
+        for leg in legs:
+            for point in leg.get("route_geometry") or []:
+                if not route_geometry or route_geometry[-1] != point:
+                    route_geometry.append(point)
+        geometry_sources = sorted({leg.get("route_geometry_source") for leg in legs if leg.get("route_geometry_source")})
         return {
             "estimated_visit_sequence": [spbu.spbu_id for spbu in sequence],
             "estimated_visit_sequence_codes": [spbu.spbu_code for spbu in sequence],
@@ -424,6 +464,8 @@ class Phase6RouteEstimationService:
             "next_available_datetime": next_available,
             "routing_confidence": confidence,
             "route_estimation_source": sources[0] if len(sources) == 1 else "MIXED_ESTIMATE",
+            "route_geometry": route_geometry,
+            "route_geometry_source": geometry_sources[0] if len(geometry_sources) == 1 else "MIXED_GEOMETRY",
             "fallback_used": fallback_used,
             "warning_codes": warnings,
             "vehicle_profile_snapshot": {

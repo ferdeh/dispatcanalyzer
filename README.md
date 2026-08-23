@@ -695,6 +695,8 @@ Engine B — SPBU Behavioral Clustering:
 - pairing graph diubah menjadi embedding dengan Node2Vec memakai seed dan single worker; isolated nodes menerima zero pairing vector, dan graph tanpa edge menghasilkan zero vector untuk seluruh node
 - feature group Tag, Shift, Pairing distandardisasi sendiri-sendiri, dikalikan `sqrt(weight / group_dimension)`, lalu digabung agar group lebar tidak dominan hanya karena memiliki lebih banyak kolom
 - pipeline utama adalah **Node2Vec + UMAP + HDBSCAN**. HDBSCAN noise tetap noise dan ditampilkan sebagai `Noise / Unique Behavioral Pattern`
+- dataset v4 mempertahankan seluruh SPBU master berstatus `ACTIVE`. HDBSCAN dan scaler tetap di-fit hanya memakai SPBU yang memenuhi minimum historical observation; SPBU aktif lainnya dipetakan sesudah training ke centroid cluster terdekat sebagai `ACTIVE_MASTER_COLD_START` dengan membership maksimum 0,49 agar coverage lengkap tanpa menyamakan cold-start dengan behavioral evidence
+- pairing graph, shift distribution, dan shipment observation selalu dibangun ulang dari histori canonical dalam training period yang dipilih; dataset summary memisahkan sufficient-history, cold-start, dan inactive historical SPBU. Artifact inference menyimpan seluruh internal pairing edge, sedangkan panel review tetap membatasi tampilannya pada Top 10 per cluster
 - training result harus direview sebelum diberi nama dan disimpan; training tidak otomatis membuat registry model atau mengaktifkannya
 - saved model untuk depot aktif dapat dipilih dan dibuka langsung dari workspace Behavioral Clustering tanpa prepare dataset atau retraining; UMAP, Geographic Cluster Map, profiles, dan paginated membership memakai assignment model yang tersimpan
 - saved package berisi encoder/configuration, scaler metadata, Node2Vec embeddings, internal/visualization UMAP model, HDBSCAN model, vectors, assignments, profiles, dependency versions, manifest, dan checksum
@@ -731,11 +733,11 @@ Phase 6 adalah inference, assignment, dan estimasi availability—bukan training
 
 Input workbook:
 
-- Loading Order: `loading_order_no`, `shipment_start_datetime`, `spbu_no`; `order_quantity_kl` bersifat opsional
+- Loading Order: `loading_order_no`, `shipment_start_datetime`, `spbu_no`, dan `order_quantity_kl`; setiap LO wajib tepat 8 KL
 - MT Availability: `vehicle_registration_no`, `initial_available_datetime`
 - template dapat diunduh dari page atau API; `.xlsx` dibatasi 10 MB
-- card **Loading Order Upload** menyediakan **Data Demo**: user memasukkan total order dalam KL, sistem membaginya menjadi LO 8 KL (LO terakhir menampung sisa), memilih SPBU aktif secara acak, dan membuat timestamp siap-kirim sesuai shift snapshot model
-- card **MT Availability Upload** menyediakan **Data Demo**: user memasukkan target total kapasitas MT dalam KL, sistem memilih kombinasi acak MT aktif dari master depot dengan total kapasitas paling dekat ke target dan membuat jam availability acak pada planning day
+- card **Loading Order Upload** menyediakan **Data Demo**: user memasukkan total order kelipatan 8 KL, sistem membuat satu LO 8 KL per unit order, hanya memilih SPBU aktif non-noise yang tercakup saved model, dan membentuk batch cluster/dominant-shift bertimestamp berdekatan agar demo dapat menguji multi-SPBU tanpa `UNSEEN_SPBU`; input dengan sisa di bawah 8 KL ditolak
+- card **MT Availability Upload** menyediakan **Data Demo**: user memasukkan target total kapasitas MT dalam KL, sistem memilih kombinasi acak MT aktif dari master depot dengan total kapasitas paling dekat ke target; jam buka depot mengikuti `start_time` shift pertama dan jam tutup mengikuti `end_time` shift terakhir pada snapshot model. Secara default semua MT tersedia tepat pada jam buka, sedangkan opsi **Random availability** membuat jam availability secara acak di dalam window buka–tutup tersebut
 - workbook demo langsung dipasang sebagai file upload aktif dan melewati validator yang sama dengan file manual; nama SPBU, kuantitas order, kapasitas MT terpilih, dan timestamp ikut dipertahankan untuk audit
 - timestamp tanpa offset dibaca memakai timezone depot; normalized snapshot disimpan dalam UTC dan local time
 - shift bukan input utama: shift diturunkan dari `shipment_start_datetime` menggunakan exact full-day shift-definition snapshot model Phase 5/Phase 2
@@ -750,11 +752,13 @@ Loading Order
         +
 Initial MT Availability
         ↓
-Time-Aware Shipment Pairing
+Capacity-Aware Shipment Grouping (1–4 LO)
         ↓
 Phase 4 MT Candidate Score
         ↓
 Phase 1 Master Compatibility Hard Filter
+        +
+8 KL Compartment Capacity Sufficiency Hard Filter
         ↓
 Rolling Chronological MT Assignment
         ↓
@@ -768,9 +772,9 @@ Final Dispatch Prediction
 Phase 7 Input
 ```
 
-Shipment inference memakai immutable Phase 5 artifact/normalized model registry: cluster membership probability, same-cluster evidence, model feature weights, derived-shift match, dan saved historical pairing strength. Pairing hanya dipertimbangkan dalam derived shift yang sama dan dalam `maximum_pairing_time_gap_minutes`; `planned_start_datetime` adalah timestamp LO paling akhir dalam shipment.
+Shipment inference memakai immutable Phase 5 artifact/normalized model registry: cluster membership probability, same-cluster evidence, model feature weights, derived-shift match, dan saved historical pairing strength. Grouping hanya dipertimbangkan dalam derived shift yang sama dan dalam `maximum_pairing_time_gap_minutes`; default window adalah 90 menit dan tetap configurable dari UI. Default minimum pairing confidence adalah 0,40 agar sufficient-history pair dapat terbentuk tanpa otomatis meloloskan cold-start coverage yang confidence-nya sengaja dibatasi. `planned_start_datetime` adalah timestamp LO paling akhir dalam shipment. Algoritma `CAPACITY_TIME_ROUTE_SET_PACKING` membangun connected candidate group hingga empat LO, lalu memilih kombinasi grup tidak-overlap secara global melalui binary MILP set packing (dengan deterministic greedy fallback). Objective memprioritaskan pengurangan shipment dan multi-SPBU, lalu mempertimbangkan group model score, time span, 8 KL compartment capacity, pair-evidence coverage, serta approximate nearest-to-farthest route dari koordinat master. Grup tidak lagi wajib complete clique, tetapi tetap harus lolos confidence minimum, time window, capacity, dan `maximum_group_route_detour_ratio`; Google Routes aktual baru dipanggil setelah grup terpilih. Versi algoritma ini adalah `phase6.capacity_time_route_set_packing.v7`.
 
-MT ranking memakai Phase 4 historical `P(MT|SPBU)` dengan deterministic Laplace smoothing. Historical affinity hanya score/ranking; rule Phase 1 dari `app.compatibility.evaluate_compatibility_entities` tetap hard filter terpisah. Untuk multi-SPBU shipment, MT harus lulus rule untuk seluruh SPBU (intersection). Candidate yang gagal disimpan sebagai diagnostic `MASTER_COMPATIBILITY_FAIL`.
+MT ranking memakai Phase 4 historical `P(MT|SPBU)` dengan deterministic Laplace smoothing. Historical affinity hanya score/ranking; rule Phase 1 dari `app.compatibility.evaluate_compatibility_entities` tetap hard filter terpisah. Untuk multi-SPBU shipment, MT harus lulus rule untuk seluruh SPBU (intersection). Capacity profile dihitung dari master `capacity_label`/`vehicle_type_tag` dan `number_of_compartments`; setiap kompartemen bernilai 8 KL. Policy `ALLOW_PARTIAL_LOAD` menggunakan aturan `jumlah LO ≤ jumlah kompartemen`, sehingga satu LO 8 KL dapat dibawa MT 8/16/24/32 KL selama historical/master compatibility lulus. Candidate gagal disimpan sebagai diagnostic `MASTER_COMPATIBILITY_FAIL` atau `CAPACITY_COMPARTMENT_MISMATCH`; compartment count kosong dapat diinfer dari kapasitas dengan warning, tetapi data master yang saling bertentangan menjadi validation error.
 
 Assignment diproses ascending `planned_start_datetime`. State awal tiap MT adalah `initial_available_datetime`; setelah trip dipilih, sistem menghitung return dan `next_available_datetime`. MT yang sama dapat mendapat Trip 1, 2, 3, dan seterusnya selama `previous.next_available <= next.predicted_departure`. Mode:
 
@@ -798,7 +802,7 @@ valid route cache / Google Routes
 → configured default
 ```
 
-Untuk shipment kecil, Phase 6 mengevaluasi small permutation atau nearest-neighbor hanya untuk `estimated_visit_sequence` dan cycle-time estimation. Ini preliminary estimate, bukan optimized route.
+Di dalam setiap shipment, Phase 6 mengurutkan SPBU secara deterministik berdasarkan jarak radial dari depot: SPBU terdekat lebih dahulu dan SPBU terjauh terakhir. Urutan `depot → SPBU terdekat → ... → SPBU terjauh → depot` digunakan oleh `estimated_visit_sequence`, estimasi cycle time, dan geographic route map. Ini preliminary operational sequence, bukan fleet-wide optimized route.
 
 Formula implementasi:
 
@@ -817,20 +821,23 @@ Turnaround buffer disimpan terpisah dan tidak dihitung dua kali dalam `total_cyc
 
 Dispatcher dapat:
 
-- mengganti MT hanya ke candidate yang compatible; route dan timeline downstream dihitung ulang dalam mode DRIVE
-- move LO/SPBU ke shipment same-shift, membuat shipment baru/single, atau combine same-shift shipment
+- mengganti MT hanya ke candidate yang lulus historical/master compatibility dan mempunyai kompartemen cukup; route dan timeline downstream dihitung ulang dalam mode DRIVE
+- move LO/SPBU ke shipment same-shift, membuat shipment baru/single, atau combine same-shift shipment tanpa melewati batas kompartemen
 - memicu ulang candidate scoring, compatibility filter, rolling state, route duration, return, dan affected future availability tanpa training ulang
+- memicu kalkulasi ulang multi-trip MT, total assigned KL, distribusi KL per jam, cumulative distribution, dan geographic MT route pada setiap manual assignment atau perubahan grouping shipment
 - membandingkan immutable `original_model_prediction` dengan `final_dispatch_prediction`
 
-Persistence migration `0010_phase6_prediction` menambah prediction core; `0011_phase6_demo_lo` menambah audit quantity KL; `0012_phase6_multitrip` menambah timestamp planning, `prediction_trip`, encrypted Google configuration, route cache, routing metrics, serta original/final snapshots. Migration `0013_phase6_drive_only` menormalisasi konfigurasi dan seluruh status profile MT ke mode DRIVE/NOT_REQUIRED. Migration `0014_phase6_worker` menambah durable PostgreSQL job queue, worker lease, heartbeat, attempt count, dan recovery metadata. Prediction run snapshot menyimpan model/config version, traffic/cycle parameters, tetapi tidak menyimpan raw API key.
+Persistence migration `0010_phase6_prediction` menambah prediction core; `0011_phase6_demo_lo` menambah audit quantity KL; `0012_phase6_multitrip` menambah timestamp planning, `prediction_trip`, encrypted Google configuration, route cache, routing metrics, serta original/final snapshots. Migration `0013_phase6_drive_only` menormalisasi konfigurasi dan seluruh status profile MT ke mode DRIVE/NOT_REQUIRED. Migration `0014_phase6_worker` menambah durable PostgreSQL job queue, worker lease, heartbeat, attempt count, dan recovery metadata. Migration `0015_phase6_road_geometry` menyimpan Google Routes overview GeoJSON per trip agar map mengikuti jalan tanpa membebani payload dengan navigation-step resolution. Prediction run snapshot menyimpan model/config version, traffic/cycle parameters, tetapi tidak menyimpan raw API key.
 
-Run Prediction diproses secara asynchronous oleh service Docker `phase6-worker`, terpisah dari proses FastAPI. `POST /api/v1/phase6/predictions` hanya memvalidasi input, menyimpan snapshot serta row `prediction_job`, membuat run berstatus `QUEUED`, lalu langsung mengembalikan `202 Accepted`. Worker mengklaim job memakai PostgreSQL row lock dan lease token, menjalankan inference dalam child process terisolasi, serta memperbarui heartbeat tanpa mengunci transaction hasil prediction. Default heartbeat adalah 5 detik, lease timeout 30 detik, execution timeout 3.600 detik, dan maksimum tiga attempt; seluruh nilai dapat diubah melalui environment `PHASE6_*` di `.env.example`.
+Run Prediction diproses secara asynchronous oleh service Docker `phase6-worker`, terpisah dari proses FastAPI. `POST /api/v1/phase6/predictions` hanya memvalidasi input, menyimpan snapshot serta row `prediction_job`, membuat run berstatus `QUEUED`, lalu langsung mengembalikan `202 Accepted`. Tombol Run tetap aktif setelah enqueue sehingga user dapat mengirim beberapa prediction tanpa menunggu task sebelumnya; seluruh task disimpan durable di PostgreSQL dan worker mengklaim job secara FIFO memakai row lock serta lease token. Inference dijalankan dalam child process terisolasi, sementara heartbeat diperbarui tanpa mengunci transaction hasil prediction. Default heartbeat adalah 5 detik, lease timeout 30 detik, execution timeout 3.600 detik, dan maksimum tiga attempt; seluruh nilai dapat diubah melalui environment `PHASE6_*` di `.env.example`.
 
 Jika worker/container berhenti, lease yang kedaluwarsa otomatis direcovery menjadi `QUEUED` dan dicoba ulang. Setelah retry limit tercapai, run ditutup sebagai `FAILED` dengan diagnostic `WORKER_HEARTBEAT_TIMEOUT`, `PREDICTION_TIMEOUT`, atau worker-exit terkait. Lease token menjadi fencing token: worker lama yang hidup kembali tidak dapat menimpa hasil attempt baru. Re-run dari history juga membuat job baru dari immutable input snapshot dan kembali melalui antrean, termasuk untuk run `FAILED`.
 
-Frontend memantau endpoint status secara berkala, menampilkan attempt serta heartbeat pada history, tetap dapat digunakan selama task berjalan, melanjutkan pemantauan run aktif saat page dibuka kembali, dan otomatis mengambil hasil lengkap ketika status menjadi `COMPLETED`. Tombol **Refresh** mempunyai loading spinner, disabled state selama request, timestamp keberhasilan, dan pesan error yang terlihat sehingga klik tidak lagi tampak tanpa respons.
+Frontend memantau seluruh task aktif secara berkala, menampilkan jumlah `RUNNING` dan `QUEUED`, attempt serta heartbeat pada history, melanjutkan pemantauan run aktif saat page dibuka kembali, dan otomatis menampilkan hasil task terbaru yang selesai. Endpoint detail hanya mengirim summary, timeline, metadata map, dan satu halaman shipment; kandidat MT dimuat ketika detail shipment dibuka, sedangkan geometri jalan dimuat hanya untuk MT terpilih. Pemisahan ini mencegah puluhan ribu kandidat dan jutaan titik geometri diserialisasi menjadi satu response. Tombol **Refresh** mempunyai loading spinner, disabled state selama request, timestamp keberhasilan, dan pesan error yang terlihat sehingga klik tidak lagi tampak tanpa respons.
 
-History menyediakan View, Download, dan Duplicate/Re-run. Export `.xlsx` berisi Summary, Shipment Result, Trip Timeline, MT Assignment, MT Candidates, dan Validation. UI main table menampilkan trip, MT, shipment/SPBU, planned/departure/return/next-available, confidence, status; card 7–8 menggunakan pagination 25 shipment per halaman dengan pilihan 25/50/100 dan reset otomatis ketika filter shift berubah. Expandable detail menampilkan LO, preliminary sequence, mode, distance, travel/service/cycle, fallback, dan missing vehicle-profile fields. MT Multi-Trip Timeline menampilkan periode kendaraan sampai turnaround selesai dengan pagination terpisah 10 MT per halaman dan pilihan 10/25/50 agar chart tetap ringkas pada hasil besar.
+Tepat di atas **Prediction Run History**, result workspace menampilkan dua visual operasional. Grafik kombinasi memakai bar untuk KL assigned shipment pada setiap jam `predicted_departure_datetime` dalam timezone depot dan line untuk cumulative assigned KL; bucket kosong di antara jam pertama dan terakhir tetap ditampilkan sebagai nol. Geographic Route per MT memakai koordinat Master Depot/SPBU yang sama dengan Geographic Cluster Map Fase 5 pada basemap OpenStreetMap, filter satu/semua MT, warna konsisten per kendaraan, dan urutan terdekat-ke-terjauh. Marker selalu menunjukkan exact master coordinate, sedangkan garis solid memakai overview GeoJSON dari Google Routes sehingga mengikuti jalan dan dapat mengalami road snapping di dekat marker. Prediction lama melakukan lazy backfill geometri ketika MT dipilih; kegagalan Google ditampilkan sebagai garis fallback putus-putus agar tidak disalahartikan sebagai rute jalan. Shipment tanpa assignment tidak masuk grafik maupun map, dan perubahan manual langsung mengembalikan payload hasil yang telah dihitung ulang.
+
+History menyediakan View, Download, dan Duplicate/Re-run. Export `.xlsx` berisi Summary, Shipment Result, Trip Timeline, MT Assignment, MT Candidates, dan Validation. UI main table menampilkan trip, MT beserta kapasitas/kompartemen, shipment/SPBU, jumlah LO dan volume, planned/departure/return/next-available, confidence, serta status; urutan kunjungan menggunakan kode SPBU yang dapat dibaca, bukan ID internal. Card 7–8 menggunakan server-side pagination 25 shipment per halaman dengan pilihan 25/50/100 dan filter shift di backend. Expandable detail menampilkan pemakaian slot 8 KL, daftar LO/SPBU, preliminary sequence, mode, distance, travel/service/cycle, fallback, serta kandidat/exclusion yang diambil secara lazy. MT Multi-Trip Timeline menampilkan periode kendaraan sampai turnaround selesai dengan pagination terpisah 10 MT per halaman dan pilihan 10/25/50 agar chart tetap ringkas pada hasil besar.
 
 Authorization mengikuti seam existing melalui `X-User` dan `X-Permissions`: `phase6:view`, `phase6:run`, `phase6:export`, `phase6:override`, `google_routes:view`, dan `google_routes:manage`. Local requests tetap permissive sampai identity provider production menggantikan dependency ini.
 
@@ -842,9 +849,9 @@ Phase 7 tetap bertanggung jawab atas final route optimization, fleet-wide constr
 
 Verification terakhir:
 
-- migration PostgreSQL memiliki single head revision `0014_phase6_worker`
-- seluruh **59 backend tests** lulus pada deployment image
-- **18 focused Phase 6 tests** lulus pada deployment image
+- migration PostgreSQL memiliki single head revision `0015_phase6_road_geometry`
+- seluruh **64 backend tests** lulus pada deployment image
+- **23 focused Phase 6 tests** lulus, termasuk asynchronous queue/worker recovery, three-LO/24-KL grouping, exact 8-KL validation, partial-load assignment, route geometry, dan pagination/lazy payload
 - TypeScript type checking dan Vite production build lulus
 - API health, kedua generator Data Demo, closest-capacity MT subset, timestamp validation, rolling assignment, DRIVE route cache/fallback, encrypted settings, exports, dan persistence telah diuji
 - Vite memberi non-blocking warning untuk application chunk sekitar 1.71 MB; code splitting ECharts/page modules menjadi technical debt performance
@@ -914,7 +921,9 @@ Setiap phase harus melewati gate berikut sebelum phase berikutnya dimulai:
 - `POST /api/v1/phase6/predictions`
 - `GET /api/v1/phase6/predictions`
 - `GET /api/v1/phase6/predictions/{run_id}/status`
-- `GET /api/v1/phase6/predictions/{run_id}`
+- `GET /api/v1/phase6/predictions/{run_id}?shipment_page=1&shipment_page_size=25&shift_id=...`
+- `GET /api/v1/phase6/predictions/{run_id}/shipments/{shipment_id}/candidates`
+- `POST /api/v1/phase6/predictions/{run_id}/route-geometry`
 - `POST /api/v1/phase6/predictions/{run_id}/recalculate`
 - `PATCH /api/v1/phase6/predictions/{run_id}/shipments/{shipment_id}`
 - `PATCH /api/v1/phase6/predictions/{run_id}/assignments/{assignment_id}`

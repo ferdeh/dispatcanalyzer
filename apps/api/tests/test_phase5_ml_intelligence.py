@@ -264,8 +264,9 @@ def test_engine_b_dataset_training_artifacts_versioning_activation_and_compariso
     get_settings().ml_artifact_dir = tmp_path
     Session = make_session()
     spbu_ids = [f"A{index}" for index in range(4)] + [f"B{index}" for index in range(4)]
+    all_active_spbu_ids = [*spbu_ids, "COLD"]
     with Session() as session:
-        seed_compatible_master(session, spbu_ids, tags=True)
+        seed_compatible_master(session, all_active_spbu_ids, tags=True)
         session.get(MasterSPBU, spbu_ids[-1]).latitude = None
         session.get(MasterSPBU, spbu_ids[-1]).longitude = None
         for day in range(1, 13):
@@ -283,7 +284,9 @@ def test_engine_b_dataset_training_artifacts_versioning_activation_and_compariso
         )
         assert prepared["status"] == "DATASET_READY"
         assert prepared["dataset_summary"]["sufficient_history_spbu_count"] == 8
-        assert prepared["dataset_summary"]["geocoded_training_spbu_count"] == 7
+        assert prepared["dataset_summary"]["active_master_spbu_count"] == 9
+        assert prepared["dataset_summary"]["cold_start_active_spbu_count"] == 1
+        assert prepared["dataset_summary"]["geocoded_training_spbu_count"] == 8
         assert prepared["dataset_summary"]["missing_coordinate_training_spbu_count"] == 1
         assert len(prepared["shift_definition_snapshot"]) == 4
         training_run_id = prepared["training_run_id"]
@@ -299,19 +302,25 @@ def test_engine_b_dataset_training_artifacts_versioning_activation_and_compariso
             },
         )
         assert trained["status"] == "COMPLETED"
-        assert trained["algorithm_version"] == "phase5.behavioral.portable_n2v_umap_hdbscan.v2"
+        assert trained["algorithm_version"] == "phase5.behavioral.portable_n2v_umap_hdbscan.v4"
+        assert all("inference_internal_pairings" in profile for profile in trained["result"]["cluster_profiles"])
         assert trained["library_versions"]["node2vec_implementation"] == "portable_walk_ppmi_svd.v1"
         assert "gensim" not in trained["library_versions"]
-        assert len(trained["result"]["assignments"]) == 8
+        assert len(trained["result"]["assignments"]) == 9
+        cold_start = next(row for row in trained["result"]["assignments"] if row["spbu_id"] == "COLD")
+        assert cold_start["coverage_source"] == "ACTIVE_MASTER_COLD_START"
+        assert cold_start["history_eligible"] is False
+        assert cold_start["is_noise"] is False
+        assert cold_start["membership_probability"] <= 0.49
         assert all(row["vehicle_class"] == 1 for row in trained["result"]["assignments"])
-        assert sum(row["latitude"] is not None and row["longitude"] is not None for row in trained["result"]["assignments"]) == 7
+        assert sum(row["latitude"] is not None and row["longitude"] is not None for row in trained["result"]["assignments"]) == 8
         assert sum(row["latitude"] is None or row["longitude"] is None for row in trained["result"]["assignments"]) == 1
         model_v1 = save_behavioral_model(session, training_run_id, model_name="Behavior 2026", description="v1", created_by="tester")
         assert model_v1["model_version"] == 1
         assert model_v1["artifacts"]
         assert model_v1["shift_definition_snapshot"] == prepared["shift_definition_snapshot"]
         assert all(row["vehicle_class"] == 1 for row in model_v1["assignments"])
-        assert sum(row["latitude"] is not None and row["longitude"] is not None for row in model_v1["assignments"]) == 7
+        assert sum(row["latitude"] is not None and row["longitude"] is not None for row in model_v1["assignments"]) == 8
         assert sum(row["latitude"] is None or row["longitude"] is None for row in model_v1["assignments"]) == 1
 
         first_run = session.get(MLTrainingRun, training_run_id)
@@ -356,7 +365,7 @@ def test_engine_b_dataset_training_artifacts_versioning_activation_and_compariso
             assignment.membership_probability = 0.9
         session.commit()
         comparison = compare_behavioral_models(session, model_v1["model_id"], model_v2["model_id"])
-        assert len(comparison["stable_cluster_neighborhood_spbu_ids"]) == 8
+        assert len(comparison["stable_cluster_neighborhood_spbu_ids"]) == 9
         assert all(match["jaccard_similarity"] == 1.0 for match in comparison["cluster_matches"])
 
         activated_v1 = activate_behavioral_model(session, model_v1["model_id"])

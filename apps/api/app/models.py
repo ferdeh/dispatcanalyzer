@@ -909,6 +909,8 @@ class PredictionTrip(Base):
     next_available_datetime = mapped_column(DateTime(timezone=True), nullable=True)
     routing_confidence: Mapped[str | None] = mapped_column(String(20))
     route_estimation_source: Mapped[str | None] = mapped_column(String(80))
+    route_geometry: Mapped[list] = mapped_column(JSON, default=list)
+    route_geometry_source: Mapped[str | None] = mapped_column(String(80))
     service_time_source: Mapped[str | None] = mapped_column(String(80))
     assignment_status: Mapped[str] = mapped_column(String(40), default="UNASSIGNED")
     unassigned_reason: Mapped[str | None] = mapped_column(String(120))

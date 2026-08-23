@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from io import BytesIO
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -17,11 +17,13 @@ from .phase6_service import (
     duplicate_prediction_run,
     enqueue_prediction_run,
     get_prediction_run,
+    get_prediction_shipment_candidates,
     get_prediction_run_status,
     list_prediction_models,
     list_prediction_runs,
     override_assignment,
     override_trip_assignment,
+    refresh_prediction_route_geometry,
 )
 from .phase6_validation import require_prediction_model, validate_loading_orders, validate_mt_availability
 
@@ -44,6 +46,10 @@ class RerunRequest(BaseModel):
     model_id: str | None = None
 
 
+class RouteGeometryRequest(BaseModel):
+    vehicle_id: str
+
+
 class DemoLoadingOrderRequest(BaseModel):
     depot_id: str
     model_id: str
@@ -54,6 +60,7 @@ class DemoMTAvailabilityRequest(BaseModel):
     depot_id: str
     model_id: str
     total_capacity_kl: float = Field(gt=0, le=40000)
+    random_availability: bool = False
 
 
 def _excel_response(content: bytes, filename: str) -> StreamingResponse:
@@ -102,11 +109,13 @@ def create_demo_mt_availability_file(
     db: Session = Depends(get_db),
     _actor: Phase6Actor = Depends(require_phase6_permission("run")),
 ) -> StreamingResponse:
-    require_prediction_model(db, request.depot_id, request.model_id)
+    model = require_prediction_model(db, request.depot_id, request.model_id)
     content, filename = generate_demo_mt_availability(
         db,
         depot_id=request.depot_id,
+        model=model,
         total_capacity_kl=request.total_capacity_kl,
+        random_availability=request.random_availability,
     )
     return _excel_response(content, filename)
 
@@ -215,10 +224,30 @@ def prediction_status(
 @router.get("/predictions/{run_id}")
 def prediction_detail(
     run_id: str,
+    shipment_page: int = Query(default=1, ge=1),
+    shipment_page_size: int = Query(default=25, ge=1, le=100),
+    shift_id: str | None = Query(default=None),
     db: Session = Depends(get_db),
     _actor: Phase6Actor = Depends(require_phase6_permission("view")),
 ) -> dict:
-    return get_prediction_run(db, run_id)
+    return get_prediction_run(
+        db,
+        run_id,
+        shipment_page=shipment_page,
+        shipment_page_size=shipment_page_size,
+        shift_id=shift_id,
+        include_candidates=False,
+    )
+
+
+@router.get("/predictions/{run_id}/shipments/{shipment_id}/candidates")
+def prediction_shipment_candidates(
+    run_id: str,
+    shipment_id: str,
+    db: Session = Depends(get_db),
+    _actor: Phase6Actor = Depends(require_phase6_permission("view")),
+) -> dict:
+    return get_prediction_shipment_candidates(db, run_id, shipment_id)
 
 
 @router.post("/predictions/{run_id}/recalculate", status_code=status.HTTP_202_ACCEPTED)
@@ -229,6 +258,16 @@ def rerun_prediction(
     actor: Phase6Actor = Depends(require_phase6_permission("run")),
 ) -> dict:
     return duplicate_prediction_run(db, run_id, model_id=request.model_id, created_by=actor.user_id)
+
+
+@router.post("/predictions/{run_id}/route-geometry")
+def load_prediction_route_geometry(
+    run_id: str,
+    request: RouteGeometryRequest,
+    db: Session = Depends(get_db),
+    _actor: Phase6Actor = Depends(require_phase6_permission("run")),
+) -> dict:
+    return refresh_prediction_route_geometry(db, run_id, request.vehicle_id)
 
 
 @router.patch("/predictions/{run_id}/shipments/{shipment_id}")

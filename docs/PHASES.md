@@ -62,7 +62,7 @@ The repository includes read-only Phase 2–4 intelligence, persisted Phase 5 ML
 - Comparison: optimal Jaccard membership matching; cluster numbers are never treated as stable identities
 - Schema: `ml_concentration_analysis_run`, `ml_spbu_concentration_profile`, `ml_training_run`, `ml_behavioral_model`, `ml_model_artifact`, `ml_spbu_cluster_assignment`, `ml_cluster_profile`
 - Artifact storage: filesystem/volume under `ML_ARTIFACT_DIR`, relational metadata and SHA-256 only
-- Algorithm versions: `phase5.concentration.iforest.v1`, `phase5.behavioral.portable_n2v_umap_hdbscan.v2`
+- Algorithm versions: `phase5.concentration.iforest.v1`, `phase5.behavioral.portable_n2v_umap_hdbscan.v4`
 
 ## Phase 6
 
@@ -85,6 +85,6 @@ The repository includes read-only Phase 2–4 intelligence, persisted Phase 5 ML
 - Overrides: compatible MT change or same-shift shipment restructure recalculates route estimate, return, next availability, and downstream rolling state without Phase 5 training
 - Export: Summary, Shipment Result, Trip Timeline, MT Assignment, MT Candidates, Validation
 - Visualization: predicted same-shipment network, assignment matrix, and MT multi-trip Gantt timeline
-- Algorithm: `phase6.time_aware_multitrip.v2`
+- Algorithm: `phase6.capacity_time_route_set_packing.v7`
 - Security: encrypted API key using environment-provided encryption secret; browser receives masked value only
 - Phase 7 boundary: Phase 6 never calls Google Route Optimization/GMPRO `optimizeTours` and never solves fleet-wide VRP; Phase 7 owns final globally optimized route and constraints

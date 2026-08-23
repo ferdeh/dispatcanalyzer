@@ -15,11 +15,12 @@ from sqlalchemy.orm import Session
 
 from .departure_intelligence import shift_for_minute, validate_shift_config
 from .models import MLBehavioralModel, MasterDepot, MasterMT, MasterSPBU, SpbuIdentifierAlias
-from .normalization import clean_str, mt_capacity_kl, normalize_key
+from .normalization import clean_str, normalize_key
+from .phase6_capacity import LOADING_ORDER_COMPARTMENT_KL, loading_order_compartments, mt_compartment_profile
 
 
 MAX_WORKBOOK_BYTES = 10 * 1024 * 1024
-LOADING_ORDER_COLUMNS = ("loading_order_no", "shipment_start_datetime", "spbu_no")
+LOADING_ORDER_COLUMNS = ("loading_order_no", "shipment_start_datetime", "spbu_no", "order_quantity_kl")
 MT_AVAILABILITY_COLUMNS = ("vehicle_registration_no", "initial_available_datetime")
 
 
@@ -203,8 +204,28 @@ def validate_loading_orders(
             issues.append(_issue(file_name, row_number, "shipment_start_datetime", "ERROR", "INVALID_DATETIME", "shipment_start_datetime must be a valid complete datetime."))
         quantity, quantity_valid = _order_quantity_kl(row.get("order_quantity_kl"))
         if not quantity_valid:
-            issues.append(_issue(file_name, row_number, "order_quantity_kl", "ERROR", "INVALID_ORDER_QUANTITY", "order_quantity_kl must be greater than 0 when provided."))
-        if lo_key and duplicates[lo_key] == 1 and spbu and spbu.primary_depot_id == depot_id and parsed and quantity_valid:
+            issues.append(_issue(file_name, row_number, "order_quantity_kl", "ERROR", "INVALID_ORDER_QUANTITY", "order_quantity_kl must be greater than 0."))
+        quantity_compartments = loading_order_compartments(quantity)
+        if quantity_valid and quantity_compartments != 1:
+            issues.append(
+                _issue(
+                    file_name,
+                    row_number,
+                    "order_quantity_kl",
+                    "ERROR",
+                    "ORDER_QUANTITY_MUST_BE_8_KL",
+                    f"Each Loading Order must be exactly {LOADING_ORDER_COMPARTMENT_KL:g} KL.",
+                )
+            )
+        if (
+            lo_key
+            and duplicates[lo_key] == 1
+            and spbu
+            and spbu.primary_depot_id == depot_id
+            and parsed
+            and quantity_valid
+            and quantity_compartments == 1
+        ):
             local = parsed.astimezone(timezone_info)
             shift = shift_for_minute(local.hour * 60 + local.minute, shift_config)
             normalized_rows.append(
@@ -219,6 +240,7 @@ def validate_loading_orders(
                     "spbu_no": spbu.spbu_code,
                     "spbu_name": spbu.spbu_name,
                     "order_quantity_kl": quantity,
+                    "required_compartments": quantity_compartments,
                 }
             )
     datetimes = [datetime.fromisoformat(row["shipment_start_datetime"]) for row in normalized_rows]
@@ -268,13 +290,39 @@ def validate_mt_availability(db: Session, *, depot_id: str, model: MLBehavioralM
         parsed = _parse_datetime(row.get("initial_available_datetime"), timezone_info)
         if row.get("initial_available_datetime") and not parsed:
             issues.append(_issue(file_name, row_number, "initial_available_datetime", "ERROR", "INVALID_AVAILABLE_DATETIME", "initial_available_datetime must be a valid complete datetime."))
-        if vehicle_key and duplicates[vehicle_key] == 1 and mt and (not mt.depot_id or mt.depot_id == depot_id) and mt.active_status == "ACTIVE" and parsed:
+        capacity_profile = mt_compartment_profile(mt) if mt else None
+        if capacity_profile:
+            for code in capacity_profile["failed_rules"]:
+                issues.append(
+                    _issue(
+                        file_name,
+                        row_number,
+                        "vehicle_registration_no",
+                        "ERROR",
+                        code,
+                        "MT capacity and compartment master data must describe matching 8 KL compartments.",
+                    )
+                )
+            if capacity_profile["valid"] and capacity_profile["compartment_source"] == "INFERRED_FROM_CAPACITY":
+                issues.append(
+                    _issue(
+                        file_name,
+                        row_number,
+                        "vehicle_registration_no",
+                        "WARNING",
+                        "MT_COMPARTMENT_COUNT_INFERRED",
+                        "number_of_compartments is empty; Phase 6 inferred it from MT capacity.",
+                    )
+                )
+        if vehicle_key and duplicates[vehicle_key] == 1 and mt and (not mt.depot_id or mt.depot_id == depot_id) and mt.active_status == "ACTIVE" and parsed and capacity_profile and capacity_profile["valid"]:
             normalized_rows.append(
                 {
                     "source_row_number": row_number,
                     "vehicle_id": mt.mt_id,
                     "vehicle_registration_no": mt.vehicle_registration or mt.mt_id,
-                    "capacity_kl": mt_capacity_kl(mt.capacity_label, mt.vehicle_type_tag),
+                    "capacity_kl": capacity_profile["capacity_kl"],
+                    "number_of_compartments": capacity_profile["effective_compartments"],
+                    "compartment_source": capacity_profile["compartment_source"],
                     "initial_available_datetime": parsed.isoformat(),
                     "initial_available_datetime_local": parsed.astimezone(timezone_info).isoformat(),
                 }

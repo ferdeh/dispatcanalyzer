@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import random
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -12,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .departure_intelligence import validate_shift_config
-from .models import MLBehavioralModel, MasterDepot, MasterMT, MasterSPBU
+from .models import MLBehavioralModel, MLSPBUClusterAssignment, MasterDepot, MasterMT, MasterSPBU
 from .normalization import mt_capacity_kl
 from .phase6_export import workbook_bytes
 
@@ -93,16 +92,38 @@ def generate_demo_loading_orders(
         label="Total order",
         maximum=MAX_DEMO_TOTAL_ORDER_KL,
     )
+    if total % DEMO_LOADING_ORDER_UNIT_KL:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "DEMO_TOTAL_ORDER_NOT_8_KL_MULTIPLE",
+                "message": "Total order demo must be a multiple of 8 KL so every generated Loading Order fills complete compartments.",
+            },
+        )
 
-    spbus = db.scalars(
-        select(MasterSPBU)
-        .where(MasterSPBU.primary_depot_id == depot_id, MasterSPBU.active_status == "ACTIVE")
-        .order_by(MasterSPBU.spbu_code)
+    covered_rows = db.execute(
+        select(MasterSPBU, MLSPBUClusterAssignment)
+        .join(MLSPBUClusterAssignment, MLSPBUClusterAssignment.spbu_id == MasterSPBU.spbu_id)
+        .where(
+            MasterSPBU.primary_depot_id == depot_id,
+            MasterSPBU.active_status == "ACTIVE",
+            MLSPBUClusterAssignment.model_id == model.model_id,
+            MLSPBUClusterAssignment.is_noise.is_(False),
+            MLSPBUClusterAssignment.cluster_id.is_not(None),
+        )
+        .order_by(
+            MLSPBUClusterAssignment.cluster_id,
+            MLSPBUClusterAssignment.dominant_shift,
+            MasterSPBU.spbu_code,
+        )
     ).all()
-    if not spbus:
+    if not covered_rows:
         raise HTTPException(
             status_code=409,
-            detail={"code": "DEMO_SPBU_NOT_FOUND", "message": "No active SPBU is available for the selected depot."},
+            detail={
+                "code": "DEMO_MODEL_COVERAGE_NOT_FOUND",
+                "message": "The selected Phase 5 model has no active, non-noise SPBU coverage for demo generation.",
+            },
         )
 
     try:
@@ -117,28 +138,55 @@ def generate_demo_loading_orders(
 
     seed = random_seed if random_seed is not None else secrets.randbits(63)
     rng = random.Random(seed)
-    order_count = math.ceil(total / DEMO_LOADING_ORDER_UNIT_KL)
+    order_count = int(total / DEMO_LOADING_ORDER_UNIT_KL)
     token = f"{seed % 1_000_000:06d}"
     planning_day = datetime.now(depot_timezone).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    shift_by_name = {shift["name"]: shift for shift in shifts}
+    strong_rows = [
+        (spbu, assignment)
+        for spbu, assignment in covered_rows
+        if float(assignment.membership_probability) >= 0.5 and assignment.dominant_shift in shift_by_name
+    ]
+    demo_pool = strong_rows or [
+        (spbu, assignment)
+        for spbu, assignment in covered_rows
+        if assignment.dominant_shift in shift_by_name
+    ] or list(covered_rows)
+    coverage_buckets: dict[tuple[int, str], list[tuple[MasterSPBU, MLSPBUClusterAssignment]]] = {}
+    for spbu, assignment in demo_pool:
+        key = (int(assignment.cluster_id), assignment.dominant_shift)
+        coverage_buckets.setdefault(key, []).append((spbu, assignment))
+    multi_buckets = [members for members in coverage_buckets.values() if len(members) >= 2]
+    if not multi_buckets:
+        multi_buckets = [demo_pool]
+
     rows: list[list] = []
-    for index in range(order_count):
-        remaining = total - (DEMO_LOADING_ORDER_UNIT_KL * index)
-        quantity = min(DEMO_LOADING_ORDER_UNIT_KL, remaining)
-        spbu = rng.choice(spbus)
-        shift = shifts[index % len(shifts)]
+    generated = 0
+    while generated < order_count:
+        remaining = order_count - generated
+        batch_size = 3 if remaining == 5 else min(4, remaining)
+        candidates = [bucket for bucket in multi_buckets if len(bucket) >= min(2, batch_size)] or multi_buckets
+        bucket = rng.choice(candidates)
+        selected = rng.sample(bucket, k=min(batch_size, len(bucket)))
+        while len(selected) < batch_size:
+            selected.append(rng.choice(bucket))
+        dominant_shift = selected[0][1].dominant_shift
+        shift = shift_by_name.get(dominant_shift, shifts[generated % len(shifts)])
         segment = rng.choice(shift["segments"])
-        latest_minute = max(segment["start_minute"], segment["end_exclusive_minute"] - 1)
-        minute_of_day = rng.randint(segment["start_minute"], latest_minute)
-        start_datetime = planning_day + timedelta(minutes=minute_of_day)
-        rows.append(
-            [
-                f"DEMO-LO-{token}-{index + 1:04d}",
-                start_datetime.strftime("%Y-%m-%d %H:%M:%S"),
-                spbu.spbu_code,
-                spbu.spbu_name or spbu.spbu_code,
-                float(quantity),
-            ]
-        )
+        latest_minute = max(segment["start_minute"], segment["end_exclusive_minute"] - batch_size)
+        base_minute = rng.randint(segment["start_minute"], latest_minute)
+        for offset, (spbu, _assignment) in enumerate(selected):
+            start_datetime = planning_day + timedelta(minutes=base_minute + offset)
+            rows.append(
+                [
+                    f"DEMO-LO-{token}-{generated + offset + 1:04d}",
+                    start_datetime.strftime("%Y-%m-%d %H:%M:%S"),
+                    spbu.spbu_code,
+                    spbu.spbu_name or spbu.spbu_code,
+                    float(DEMO_LOADING_ORDER_UNIT_KL),
+                ]
+            )
+        generated += batch_size
 
     content = workbook_bytes(
         [
@@ -157,7 +205,9 @@ def generate_demo_mt_availability(
     db: Session,
     *,
     depot_id: str,
+    model: MLBehavioralModel,
     total_capacity_kl: float,
+    random_availability: bool = False,
     random_seed: int | None = None,
 ) -> tuple[bytes, str]:
     target = _positive_demo_total(
@@ -194,6 +244,14 @@ def generate_demo_mt_availability(
         depot_timezone = ZoneInfo(depot.timezone if depot and depot.timezone else "Asia/Jakarta")
     except ZoneInfoNotFoundError:
         depot_timezone = ZoneInfo("Asia/Jakarta")
+    try:
+        shifts = validate_shift_config(model.shift_definition_snapshot or [])
+    except HTTPException as exc:
+        raise HTTPException(status_code=409, detail={"code": "DEMO_SHIFT_NOT_FOUND", "message": "The selected model has no usable shift definition."}) from exc
+    first_shift = min(shifts, key=lambda shift: shift["order"])
+    last_shift = max(shifts, key=lambda shift: shift["order"])
+    opening_minute = first_shift["start_minute"]
+    closing_minute = last_shift["end_minute"]
     seed = random_seed if random_seed is not None else secrets.randbits(63)
     rng = random.Random(seed)
     selected = _select_mts_near_capacity(candidates, target, rng)
@@ -204,9 +262,18 @@ def generate_demo_mt_availability(
         )
 
     planning_day = datetime.now(depot_timezone).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    depot_open_datetime = planning_day + timedelta(minutes=opening_minute)
+    depot_close_datetime = planning_day + timedelta(minutes=closing_minute)
+    if depot_close_datetime < depot_open_datetime:
+        depot_close_datetime += timedelta(days=1)
+    operating_window_minutes = int((depot_close_datetime - depot_open_datetime).total_seconds() // 60)
     rows = []
     for mt, capacity in selected:
-        available_datetime = planning_day + timedelta(minutes=rng.randint(0, (24 * 60) - 1))
+        available_datetime = (
+            depot_open_datetime + timedelta(minutes=rng.randint(0, operating_window_minutes))
+            if random_availability
+            else depot_open_datetime
+        )
         rows.append(
             [
                 mt.vehicle_registration,

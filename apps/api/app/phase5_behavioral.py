@@ -324,6 +324,8 @@ def _feature_fusion(
     records: list[dict],
     embeddings: dict[str, list[float]],
     weights: dict[str, float],
+    *,
+    fit_indices: list[int] | None = None,
 ) -> tuple[np.ndarray, dict]:
     try:
         from sklearn.preprocessing import StandardScaler
@@ -334,9 +336,11 @@ def _feature_fusion(
     pairing_matrix = np.asarray([embeddings[record["spbu_id"]] for record in records], dtype=float)
     scalers = {}
     weighted_groups = []
+    scaler_indices = fit_indices or list(range(len(records)))
     for name, matrix in (("tag", tag_matrix), ("shift", shift_matrix), ("pairing", pairing_matrix)):
         scaler = StandardScaler()
-        transformed = scaler.fit_transform(matrix)
+        scaler.fit(matrix[scaler_indices])
+        transformed = scaler.transform(matrix)
         # Division by sqrt(dimension) prevents a wide tag group from dominating a
         # narrower shift/pairing group solely because it owns more columns. After
         # independent standardization, each group's expected squared-distance
@@ -346,6 +350,7 @@ def _feature_fusion(
     fused = np.concatenate(weighted_groups, axis=1)
     return fused, {
         "weight_application": "Each independently standardized group is multiplied by sqrt(group_weight / group_dimension) before concatenation.",
+        "scaler_fit_spbu_count": len(scaler_indices),
         "scalers": scalers,
         "group_dimensions": {"tag": tag_matrix.shape[1], "shift": shift_matrix.shape[1], "pairing": pairing_matrix.shape[1]},
     }
@@ -394,9 +399,24 @@ def prepare_training_dataset(
         if not memberships:
             raise HTTPException(status_code=422, detail="No shipment data exists in the selected training period.")
         observation_counts: Counter[str] = Counter(spbu_id for values in memberships.values() for spbu_id in values)
-        eligible_ids = sorted(spbu_id for spbu_id, count in observation_counts.items() if count >= minimum_shipment_observation)
-        excluded_ids = sorted(spbu_id for spbu_id, count in observation_counts.items() if count < minimum_shipment_observation)
-        spbus = db.scalars(select(MasterSPBU).where(MasterSPBU.spbu_id.in_(eligible_ids)).order_by(MasterSPBU.spbu_id)).all() if eligible_ids else []
+        spbus = db.scalars(
+            select(MasterSPBU)
+            .where(
+                MasterSPBU.primary_depot_id == depot_id,
+                MasterSPBU.active_status == "ACTIVE",
+            )
+            .order_by(MasterSPBU.spbu_id)
+        ).all()
+        if not spbus:
+            raise HTTPException(status_code=422, detail="No active SPBU exists for the selected depot.")
+        active_ids = {spbu.spbu_id for spbu in spbus}
+        eligible_ids = sorted(
+            spbu_id
+            for spbu_id, count in observation_counts.items()
+            if spbu_id in active_ids and count >= minimum_shipment_observation
+        )
+        cold_start_ids = sorted(active_ids - set(eligible_ids))
+        inactive_history_ids = sorted(set(observation_counts) - active_ids)
 
         tag_feature_names, tag_vectors, key_tags, tag_configuration = _load_tag_features(db, spbus)
         departure_rows = load_departure_rows(db, depot_id, training_start_date, training_end_date, None)
@@ -408,7 +428,7 @@ def prepare_training_dataset(
         shift_counts: dict[str, Counter[str]] = defaultdict(Counter)
         shift_valid_counts: Counter[str] = Counter()
         for observation in departure_observations:
-            if observation["spbu_id"] not in set(eligible_ids) or observation["departure_minute"] is None:
+            if observation["spbu_id"] not in active_ids or observation["departure_minute"] is None:
                 continue
             shift = shift_for_minute(int(observation["departure_minute"]), shift_snapshot)
             shift_counts[observation["spbu_id"]][shift["shift_id"]] += 1
@@ -429,6 +449,8 @@ def prepare_training_dataset(
                     "latitude": float(spbu.latitude) if spbu.latitude is not None else None,
                     "longitude": float(spbu.longitude) if spbu.longitude is not None else None,
                     "shipment_observation_count": observation_counts[spbu.spbu_id],
+                    "history_eligible": spbu.spbu_id in set(eligible_ids),
+                    "coverage_source": "BEHAVIORAL_HISTORY" if spbu.spbu_id in set(eligible_ids) else "ACTIVE_MASTER_COLD_START",
                     "vehicle_class": spbu.vehicle_type_tag,
                     "tag_vector": tag_vectors[spbu.spbu_id],
                     "key_tags": key_tags.get(spbu.spbu_id, []),
@@ -450,10 +472,14 @@ def prepare_training_dataset(
             "shipment_count": len(memberships),
             "source_shipment_count": len(source_shipments),
             "spbu_count": len(observation_counts),
+            "active_master_spbu_count": len(records),
+            "active_spbu_with_any_history_count": sum(observation_counts[spbu.spbu_id] > 0 for spbu in spbus),
             "mt_count": len({shipment.mt_id for shipment in source_shipments if shipment.mt_id}),
             "master_compatibility_pass_percentage": readiness["master_compatibility_pass_percentage"],
-            "sufficient_history_spbu_count": len(records),
-            "excluded_insufficient_data_spbu_count": len(excluded_ids),
+            "sufficient_history_spbu_count": len(eligible_ids),
+            "cold_start_active_spbu_count": len(cold_start_ids),
+            "excluded_insufficient_data_spbu_count": 0,
+            "excluded_inactive_history_spbu_count": len(inactive_history_ids),
             "geocoded_training_spbu_count": sum(record["latitude"] is not None and record["longitude"] is not None for record in records),
             "missing_coordinate_training_spbu_count": sum(record["latitude"] is None or record["longitude"] is None for record in records),
             "pairing_edge_count": len(pair_rows),
@@ -467,13 +493,15 @@ def prepare_training_dataset(
             "shift_feature_names": [f"shift:{shift['shift_id']}" for shift in shift_snapshot],
             "tag_feature_configuration": tag_configuration,
             "pair_rows": pair_rows,
-            "excluded_spbu_ids": excluded_ids,
+            "cold_start_spbu_ids": cold_start_ids,
+            "excluded_inactive_history_spbu_ids": inactive_history_ids,
             "dependency_metadata": {
                 "master_compatibility_rule_source": readiness["rule_source"],
                 "master_tag_configuration": "canonical master_tag + bridge_spbu_tag snapshot at preparation time",
                 "departure_algorithm_version": DEPARTURE_ALGORITHM_VERSION,
                 "shift_assignment_algorithm_version": SHIFT_ASSIGNMENT_ALGORITHM_VERSION,
                 "pairing_algorithm_version": PAIRING_ALGORITHM_VERSION,
+                "active_spbu_coverage_policy": "All ACTIVE SPBU for the depot are retained. HDBSCAN is fitted only on sufficient-history SPBU; remaining active SPBU receive conservative nearest-cluster cold-start coverage.",
                 "geographic_coordinate_source": "MasterSPBU latitude/longitude snapshot; visualization only and excluded from model features",
                 "source_observation_key": ["shipment_id", "spbu_id"],
             },
@@ -574,6 +602,7 @@ def _cluster_profiles(assignments: list[dict], records: list[dict], pair_rows: l
                 ],
                 "dominant_shift": shift_snapshot[dominant_index]["name"] if dominant_index is not None else "Insufficient timestamp data",
                 "top_internal_pairings": internal_pairs[:10],
+                "inference_internal_pairings": internal_pairs,
                 "average_membership_probability": round(average_probability, 4),
                 "low_confidence_member_count": sum(member["membership_probability"] < 0.5 for member in members),
                 "member_spbu_ids": sorted(member_ids),
@@ -592,8 +621,9 @@ def train_behavioral_model(db: Session, training_run_id: str, configuration: dic
     require_phase5_readiness(db, run.depot_id)
     config = _validated_training_configuration(configuration)
     records = run.dataset_payload.get("records", [])
+    history_indices = [index for index, record in enumerate(records) if record.get("history_eligible", True)]
     minimum_cluster_size = int(config["hdbscan_parameters"]["min_cluster_size"])
-    if len(records) < max(3, minimum_cluster_size):
+    if len(history_indices) < max(3, minimum_cluster_size):
         raise HTTPException(status_code=422, detail=f"Too few SPBUs for clustering. Need at least {max(3, minimum_cluster_size)} sufficient-history SPBUs.")
     run.status = "TRAINING"
     run.training_configuration = config
@@ -606,7 +636,12 @@ def train_behavioral_model(db: Session, training_run_id: str, configuration: dic
         pair_rows = run.dataset_payload.get("pair_rows", [])
         graph = create_pairing_graph([record["spbu_id"] for record in records], pair_rows)
         embeddings, node2vec_metadata = generate_node2vec_embeddings(graph, config["node2vec_parameters"])
-        fused, fusion_metadata = _feature_fusion(records, embeddings, config["feature_weights"])
+        fused, fusion_metadata = _feature_fusion(
+            records,
+            embeddings,
+            config["feature_weights"],
+            fit_indices=history_indices,
+        )
         try:
             import joblib
             import umap
@@ -615,8 +650,9 @@ def train_behavioral_model(db: Session, training_run_id: str, configuration: dic
             raise HTTPException(status_code=503, detail="UMAP/HDBSCAN ML dependencies are not installed.") from exc
 
         umap_config = config["umap_parameters"]
-        neighbors = min(max(2, int(umap_config["n_neighbors"])), len(records) - 1)
-        components = min(max(2, int(umap_config["n_components"])), max(2, len(records) - 2), fused.shape[1])
+        history_fused = fused[history_indices]
+        neighbors = min(max(2, int(umap_config["n_neighbors"])), len(history_indices) - 1)
+        components = min(max(2, int(umap_config["n_components"])), max(2, len(history_indices) - 2), fused.shape[1])
         internal_umap = umap.UMAP(
             n_neighbors=neighbors,
             n_components=components,
@@ -625,7 +661,9 @@ def train_behavioral_model(db: Session, training_run_id: str, configuration: dic
             random_state=int(umap_config["random_state"]),
             transform_seed=int(config["random_seed"]),
         )
-        reduced = internal_umap.fit_transform(fused)
+        reduced_history = internal_umap.fit_transform(history_fused)
+        reduced = internal_umap.transform(fused)
+        reduced[history_indices] = reduced_history
         cluster_config = config["hdbscan_parameters"]
         clusterer = HDBSCAN(
             min_cluster_size=minimum_cluster_size,
@@ -635,8 +673,8 @@ def train_behavioral_model(db: Session, training_run_id: str, configuration: dic
             n_jobs=1,
             copy=True,
         )
-        labels = clusterer.fit_predict(reduced)
-        probabilities = clusterer.probabilities_
+        history_labels = clusterer.fit_predict(reduced_history)
+        history_probabilities = clusterer.probabilities_
         visualization_umap = umap.UMAP(
             n_neighbors=neighbors,
             n_components=2,
@@ -645,7 +683,43 @@ def train_behavioral_model(db: Session, training_run_id: str, configuration: dic
             random_state=int(umap_config["random_state"]),
             transform_seed=int(config["random_seed"]),
         )
-        visualization = visualization_umap.fit_transform(fused)
+        visualization_history = visualization_umap.fit_transform(history_fused)
+        visualization = visualization_umap.transform(fused)
+        visualization[history_indices] = visualization_history
+
+        labels = np.full(len(records), -1, dtype=int)
+        probabilities = np.zeros(len(records), dtype=float)
+        labels[history_indices] = history_labels
+        probabilities[history_indices] = history_probabilities
+
+        # SPBU aktif tanpa histori cukup tidak boleh mengubah density model utama.
+        # Mereka dipetakan sesudah training ke centroid cluster terdekat dengan
+        # confidence konservatif sehingga inference dapat membedakan cold-start
+        # coverage dari evidence historis tanpa menandainya sebagai UNSEEN_SPBU.
+        clustered_history_labels = sorted({int(label) for label in history_labels if int(label) >= 0})
+        cluster_centroids: dict[int, np.ndarray] = {}
+        cluster_scales: dict[int, float] = {}
+        for label in clustered_history_labels:
+            member_vectors = reduced_history[history_labels == label]
+            centroid = np.mean(member_vectors, axis=0)
+            distances = np.linalg.norm(member_vectors - centroid, axis=1)
+            cluster_centroids[label] = centroid
+            cluster_scales[label] = max(1e-6, float(np.percentile(distances, 90)) if len(distances) else 1.0)
+        for index, record in enumerate(records):
+            if record.get("history_eligible", True) or not cluster_centroids:
+                continue
+            label, distance = min(
+                (
+                    (label, float(np.linalg.norm(reduced[index] - centroid)))
+                    for label, centroid in cluster_centroids.items()
+                ),
+                key=lambda item: (item[1], item[0]),
+            )
+            labels[index] = label
+            probabilities[index] = max(
+                0.10,
+                min(0.49, 0.49 * math.exp(-distance / (3.0 * cluster_scales[label]))),
+            )
         assignments = []
         for index, record in enumerate(records):
             label = int(labels[index])
@@ -658,6 +732,8 @@ def train_behavioral_model(db: Session, training_run_id: str, configuration: dic
                     "latitude": record.get("latitude"),
                     "longitude": record.get("longitude"),
                     "shipment_observation_count": record["shipment_observation_count"],
+                    "coverage_source": record.get("coverage_source", "BEHAVIORAL_HISTORY"),
+                    "history_eligible": bool(record.get("history_eligible", True)),
                     "cluster_id": None if is_noise else label,
                     "cluster_label": "Noise / Unique Behavioral Pattern" if is_noise else f"Cluster {label + 1}",
                     "membership_probability": round(float(probabilities[index]), 6),
@@ -679,9 +755,16 @@ def train_behavioral_model(db: Session, training_run_id: str, configuration: dic
             warnings.append("No pairing edges were available; every SPBU received the documented zero pairing embedding.")
         if noise_count == len(assignments):
             warnings.append("HDBSCAN marked every SPBU as noise. Review feature weights or density parameters before saving.")
+        cold_start_count = sum(not assignment["history_eligible"] for assignment in assignments)
+        if cold_start_count:
+            warnings.append(
+                f"{cold_start_count} active SPBU lacked the minimum historical observations and received conservative nearest-cluster cold-start coverage."
+            )
         result = {
             "summary": {
                 "training_spbu_count": len(assignments),
+                "behavioral_history_spbu_count": len(history_indices),
+                "cold_start_covered_spbu_count": cold_start_count,
                 "cluster_count": cluster_count,
                 "clustered_spbu_count": len(assignments) - noise_count,
                 "noise_spbu_count": noise_count,

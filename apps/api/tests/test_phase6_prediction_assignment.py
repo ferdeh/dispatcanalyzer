@@ -7,6 +7,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from openpyxl import Workbook, load_workbook
 from sqlalchemy import create_engine, event
@@ -30,6 +31,8 @@ from app.phase6_jobs import claim_next_prediction_job, heartbeat_prediction_job,
 from app.phase6_service import (
     create_prediction_run,
     enqueue_prediction_run,
+    get_prediction_run,
+    get_prediction_shipment_candidates,
     get_prediction_run_status,
     override_assignment,
     process_prediction_run,
@@ -71,11 +74,11 @@ def seed(session) -> MLBehavioralModel:
     session.commit()
     session.add_all(
         [
-            MasterMT(mt_id="T1", vehicle_name_raw="Truck 1", vehicle_registration="B1001AA", capacity_label="8KL", vehicle_type_tag=8, depot_id="D1", active_status="ACTIVE"),
-            MasterMT(mt_id="T2", vehicle_name_raw="Truck 2", vehicle_registration="B1002AA", capacity_label="8 KL", vehicle_type_tag=8, depot_id="D1", active_status="ACTIVE"),
-            MasterMT(mt_id="T3", vehicle_name_raw="Truck 3", vehicle_registration="B1003AA", capacity_label="16KL", vehicle_type_tag=16, depot_id="D1", active_status="ACTIVE"),
-            MasterMT(mt_id="INACTIVE", vehicle_name_raw="Inactive", vehicle_registration="B1999AA", vehicle_type_tag=8, depot_id="D1", active_status="INACTIVE"),
-            MasterMT(mt_id="OTHER-MT", vehicle_name_raw="Other", vehicle_registration="B2001BB", vehicle_type_tag=8, depot_id="D2", active_status="ACTIVE"),
+            MasterMT(mt_id="T1", vehicle_name_raw="Truck 1", vehicle_registration="B1001AA", capacity_label="8KL", vehicle_type_tag=8, number_of_compartments=1, depot_id="D1", active_status="ACTIVE"),
+            MasterMT(mt_id="T2", vehicle_name_raw="Truck 2", vehicle_registration="B1002AA", capacity_label="8 KL", vehicle_type_tag=8, number_of_compartments=1, depot_id="D1", active_status="ACTIVE"),
+            MasterMT(mt_id="T3", vehicle_name_raw="Truck 3", vehicle_registration="B1003AA", capacity_label="16KL", vehicle_type_tag=16, number_of_compartments=2, depot_id="D1", active_status="ACTIVE"),
+            MasterMT(mt_id="INACTIVE", vehicle_name_raw="Inactive", vehicle_registration="B1999AA", vehicle_type_tag=8, number_of_compartments=1, depot_id="D1", active_status="INACTIVE"),
+            MasterMT(mt_id="OTHER-MT", vehicle_name_raw="Other", vehicle_registration="B2001BB", vehicle_type_tag=8, number_of_compartments=1, depot_id="D2", active_status="ACTIVE"),
             MasterSPBU(spbu_id="A", spbu_code="SPBU-A", spbu_name="A", latitude=-6.21, longitude=106.85, master_travel_time_min=10, vehicle_type_tag=8, primary_depot_id="D1"),
             MasterSPBU(spbu_id="B", spbu_code="SPBU-B", spbu_name="B", latitude=-6.22, longitude=106.86, master_travel_time_min=10, vehicle_type_tag=8, primary_depot_id="D1"),
             MasterSPBU(spbu_id="C", spbu_code="SPBU-C", spbu_name="C", latitude=-6.23, longitude=106.87, master_travel_time_min=10, vehicle_type_tag=8, primary_depot_id="D1"),
@@ -118,11 +121,12 @@ def seed(session) -> MLBehavioralModel:
 
 
 def run_prediction(session, lo_rows: list[list], mt_rows: list[list], parameters: dict | None = None) -> dict:
+    normalized_lo_rows = [row if len(row) >= 4 else [*row, 8] for row in lo_rows]
     return create_prediction_run(
         session,
         depot_id="D1",
         model_id="M1",
-        loading_order_content=workbook(["loading_order_no", "shipment_start_datetime", "spbu_no"], lo_rows),
+        loading_order_content=workbook(["loading_order_no", "shipment_start_datetime", "spbu_no", "order_quantity_kl"], normalized_lo_rows),
         loading_order_filename="lo.xlsx",
         availability_content=workbook(["vehicle_registration_no", "initial_available_datetime"], mt_rows),
         availability_filename="mt.xlsx",
@@ -140,8 +144,8 @@ def test_prediction_run_can_be_queued_then_processed() -> None:
             depot_id="D1",
             model_id="M1",
             loading_order_content=workbook(
-                ["loading_order_no", "shipment_start_datetime", "spbu_no"],
-                [["LO1", "2026-08-22 09:00:00", "SPBU-A"]],
+                ["loading_order_no", "shipment_start_datetime", "spbu_no", "order_quantity_kl"],
+                [["LO1", "2026-08-22 09:00:00", "SPBU-A", 8]],
             ),
             loading_order_filename="lo.xlsx",
             availability_content=workbook(
@@ -172,6 +176,72 @@ def test_prediction_run_can_be_queued_then_processed() -> None:
         assert session.get(PredictionJob, queued["id"]).status == "COMPLETED"
 
 
+def test_multiple_predictions_can_queue_without_waiting_for_active_job() -> None:
+    Session = make_session()
+    with Session() as session:
+        seed(session)
+        queued_runs = [
+            enqueue_prediction_run(
+                session,
+                depot_id="D1",
+                model_id="M1",
+                loading_order_content=workbook(
+                    ["loading_order_no", "shipment_start_datetime", "spbu_no", "order_quantity_kl"],
+                    [[f"LO{index}", "2026-08-22 09:00:00", "SPBU-A", 8]],
+                ),
+                loading_order_filename=f"lo-{index}.xlsx",
+                availability_content=workbook(
+                    ["vehicle_registration_no", "initial_available_datetime"],
+                    [["B1001AA", "2026-08-22 08:00:00"]],
+                ),
+                availability_filename=f"mt-{index}.xlsx",
+                parameters=None,
+                created_by="tester",
+            )
+            for index in (1, 2)
+        ]
+        assert [get_prediction_run_status(session, row["id"])["status"] for row in queued_runs] == ["QUEUED", "QUEUED"]
+        first = claim_next_prediction_job(session, worker_id="worker-1", lease_seconds=30)
+        assert first is not None
+        assert get_prediction_run_status(session, first.run_id)["status"] == "RUNNING"
+        queued_id = next(row["id"] for row in queued_runs if row["id"] != first.run_id)
+        assert get_prediction_run_status(session, queued_id)["status"] == "QUEUED"
+
+
+def test_prediction_result_is_paginated_and_candidates_are_lazy() -> None:
+    Session = make_session()
+    with Session() as session:
+        seed(session)
+        result = run_prediction(
+            session,
+            [
+                ["LO1", "2026-08-22 05:30:00", "SPBU-A"],
+                ["LO2", "2026-08-22 10:00:00", "SPBU-C"],
+            ],
+            [["B1001AA", "2026-08-22 05:00:00"], ["B1002AA", "2026-08-22 05:00:00"]],
+        )
+        page = get_prediction_run(
+            session,
+            result["id"],
+            shipment_page=1,
+            shipment_page_size=1,
+            include_candidates=False,
+        )
+        assert page["shipment_pagination"] == {
+            "page": 1,
+            "page_size": 1,
+            "total": 2,
+            "total_pages": 2,
+            "shift_id": None,
+        }
+        assert len(page["shipments"]) == 1
+        assert page["shipments"][0]["candidates"] == []
+        assert page["shipments"][0]["candidates_loaded"] is False
+        assert all("route_geometry" not in trip for trip in page["trips"])
+        candidates = get_prediction_shipment_candidates(session, result["id"], page["shipments"][0]["id"])
+        assert candidates["candidates"]
+
+
 def test_prediction_api_persists_queue_task_with_202() -> None:
     Session = make_session()
     with Session() as session:
@@ -191,8 +261,8 @@ def test_prediction_api_persists_queue_task_with_202() -> None:
                 "loading_order_file": (
                     "lo.xlsx",
                     workbook(
-                        ["loading_order_no", "shipment_start_datetime", "spbu_no"],
-                        [["LO1", "2026-08-22 09:00:00", "SPBU-A"]],
+                        ["loading_order_no", "shipment_start_datetime", "spbu_no", "order_quantity_kl"],
+                        [["LO1", "2026-08-22 09:00:00", "SPBU-A", 8]],
                     ),
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 ),
@@ -226,8 +296,8 @@ def test_stale_worker_job_is_requeued_then_fails_at_retry_limit() -> None:
             depot_id="D1",
             model_id="M1",
             loading_order_content=workbook(
-                ["loading_order_no", "shipment_start_datetime", "spbu_no"],
-                [["LO1", "2026-08-22 09:00:00", "SPBU-A"]],
+                ["loading_order_no", "shipment_start_datetime", "spbu_no", "order_quantity_kl"],
+                [["LO1", "2026-08-22 09:00:00", "SPBU-A", 8]],
             ),
             loading_order_filename="lo.xlsx",
             availability_content=workbook(
@@ -264,8 +334,8 @@ def test_timestamp_validation_derives_shift_and_rejects_bad_inputs() -> None:
         result = validate_loading_orders(
             session, depot_id="D1", model=model,
             content=workbook(
-                ["loading_order_no", "shipment_start_datetime", "spbu_no"],
-                [["LO1", "2026-08-22 05:30:00", "SPBU-A"], ["LO1", "bad", "UNKNOWN"], ["LO3", "2026-08-22 07:00:00", "SPBU-OTHER"]],
+                ["loading_order_no", "shipment_start_datetime", "spbu_no", "order_quantity_kl"],
+                [["LO1", "2026-08-22 05:30:00", "SPBU-A", 8], ["LO1", "bad", "UNKNOWN", 8], ["LO3", "2026-08-22 07:00:00", "SPBU-OTHER", 8]],
             ),
             file_name="lo.xlsx",
         )
@@ -274,12 +344,36 @@ def test_timestamp_validation_derives_shift_and_rejects_bad_inputs() -> None:
 
         valid = validate_loading_orders(
             session, depot_id="D1", model=model,
-            content=workbook(["loading_order_no", "shipment_start_datetime", "spbu_no"], [["LO4", "2026-08-22 07:00:00", "SPBU-A"]]),
+            content=workbook(["loading_order_no", "shipment_start_datetime", "spbu_no", "order_quantity_kl"], [["LO4", "2026-08-22 07:00:00", "SPBU-A", 8]]),
             file_name="lo.xlsx",
         )
         assert valid["status"] == "PASS"
         assert valid["normalized_rows"][0]["shift_id"] == "s2"
         assert valid["normalized_rows"][0]["shipment_start_datetime"].endswith("+00:00")
+
+
+def test_loading_order_quantity_must_be_present_and_exactly_8_kl() -> None:
+    Session = make_session()
+    with Session() as session:
+        model = seed(session)
+        result = validate_loading_orders(
+            session,
+            depot_id="D1",
+            model=model,
+            content=workbook(
+                ["loading_order_no", "shipment_start_datetime", "spbu_no", "order_quantity_kl"],
+                [
+                    ["LO1", "2026-08-22 07:00:00", "SPBU-A", 10],
+                    ["LO2", "2026-08-22 07:00:00", "SPBU-A", None],
+                    ["LO3", "2026-08-22 07:00:00", "SPBU-A", 16],
+                ],
+            ),
+            file_name="lo.xlsx",
+        )
+        codes = {issue["error_code"] for issue in result["issues"]}
+        assert "ORDER_QUANTITY_MUST_BE_8_KL" in codes
+        assert "REQUIRED_VALUE_EMPTY" in codes
+        assert result["blocking_error_count"] > 0
 
 
 def test_mt_timestamp_validation_duplicate_inactive_and_depot_errors() -> None:
@@ -313,6 +407,13 @@ def test_strict_start_multi_trip_reuses_vehicle_without_overlap() -> None:
         first, second = result["trips"]
         assert datetime.fromisoformat(first["next_available_datetime"]) <= datetime.fromisoformat(second["predicted_departure_datetime"])
         assert result["summary"]["multi_trip_mt"] == 1
+        assert sum(row["delivered_kl"] for row in result["hourly_distribution"]) == 16
+        assert result["hourly_distribution"][-1]["cumulative_kl"] == 16
+        assert len(result["geographic_routes"]["routes"]) == 2
+        assert result["geographic_routes"]["sequence_policy"] == "NEAREST_TO_FARTHEST_FROM_DEPOT"
+        assert all(route["vehicle_id"] == "T1" for route in result["geographic_routes"]["routes"])
+        assert all(route["route_geometry_source"] == "MASTER_COORDINATE_FALLBACK" for route in result["geographic_routes"]["routes"])
+        assert all(route["uses_road_geometry"] is False for route in result["geographic_routes"]["routes"])
 
 
 def test_strict_start_rejects_not_yet_available_vehicle() -> None:
@@ -360,26 +461,140 @@ def test_multi_spbu_master_compatibility_is_intersection() -> None:
         assert result["trips"][0]["unassigned_reason"] == "NO_COMPATIBLE_MT"
 
 
+def test_capacity_aware_grouping_builds_three_lo_shipment_for_24_kl_mt() -> None:
+    Session = make_session()
+    with Session() as session:
+        seed(session)
+        session.add(
+            MasterMT(
+                mt_id="T24",
+                vehicle_name_raw="Truck 24",
+                vehicle_registration="B1024AA",
+                capacity_label="24KL",
+                vehicle_type_tag=24,
+                number_of_compartments=3,
+                depot_id="D1",
+                active_status="ACTIVE",
+            )
+        )
+        for suffix, latitude in (("D", -6.25), ("E", -6.26), ("F", -6.27)):
+            session.add(
+                MasterSPBU(
+                    spbu_id=suffix,
+                    spbu_code=f"SPBU-{suffix}",
+                    spbu_name=suffix,
+                    latitude=latitude,
+                    longitude=106.88,
+                    master_travel_time_min=10,
+                    vehicle_type_tag=24,
+                    primary_depot_id="D1",
+                )
+            )
+            session.flush()
+            session.add(
+                MLSPBUClusterAssignment(
+                    assignment_id=f"AS-{suffix}",
+                    model_id="M1",
+                    depot_id="D1",
+                    spbu_id=suffix,
+                    cluster_id=2,
+                    cluster_label="Cluster 3",
+                    membership_probability=0.9,
+                    is_noise=False,
+                    dominant_shift="Shift 2",
+                )
+            )
+        session.commit()
+
+        result = run_prediction(
+            session,
+            [
+                ["LO-D", "2026-08-22 09:00:00", "SPBU-D", 8],
+                ["LO-E", "2026-08-22 09:05:00", "SPBU-E", 8],
+                ["LO-F", "2026-08-22 09:10:00", "SPBU-F", 8],
+            ],
+            [["B1024AA", "2026-08-22 08:00:00"]],
+        )
+        assert len(result["shipments"]) == 1
+        shipment = result["shipments"][0]
+        assert len(shipment["lines"]) == 3
+        assert shipment["total_order_kl"] == 24
+        assert shipment["required_compartments"] == 3
+        assert shipment["explanation"]["grouping_method"] == "CAPACITY_TIME_ROUTE_SET_PACKING"
+        assert shipment["explanation"]["optimizer_method"] in {
+            "SCIPY_MILP_SET_PACKING",
+            "DETERMINISTIC_GREEDY_SET_PACKING_FALLBACK",
+        }
+        assert shipment["explanation"]["group_optimization"]["route_feasible"] is True
+        assert shipment["explanation"]["group_optimization"]["time_span_minutes"] == 10
+        assert shipment["assignment"]["assigned_vehicle_id"] == "T24"
+        assert shipment["trip"]["estimated_visit_sequence"] == ["SPBU-D", "SPBU-E", "SPBU-F"]
+        route = result["geographic_routes"]["routes"][0]
+        assert [stop["spbu_code"] for stop in route["stops"]] == ["SPBU-D", "SPBU-E", "SPBU-F"]
+        assert route["points"][0]["type"] == "DEPOT"
+        assert route["points"][-1]["type"] == "DEPOT_RETURN"
+
+
+def test_one_8_kl_lo_can_use_compatible_16_kl_mt_as_partial_load() -> None:
+    Session = make_session()
+    with Session() as session:
+        seed(session)
+        result = run_prediction(
+            session,
+            [["LO1", "2026-08-22 09:00:00", "SPBU-LIMITED", 8]],
+            [["B1003AA", "2026-08-22 08:00:00"]],
+        )
+        candidate = result["shipments"][0]["candidates"][0]
+        assert candidate["compatibility_status"] == "PASS"
+        assert candidate["exclusion_reason"] is None
+        assert candidate["explanation"]["capacity_policy"] == "ALLOW_PARTIAL_LOAD"
+        assert candidate["explanation"]["shipment_required_compartments"] == 1
+        assert candidate["explanation"]["mt_number_of_compartments"] == 2
+        assert result["trips"][0]["vehicle_id"] == "T3"
+        assert result["summary"]["assigned_loading_orders"] == 1
+        assert result["summary"]["assigned_order_kl"] == 8
+
+
 def test_demo_loading_order_uses_timestamps_and_requested_total() -> None:
     Session = make_session()
     with Session() as session:
         model = seed(session)
-        content, filename = generate_demo_loading_orders(session, depot_id="D1", model=model, total_order_kl=18, random_seed=42)
+        session.add(
+            MasterSPBU(
+                spbu_id="UNCOVERED",
+                spbu_code="SPBU-UNCOVERED",
+                spbu_name="Uncovered",
+                latitude=-6.30,
+                longitude=106.90,
+                vehicle_type_tag=8,
+                primary_depot_id="D1",
+                active_status="ACTIVE",
+            )
+        )
+        session.commit()
+        with pytest.raises(HTTPException) as raised:
+            generate_demo_loading_orders(session, depot_id="D1", model=model, total_order_kl=18, random_seed=42)
+        assert raised.value.detail["code"] == "DEMO_TOTAL_ORDER_NOT_8_KL_MULTIPLE"
+
+        content, filename = generate_demo_loading_orders(session, depot_id="D1", model=model, total_order_kl=24, random_seed=42)
         sheet = load_workbook(BytesIO(content), read_only=True, data_only=True).active
         assert [cell.value for cell in next(sheet.iter_rows(max_row=1))][:3] == ["loading_order_no", "shipment_start_datetime", "spbu_no"]
         rows = list(sheet.iter_rows(min_row=2, values_only=True))
         assert filename.startswith("phase6-demo-loading-order-")
-        assert [row[4] for row in rows] == [8, 8, 2]
+        assert [row[4] for row in rows] == [8, 8, 8]
+        assert {row[2] for row in rows} <= {"SPBU-A", "SPBU-B", "SPBU-C", "SPBU-LIMITED"}
+        generated_times = [datetime.fromisoformat(row[1]) for row in rows]
+        assert (max(generated_times) - min(generated_times)).total_seconds() <= 2 * 60
         validated = validate_loading_orders(session, depot_id="D1", model=model, content=content, file_name=filename)
         assert validated["status"] == "PASS"
-        assert sum(row["order_quantity_kl"] for row in validated["normalized_rows"]) == 18
+        assert sum(row["order_quantity_kl"] for row in validated["normalized_rows"]) == 24
 
 
 def test_demo_mt_availability_selects_random_active_mt_near_capacity_target() -> None:
     Session = make_session()
     with Session() as session:
         model = seed(session)
-        content, filename = generate_demo_mt_availability(session, depot_id="D1", total_capacity_kl=24, random_seed=42)
+        content, filename = generate_demo_mt_availability(session, depot_id="D1", model=model, total_capacity_kl=24, random_seed=42)
         sheet = load_workbook(BytesIO(content), read_only=True, data_only=True).active
         assert [cell.value for cell in next(sheet.iter_rows(max_row=1))][:3] == [
             "vehicle_registration_no",
@@ -391,12 +606,29 @@ def test_demo_mt_availability_selects_random_active_mt_near_capacity_target() ->
         assert len(rows) == 2
         assert sum(row[2] for row in rows) == 24
         assert {row[0] for row in rows} <= {"B1001AA", "B1002AA", "B1003AA"}
-        assert all(datetime.fromisoformat(row[1]) for row in rows)
+        availability_times = [datetime.fromisoformat(row[1]) for row in rows]
+        assert len(set(availability_times)) == 1
+        assert availability_times[0].hour == 0
+        assert availability_times[0].minute == 0
         validated = validate_mt_availability(session, depot_id="D1", model=model, content=content, file_name=filename)
         assert validated["status"] == "PASS"
         assert sum(row["capacity_kl"] for row in validated["normalized_rows"]) == 24
 
-        near_content, _ = generate_demo_mt_availability(session, depot_id="D1", total_capacity_kl=18, random_seed=7)
+        random_content, _ = generate_demo_mt_availability(
+            session,
+            depot_id="D1",
+            model=model,
+            total_capacity_kl=24,
+            random_availability=True,
+            random_seed=42,
+        )
+        random_sheet = load_workbook(BytesIO(random_content), read_only=True, data_only=True).active
+        random_times = [datetime.fromisoformat(row[1]) for row in random_sheet.iter_rows(min_row=2, values_only=True)]
+        assert len(set(random_times)) > 1
+        depot_close = availability_times[0].replace(hour=23, minute=59)
+        assert all(availability_times[0] <= value <= depot_close for value in random_times)
+
+        near_content, _ = generate_demo_mt_availability(session, depot_id="D1", model=model, total_capacity_kl=18, random_seed=7)
         near_sheet = load_workbook(BytesIO(near_content), read_only=True, data_only=True).active
         assert sum(row[2] for row in near_sheet.iter_rows(min_row=2, values_only=True)) == 16
 
@@ -407,7 +639,12 @@ def test_google_client_is_drive_only_and_rejects_truck() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         captured.update(json.loads(request.content))
         assert request.headers["x-goog-api-key"] == "secret-test-key"
-        return httpx.Response(200, json={"routes": [{"distanceMeters": 1000, "duration": "600s", "staticDuration": "550s"}]})
+        return httpx.Response(200, json={"routes": [{
+            "distanceMeters": 1000,
+            "duration": "600s",
+            "staticDuration": "550s",
+            "polyline": {"geoJsonLinestring": {"type": "LineString", "coordinates": [[106.8, -6.2], [106.85, -6.25], [106.9, -6.3]]}},
+        }]})
 
     client = GoogleRoutesClient("secret-test-key", transport=httpx.MockTransport(handler))
     response = client.compute_route(
@@ -416,8 +653,16 @@ def test_google_client_is_drive_only_and_rejects_truck() -> None:
     )
     assert captured["travelMode"] == "DRIVE"
     assert captured["routingPreference"] == "TRAFFIC_AWARE"
+    assert captured["polylineQuality"] == "OVERVIEW"
+    assert captured["polylineEncoding"] == "GEO_JSON_LINESTRING"
     assert "routeModifiers" not in captured
     assert response["duration_seconds"] == 600
+    assert response["route_geometry"] == [
+        {"latitude": -6.2, "longitude": 106.8},
+        {"latitude": -6.25, "longitude": 106.85},
+        {"latitude": -6.3, "longitude": 106.9},
+    ]
+    assert response["route_geometry_source"] == "GOOGLE_ROUTES_GEOJSON"
 
     with pytest.raises(GoogleRoutesError) as raised:
         client.compute_route(
@@ -435,7 +680,18 @@ class FakeRoutesClient:
     def compute_route(self, **kwargs):
         self.calls += 1
         self.routing_modes.append(kwargs["routing_mode"])
-        return {"distance_meters": 1000, "duration_seconds": 600, "static_duration_seconds": 550, "restrictions_partially_ignored": False, "warnings": []}
+        return {
+            "distance_meters": 1000,
+            "duration_seconds": 600,
+            "static_duration_seconds": 550,
+            "route_geometry": [
+                {"latitude": kwargs["origin"][0], "longitude": kwargs["origin"][1]},
+                {"latitude": kwargs["destination"][0], "longitude": kwargs["destination"][1]},
+            ],
+            "route_geometry_source": "GOOGLE_ROUTES_GEOJSON",
+            "restrictions_partially_ignored": False,
+            "warnings": [],
+        }
 
 
 def test_route_cache_uses_generic_drive_profile_across_vehicles() -> None:
@@ -499,6 +755,9 @@ def test_route_estimation_forces_drive_even_with_legacy_truck_configuration() ->
         assert estimate["routing_mode"] == "DRIVE"
         assert estimate["large_vehicle_used"] is False
         assert estimate["vehicle_profile_snapshot"]["profile_status"] == "NOT_REQUIRED"
+        assert estimate["route_geometry_source"] == "GOOGLE_ROUTES_GEOJSON"
+        assert estimate["route_geometry"][0] == {"latitude": -6.2, "longitude": 106.84}
+        assert estimate["route_geometry"][-1] == {"latitude": -6.2, "longitude": 106.84}
         assert fake.calls == 2
         assert set(fake.routing_modes) == {"DRIVE"}
 
@@ -543,6 +802,10 @@ def test_manual_override_preserves_original_and_recalculates_route() -> None:
         assert updated["original_model_prediction"] == original
         assert updated["trips"][0]["vehicle_id"] == replacement["vehicle_id"]
         assert updated["trips"][0]["assignment_status"] == "MANUAL_OVERRIDE"
+        assert updated["summary"]["assigned_order_kl"] == 8
+        assert updated["hourly_distribution"][-1]["cumulative_kl"] == 8
+        assert updated["geographic_routes"]["routes"][0]["vehicle_id"] == replacement["vehicle_id"]
+        assert updated["geographic_routes"]["routes"][0]["trip_id"] == updated["trips"][0]["trip_id"]
 
 
 def test_phase6_has_no_route_optimization_or_full_vrp_client() -> None:

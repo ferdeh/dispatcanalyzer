@@ -191,6 +191,21 @@ def _parse_duration(value: str | None) -> int:
     return round(float(value[:-1]))
 
 
+def _geojson_route_geometry(route: dict) -> list[dict[str, float]]:
+    coordinates = ((route.get("polyline") or {}).get("geoJsonLinestring") or {}).get("coordinates") or []
+    geometry = []
+    for coordinate in coordinates:
+        if not isinstance(coordinate, list) or len(coordinate) < 2:
+            continue
+        try:
+            longitude, latitude = float(coordinate[0]), float(coordinate[1])
+        except (TypeError, ValueError):
+            continue
+        if -90 <= latitude <= 90 and -180 <= longitude <= 180:
+            geometry.append({"latitude": latitude, "longitude": longitude})
+    return geometry
+
+
 class GoogleRoutesClient:
     """Server-side Routes API client used only for per-trip travel estimation.
 
@@ -284,6 +299,8 @@ class GoogleRoutesClient:
             "destination": self._waypoint(*destination),
             "travelMode": "DRIVE",
             "routingPreference": routing_preference,
+            "polylineQuality": "OVERVIEW",
+            "polylineEncoding": "GEO_JSON_LINESTRING",
         }
         departure = self._future_departure(departure_datetime)
         if departure:
@@ -291,7 +308,7 @@ class GoogleRoutesClient:
         response = self._post(
             ROUTES_URL,
             payload,
-            "routes.distanceMeters,routes.duration,routes.staticDuration,routes.travelAdvisory.routeRestrictionsPartiallyIgnored,routes.warnings",
+            "routes.distanceMeters,routes.duration,routes.staticDuration,routes.polyline.geoJsonLinestring,routes.travelAdvisory.routeRestrictionsPartiallyIgnored,routes.warnings",
         )
         routes = response.get("routes") or []
         if not routes:
@@ -301,6 +318,8 @@ class GoogleRoutesClient:
             "distance_meters": int(route.get("distanceMeters") or 0),
             "duration_seconds": _parse_duration(route.get("duration")),
             "static_duration_seconds": _parse_duration(route.get("staticDuration")) or None,
+            "route_geometry": _geojson_route_geometry(route),
+            "route_geometry_source": "GOOGLE_ROUTES_GEOJSON",
             "restrictions_partially_ignored": bool((route.get("travelAdvisory") or {}).get("routeRestrictionsPartiallyIgnored")),
             "warnings": route.get("warnings") or [],
         }

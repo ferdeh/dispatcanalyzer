@@ -1,6 +1,8 @@
 import ReactECharts from "echarts-for-react";
 import { ChevronDown, ChevronRight, Download, Eye, FileCheck2, Play, RefreshCw, Sparkles, Split, Upload, XCircle } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
+import { CircleMarker, MapContainer, Polyline, Popup, TileLayer, Tooltip, useMap } from "react-leaflet";
+import "leaflet/dist/leaflet.css";
 import { apiFile, apiForm, apiGet, apiSend, downloadFormFromApi, downloadFromApi } from "../lib/api";
 
 type Depot = { depot_id: string; depot_name: string };
@@ -41,6 +43,8 @@ type Candidate = {
   candidate_rank: number | null;
   exclusion_reason: string | null;
   explanation: Record<string, unknown>;
+  capacity_kl: number | null;
+  number_of_compartments: number | null;
 };
 type Trip = {
   id: string;
@@ -82,6 +86,9 @@ type Shipment = {
   low_confidence: boolean;
   is_manual_override: boolean;
   explanation: Record<string, unknown>;
+  total_order_kl: number;
+  required_compartments: number;
+  compartment_unit_kl: number;
   lines: Array<{
     id: string;
     loading_order_no: string;
@@ -98,6 +105,8 @@ type Shipment = {
     original_prediction_score: number | null;
     assigned_vehicle_id: string | null;
     assigned_vehicle_registration: string | null;
+    assigned_vehicle_capacity_kl: number | null;
+    assigned_vehicle_compartments: number | null;
     mt_assignment_score: number | null;
     assignment_status: string;
     unassigned_reason: string | null;
@@ -105,6 +114,67 @@ type Shipment = {
   };
   trip: Trip | null;
   candidates: Candidate[];
+  candidates_loaded: boolean;
+};
+type HourlyDistribution = {
+  hour_start: string;
+  timezone: string;
+  delivered_kl: number;
+  cumulative_kl: number;
+  shipment_count: number;
+  loading_order_count: number;
+};
+type GeographicRoutePoint = {
+  type: "DEPOT" | "SPBU" | "DEPOT_RETURN";
+  code: string;
+  name: string;
+  sequence?: number;
+  latitude: number;
+  longitude: number;
+};
+type GeographicGeometryPoint = { latitude: number; longitude: number };
+type GeographicRoute = {
+  trip_id: string;
+  trip_number: number | null;
+  shipment_id: string;
+  vehicle_id: string;
+  vehicle_registration_no: string;
+  predicted_departure_datetime: string;
+  total_order_kl: number;
+  stops: Array<{
+    sequence: number;
+    spbu_id: string;
+    spbu_code: string;
+    spbu_name: string;
+    distance_from_depot_meters: number | null;
+    latitude: number | null;
+    longitude: number | null;
+  }>;
+  points: GeographicRoutePoint[];
+  route_geometry: GeographicGeometryPoint[];
+  route_geometry_source: "GOOGLE_ROUTES_GEOJSON" | "MASTER_COORDINATE_FALLBACK" | "MIXED_GEOMETRY" | null;
+  original_geometry_point_count: number;
+  uses_road_geometry: boolean;
+  missing_coordinate_count: number;
+  mappable: boolean;
+};
+type GeographicRoutes = {
+  sequence_policy: "NEAREST_TO_FARTHEST_FROM_DEPOT";
+  geometry_source: "GOOGLE_ROUTES_WITH_MASTER_FALLBACK";
+  marker_coordinate_source: "MASTER_DEPOT_AND_SPBU";
+  depot: {
+    depot_id: string | null;
+    depot_code: string | null;
+    depot_name: string | null;
+    latitude: number | null;
+    longitude: number | null;
+  };
+  routes: GeographicRoute[];
+};
+type RouteGeometryRefresh = {
+  geographic_routes: GeographicRoutes;
+  refreshed_trip_count: number;
+  road_geometry_trip_count: number;
 };
 type PredictionResult = {
   id: string;
@@ -126,6 +196,8 @@ type PredictionResult = {
     predicted_shipments: number;
     available_mt: number;
     assigned_shipments: number;
+    assigned_loading_orders: number;
+    assigned_order_kl: number;
     unassigned_shipments: number;
     total_trips: number;
     assigned_with_delay: number;
@@ -135,8 +207,18 @@ type PredictionResult = {
     average_mt_assignment_confidence: number;
   };
   summary_by_shift: Array<Record<string, string | number>>;
+  shipment_pagination: {
+    page: number;
+    page_size: number;
+    total: number;
+    total_pages: number;
+    shift_id: string | null;
+  };
+  shipment_options: Array<{ id: string; predicted_shipment_id: string; shift_id: string; shift: string }>;
   shipments: Shipment[];
   trips: Trip[];
+  hourly_distribution: HourlyDistribution[];
+  geographic_routes: GeographicRoutes;
   mt_timeline: Array<{ vehicle_id: string; vehicle_registration_no: string; trips: Array<{ trip_id: string; trip_number: number; shipment_id: string; start: string; return: string; next_available: string; status: string }> }>;
   routing_configuration: Record<string, unknown>;
   routing_metrics: Record<string, number>;
@@ -148,6 +230,8 @@ type PredictionTask = {
   status: "QUEUED";
   message: string;
 };
+type ActivePredictionTask = { id: string; predictionRunId: string; depotId: string };
+type ShipmentCandidatesResponse = { shipment_id: string; predicted_shipment_id: string; candidates: Candidate[] };
 type PredictionRunStatus = {
   id: string;
   prediction_run_id: string;
@@ -220,6 +304,179 @@ function durationMinutes(value: number | null | undefined) {
   return value === null || value === undefined ? "—" : `${Math.round(value / 60).toLocaleString("id-ID")} min`;
 }
 
+const ROUTE_COLORS = ["#0b73bf", "#b45309", "#15803d", "#7e22ce", "#be123c", "#0369a1", "#4d7c0f", "#c2410c"];
+
+function FitRouteBounds({ routes }: { routes: GeographicRoute[] }) {
+  const map = useMap();
+  useEffect(() => {
+    const bounds = routes.flatMap((route) => route.points
+      .filter((point) => point.type !== "DEPOT_RETURN")
+      .map((point) => [point.latitude, point.longitude] as [number, number]));
+    if (bounds.length > 0) map.fitBounds(bounds, { padding: [28, 28], maxZoom: 12 });
+  }, [map, routes]);
+  return null;
+}
+
+function GeographicMTRouteMap({ payload, runId }: { payload: GeographicRoutes; runId: string }) {
+  const [displayPayload, setDisplayPayload] = useState(payload);
+  const [routeLoadingVehicle, setRouteLoadingVehicle] = useState<string | null>(null);
+  const [requestedVehicles, setRequestedVehicles] = useState<Set<string>>(() => new Set());
+  const [routeFeedback, setRouteFeedback] = useState<{ status: "SUCCESS" | "WARNING" | "ERROR"; message: string } | null>(null);
+  const [vehicleSearch, setVehicleSearch] = useState("");
+  useEffect(() => {
+    setDisplayPayload(payload);
+    setRequestedVehicles(new Set());
+    setRouteFeedback(null);
+    setVehicleSearch("");
+  }, [payload, runId]);
+  const vehicleOptions = useMemo(
+    () => [...new Map(displayPayload.routes.filter((route) => route.mappable).map((route) => [route.vehicle_id, route.vehicle_registration_no || route.vehicle_id])).entries()],
+    [displayPayload.routes],
+  );
+  const filteredVehicleOptions = useMemo(() => {
+    const query = vehicleSearch.trim().toLocaleUpperCase("id-ID");
+    if (!query) return vehicleOptions;
+    return vehicleOptions.filter(([vehicleId, registration]) =>
+      vehicleId.toLocaleUpperCase("id-ID").includes(query)
+      || registration.toLocaleUpperCase("id-ID").includes(query));
+  }, [vehicleOptions, vehicleSearch]);
+  const [selectedVehicle, setSelectedVehicle] = useState(vehicleOptions[0]?.[0] ?? "ALL");
+  useEffect(() => {
+    if (selectedVehicle !== "ALL" && !vehicleOptions.some(([vehicleId]) => vehicleId === selectedVehicle)) {
+      setSelectedVehicle(vehicleOptions[0]?.[0] ?? "ALL");
+    }
+  }, [selectedVehicle, vehicleOptions]);
+  useEffect(() => {
+    if (selectedVehicle !== "ALL" && !filteredVehicleOptions.some(([vehicleId]) => vehicleId === selectedVehicle)) {
+      setSelectedVehicle("ALL");
+    }
+  }, [filteredVehicleOptions, selectedVehicle]);
+  const visibleRoutes = useMemo(
+    () => displayPayload.routes.filter((route) => route.mappable && (selectedVehicle === "ALL" || route.vehicle_id === selectedVehicle)),
+    [displayPayload.routes, selectedVehicle],
+  );
+  const mappedStops = useMemo(() => [...new Map(visibleRoutes.flatMap((route) => route.points
+    .filter((point) => point.type === "SPBU")
+    .map((point) => [point.code, { ...point, vehicleId: route.vehicle_id, tripId: route.trip_id }]))).values()], [visibleRoutes]);
+  const roadRouteCount = visibleRoutes.filter((route) => route.uses_road_geometry).length;
+  const missingCoordinateCount = visibleRoutes.reduce((total, route) => total + route.missing_coordinate_count, 0);
+  const vehicleColor = (vehicleId: string) => {
+    const index = Math.max(0, vehicleOptions.findIndex(([id]) => id === vehicleId));
+    return ROUTE_COLORS[index % ROUTE_COLORS.length];
+  };
+  const defaultCenter: [number, number] = displayPayload.depot.latitude !== null && displayPayload.depot.longitude !== null
+    ? [displayPayload.depot.latitude, displayPayload.depot.longitude]
+    : visibleRoutes[0]?.points[0]
+      ? [visibleRoutes[0].points[0].latitude, visibleRoutes[0].points[0].longitude]
+      : [3.5952, 98.6722];
+
+  async function loadRoadGeometry(vehicleId: string) {
+    if (vehicleId === "ALL" || routeLoadingVehicle) return;
+    setRouteLoadingVehicle(vehicleId);
+    setRequestedVehicles((current) => new Set(current).add(vehicleId));
+    setRouteFeedback(null);
+    try {
+      const response = await apiSend<RouteGeometryRefresh>(`/api/v1/phase6/predictions/${runId}/route-geometry`, "POST", { vehicle_id: vehicleId });
+      setDisplayPayload((current) => {
+        const refreshedByTrip = new Map(response.geographic_routes.routes.map((route) => [route.trip_id, route]));
+        return {
+          ...current,
+          routes: current.routes.map((route) => refreshedByTrip.get(route.trip_id) ?? route),
+        };
+      });
+      setRouteFeedback(response.road_geometry_trip_count > 0
+        ? { status: "SUCCESS", message: `${response.road_geometry_trip_count} trip memakai geometri jalan Google Routes.` }
+        : { status: "WARNING", message: "Google Routes tidak menghasilkan geometri jalan. Garis fallback ditampilkan putus-putus." });
+    } catch (reason) {
+      setRouteFeedback({ status: "ERROR", message: reason instanceof Error ? reason.message : "Geometri jalan gagal dimuat." });
+    } finally {
+      setRouteLoadingVehicle(null);
+    }
+  }
+
+  useEffect(() => {
+    if (selectedVehicle === "ALL" || requestedVehicles.has(selectedVehicle) || routeLoadingVehicle) return;
+    if (visibleRoutes.some((route) => !route.uses_road_geometry)) void loadRoadGeometry(selectedVehicle);
+  }, [requestedVehicles, routeLoadingVehicle, selectedVehicle, visibleRoutes]);
+
+  return (
+    <div className="border border-line bg-white p-5">
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">10B. Geographic Route per MT</div>
+          <p className="mt-1 max-w-4xl text-xs text-slate-500">Marker memakai Master Depot dan Master SPBU latitude/longitude yang sama dengan Geographic Cluster Map Fase 5. Garis solid memakai geometri jalan Google Routes; marker tetap berada di koordinat master meskipun Google melakukan road snapping.</p>
+        </div>
+        <div className="flex flex-wrap items-end gap-2">
+          <div className="grid gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
+            <label htmlFor={`geographic-mt-search-${runId}`}>Cari No. MT</label>
+            <input
+              id={`geographic-mt-search-${runId}`}
+              type="search"
+              className="min-w-52 border border-line bg-white px-3 py-2 text-sm font-normal normal-case tracking-normal text-petroink placeholder:text-slate-400"
+              placeholder="Ketik nomor MT…"
+              value={vehicleSearch}
+              onChange={(event) => setVehicleSearch(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && filteredVehicleOptions.length > 0) {
+                  event.preventDefault();
+                  setSelectedVehicle(filteredVehicleOptions[0][0]);
+                }
+              }}
+            />
+            <span className="font-normal normal-case tracking-normal text-slate-400">{filteredVehicleOptions.length.toLocaleString("id-ID")} dari {vehicleOptions.length.toLocaleString("id-ID")} MT</span>
+          </div>
+          <label className="grid gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
+            Tampilkan MT
+            <select className="min-w-52 border border-line bg-white px-3 py-2 text-sm font-normal normal-case tracking-normal text-petroink" value={selectedVehicle} onChange={(event) => setSelectedVehicle(event.target.value)}>
+              <option value="ALL">Semua MT ({vehicleOptions.length})</option>
+              {filteredVehicleOptions.map(([vehicleId, registration]) => <option key={vehicleId} value={vehicleId}>{registration}</option>)}
+              {filteredVehicleOptions.length === 0 && <option value="NO_RESULT" disabled>MT tidak ditemukan</option>}
+            </select>
+          </label>
+          <button className="inline-flex items-center gap-2 border border-petroblue px-3 py-2 text-sm text-petroblue disabled:cursor-wait disabled:opacity-40" disabled={selectedVehicle === "ALL" || routeLoadingVehicle !== null} onClick={() => void loadRoadGeometry(selectedVehicle)}><RefreshCw className={routeLoadingVehicle ? "animate-spin" : ""} size={15} />{routeLoadingVehicle ? "Memuat jalan…" : "Perbarui rute jalan"}</button>
+        </div>
+      </div>
+      <div className="mt-3 flex flex-wrap gap-4 text-xs text-slate-500"><span>{mappedStops.length.toLocaleString("id-ID")} SPBU mapped</span><span>{missingCoordinateCount.toLocaleString("id-ID")} koordinat missing</span><span>{roadRouteCount.toLocaleString("id-ID")}/{visibleRoutes.length.toLocaleString("id-ID")} trip memakai jalan Google</span></div>
+      {routeFeedback && <div className={`mt-3 border px-3 py-2 text-xs ${routeFeedback.status === "SUCCESS" ? "border-mint bg-mint/5 text-mint" : routeFeedback.status === "WARNING" ? "border-amber bg-amber/5 text-amber" : "border-rust bg-rust/5 text-rust"}`} role="status">{routeFeedback.message}</div>}
+      {visibleRoutes.length > 0 ? (
+        <>
+          <div className="relative z-0 mt-4 overflow-hidden rounded-2xl border border-line" role="region" aria-label="Geographic MT route map using Master SPBU and Master Depot coordinates">
+            <MapContainer center={defaultCenter} zoom={8} scrollWheelZoom preferCanvas className="h-[500px] w-full bg-slate-100">
+              <TileLayer attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors' url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+              <FitRouteBounds routes={visibleRoutes} />
+              {visibleRoutes.map((route) => {
+                const color = vehicleColor(route.vehicle_id);
+                const geometry = route.route_geometry.length >= 2 ? route.route_geometry : route.points;
+                const positions = geometry.map((point) => [point.latitude, point.longitude] as [number, number]);
+                return (
+                  <Polyline key={route.trip_id} positions={positions} pathOptions={{ color, weight: route.uses_road_geometry ? 5 : 3, opacity: 0.82, dashArray: route.uses_road_geometry ? undefined : "8 8" }}>
+                    <Tooltip sticky>{route.vehicle_registration_no} · {route.trip_id}<br />{route.shipment_id} · {route.total_order_kl} KL<br />Berangkat {dateTime(route.predicted_departure_datetime)}<br />{route.uses_road_geometry ? "Google road geometry" : "Straight fallback — bukan rute jalan"}</Tooltip>
+                  </Polyline>
+                );
+              })}
+              {mappedStops.map((point) => (
+                <CircleMarker key={point.code} center={[point.latitude, point.longitude]} radius={6} pathOptions={{ color: "#ffffff", fillColor: vehicleColor(point.vehicleId), fillOpacity: 0.88, weight: 1.5 }}>
+                  <Tooltip direction="top" opacity={1}><div className="min-w-48 text-sm text-petroink"><div className="font-semibold">{point.name || point.code}</div><div className="text-xs text-slate-500">SPBU {point.code} · {point.tripId}</div><div className="mt-1">Master: {point.latitude.toFixed(5)}, {point.longitude.toFixed(5)}</div></div></Tooltip>
+                  <Popup><strong>{point.name || point.code}</strong><br />SPBU {point.code}<br />Trip {point.tripId}<br />Master coordinate: {point.latitude.toFixed(5)}, {point.longitude.toFixed(5)}</Popup>
+                </CircleMarker>
+              ))}
+              {displayPayload.depot.latitude !== null && displayPayload.depot.longitude !== null && (
+                <CircleMarker center={[displayPayload.depot.latitude, displayPayload.depot.longitude]} radius={11} pathOptions={{ color: "#facc15", fillColor: "#0f2942", fillOpacity: 1, weight: 4 }}>
+                  <Tooltip direction="top" opacity={1}><div className="min-w-48 text-sm text-petroink"><div className="font-semibold">Depot · {displayPayload.depot.depot_name}</div><div className="mt-1 text-xs text-slate-500">Master Depot position</div><div className="mt-1">{displayPayload.depot.latitude.toFixed(5)}, {displayPayload.depot.longitude.toFixed(5)}</div></div></Tooltip>
+                  <Popup><strong>Depot · {displayPayload.depot.depot_name}</strong><br />Master coordinate: {displayPayload.depot.latitude.toFixed(5)}, {displayPayload.depot.longitude.toFixed(5)}</Popup>
+                </CircleMarker>
+              )}
+            </MapContainer>
+          </div>
+          <div className="mt-4 grid max-h-44 gap-2 overflow-auto text-xs sm:grid-cols-2 xl:grid-cols-3">
+            {visibleRoutes.map((route) => <div key={`legend-${route.trip_id}`} className="border border-line p-2"><span className="mr-2 inline-block h-2.5 w-2.5 rounded-full" style={{ backgroundColor: vehicleColor(route.vehicle_id) }} /><strong>{route.vehicle_registration_no}</strong> · Trip #{route.trip_number ?? "—"} · {route.uses_road_geometry ? "Google road" : "fallback"}<div className="mt-1 text-slate-500">{route.shipment_id} · {route.total_order_kl} KL · Depot → {route.stops.map((stop) => stop.spbu_code).join(" → ")} → Depot</div></div>)}
+          </div>
+        </>
+      ) : <div className="mt-4 border border-dashed border-line p-6 text-center text-sm text-slate-500">Belum ada assigned shipment dengan koordinat depot dan SPBU yang lengkap.</div>}
+    </div>
+  );
+}
+
 export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
   const [depotId, setDepotId] = useState("");
   const [models, setModels] = useState<Model[]>([]);
@@ -235,17 +492,19 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [runFeedback, setRunFeedback] = useState<{ status: "RUNNING" | "SUCCESS" | "ERROR"; message: string } | null>(null);
-  const [activeRun, setActiveRun] = useState<{ id: string; predictionRunId: string; depotId: string } | null>(null);
+  const [activeRuns, setActiveRuns] = useState<ActivePredictionTask[]>([]);
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [candidateLoadingShipment, setCandidateLoadingShipment] = useState<string | null>(null);
   const [shiftTab, setShiftTab] = useState("ALL");
   const [shipmentPage, setShipmentPage] = useState(1);
   const [shipmentsPerPage, setShipmentsPerPage] = useState(25);
+  const [resultPageLoading, setResultPageLoading] = useState(false);
   const [timelinePage, setTimelinePage] = useState(1);
   const [mtPerTimelinePage, setMtPerTimelinePage] = useState(10);
   const [overrideReason, setOverrideReason] = useState<Record<string, string>>({});
   const [moveTargets, setMoveTargets] = useState<Record<string, string>>({});
-  const [minimumConfidence, setMinimumConfidence] = useState("0.60");
-  const [maximumPairingGap, setMaximumPairingGap] = useState("30");
+  const [minimumConfidence, setMinimumConfidence] = useState("0.40");
+  const [maximumPairingGap, setMaximumPairingGap] = useState("90");
   const [assignmentMode, setAssignmentMode] = useState("STRICT_START");
   const [maximumDelay, setMaximumDelay] = useState("30");
   const [demoDialogOpen, setDemoDialogOpen] = useState(false);
@@ -254,6 +513,7 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
   const [demoNotice, setDemoNotice] = useState<string | null>(null);
   const [mtDemoDialogOpen, setMtDemoDialogOpen] = useState(false);
   const [mtDemoTotalKl, setMtDemoTotalKl] = useState("160");
+  const [mtDemoRandomAvailability, setMtDemoRandomAvailability] = useState(false);
   const [mtDemoLoading, setMtDemoLoading] = useState(false);
   const [mtDemoNotice, setMtDemoNotice] = useState<string | null>(null);
 
@@ -272,7 +532,7 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
   const canRun = Boolean(depotId && modelId && loadingOrderFile && mtFile && loValidation && mtValidation && blockingErrors === 0);
 
   useEffect(() => {
-    setActiveRun(null);
+    setActiveRuns([]);
     setModelId("");
     setModels([]);
     setLoadingOrderFile(null);
@@ -295,12 +555,12 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
     ]).then(([modelRows, historyRows]) => {
       setModels(modelRows);
       setHistory(historyRows);
-      const pendingRun = historyRows.find((row) => row.status === "QUEUED" || row.status === "RUNNING");
-      if (pendingRun) {
-        setActiveRun({ id: pendingRun.id, predictionRunId: pendingRun.prediction_run_id, depotId: pendingRun.depot_id });
+      const pendingRuns = historyRows.filter((row) => row.status === "QUEUED" || row.status === "RUNNING");
+      if (pendingRuns.length > 0) {
+        setActiveRuns(pendingRuns.map((row) => ({ id: row.id, predictionRunId: row.prediction_run_id, depotId: row.depot_id })));
         setRunFeedback({
           status: "RUNNING",
-          message: `Prediction ${pendingRun.prediction_run_id} masih berjalan di belakang layar. Hasil akan ditampilkan otomatis.`,
+          message: `${pendingRuns.length.toLocaleString("id-ID")} task prediction sedang berada di antrean atau diproses worker. Anda tetap dapat mengirim task baru.`,
         });
       }
     }).catch((reason: Error) => setError(reason.message));
@@ -320,58 +580,63 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
   }, [modelId]);
 
   useEffect(() => {
-    if (!activeRun) return;
-    const task = activeRun;
+    if (activeRuns.length === 0) return;
+    const tasks = activeRuns;
     let cancelled = false;
     let timer: number | undefined;
 
-    async function pollPredictionStatus() {
+    async function pollPredictionStatuses() {
       try {
-        const runStatus = await apiGet<PredictionRunStatus>(`/api/v1/phase6/predictions/${task.id}/status`);
+        const statuses = await Promise.all(tasks.map(async (task) => {
+          try {
+            return await apiGet<PredictionRunStatus>(`/api/v1/phase6/predictions/${task.id}/status`);
+          } catch {
+            return null;
+          }
+        }));
         if (cancelled) return;
-        if (runStatus.status === "COMPLETED") {
-          const payload = await apiGet<PredictionResult>(`/api/v1/phase6/predictions/${task.id}`);
+        const completed = statuses.filter((status): status is PredictionRunStatus => status?.status === "COMPLETED");
+        const failed = statuses.filter((status): status is PredictionRunStatus => status?.status === "FAILED");
+        const terminalIds = new Set([...completed, ...failed].map((status) => status.id));
+        if (completed.length > 0) {
+          const latest = completed[completed.length - 1];
+          const payload = await apiGet<PredictionResult>(`/api/v1/phase6/predictions/${latest.id}?shipment_page=1&shipment_page_size=${shipmentsPerPage}`);
           if (cancelled) return;
           setResult(payload);
-          setExpanded(payload.shipments[0]?.id ?? null);
+          setShipmentPage(1);
+          setExpanded(null);
           setShiftTab("ALL");
-          setRunFeedback({ status: "SUCCESS", message: `Prediction ${payload.prediction_run_id} berhasil diselesaikan dan hasilnya telah ditampilkan.` });
-          if (depotId === task.depotId) {
-            setHistory(await apiGet<HistoryRow[]>(`/api/v1/phase6/predictions?depot_id=${encodeURIComponent(task.depotId)}`));
-          }
-          setActiveRun(null);
-          return;
         }
-        if (runStatus.status === "FAILED") {
-          const message = `${runStatus.error_code ? `[${runStatus.error_code}] ` : ""}${runStatus.error_message ?? "Prediction gagal diproses."}`;
+        if (failed.length > 0) {
+          const failedStatus = failed[failed.length - 1];
+          const message = `${failedStatus.error_code ? `[${failedStatus.error_code}] ` : ""}${failedStatus.error_message ?? "Prediction gagal diproses."}`;
           setError(message);
-          setRunFeedback({ status: "ERROR", message: `Prediction ${runStatus.prediction_run_id} gagal: ${message}` });
-          if (depotId === task.depotId) {
-            setHistory(await apiGet<HistoryRow[]>(`/api/v1/phase6/predictions?depot_id=${encodeURIComponent(task.depotId)}`));
-          }
-          setActiveRun(null);
+        }
+        if (terminalIds.size > 0) {
+          setActiveRuns((current) => current.filter((task) => !terminalIds.has(task.id)));
+          if (depotId) setHistory(await apiGet<HistoryRow[]>(`/api/v1/phase6/predictions?depot_id=${encodeURIComponent(depotId)}`));
+          const remaining = tasks.length - terminalIds.size;
+          setRunFeedback(failed.length > 0
+            ? { status: "ERROR", message: `${failed.length} task gagal. ${remaining} task lain masih berada di antrean atau diproses.` }
+            : { status: "SUCCESS", message: `${completed.length} prediction selesai dan hasil terbaru ditampilkan. ${remaining > 0 ? `${remaining} task masih berada di antrean.` : "Antrean aktif telah selesai."}` });
           return;
         }
-        setRunFeedback({
-          status: "RUNNING",
-          message: `Prediction ${runStatus.prediction_run_id} ${runStatus.status === "QUEUED" ? "menunggu worker" : "sedang diproses"} di belakang layar (percobaan ${Math.max(1, runStatus.queue.attempt_count)}/${Math.max(1, runStatus.queue.max_attempts)}). Hasil akan ditampilkan otomatis.`,
-        });
+        const runningCount = statuses.filter((status) => status?.status === "RUNNING").length;
+        const queuedCount = statuses.filter((status) => status?.status === "QUEUED").length;
+        setRunFeedback({ status: "RUNNING", message: `${runningCount} task sedang diproses worker · ${queuedCount} task menunggu antrean. Anda tetap dapat mengirim prediction baru.` });
       } catch {
         if (cancelled) return;
-        setRunFeedback({
-          status: "RUNNING",
-          message: `Prediction ${task.predictionRunId} tetap berjalan di belakang layar. Koneksi status akan dicoba kembali otomatis.`,
-        });
+        setRunFeedback({ status: "RUNNING", message: `${tasks.length} task tetap berjalan di belakang layar. Koneksi status akan dicoba kembali otomatis.` });
       }
-      timer = window.setTimeout(() => void pollPredictionStatus(), 1500);
+      timer = window.setTimeout(() => void pollPredictionStatuses(), 1500);
     }
 
-    void pollPredictionStatus();
+    void pollPredictionStatuses();
     return () => {
       cancelled = true;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [activeRun, depotId]);
+  }, [activeRuns, depotId, shipmentsPerPage]);
 
   async function validateFile(kind: "loading-order" | "mt-availability", file: File) {
     if (!depotId || !modelId) return null;
@@ -392,7 +657,7 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
   }
 
   async function runPrediction() {
-    if (!canRun || !loadingOrderFile || !mtFile || activeRun) return;
+    if (!canRun || !loadingOrderFile || !mtFile) return;
     setLoading(true);
     setError(null);
     setRunFeedback({
@@ -412,11 +677,12 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
     }));
     try {
       const queued = await apiForm<PredictionTask>("/api/v1/phase6/predictions", body);
-      setResult(null);
-      setActiveRun({ id: queued.id, predictionRunId: queued.prediction_run_id, depotId });
+      setActiveRuns((current) => current.some((task) => task.id === queued.id)
+        ? current
+        : [...current, { id: queued.id, predictionRunId: queued.prediction_run_id, depotId }]);
       setRunFeedback({
         status: "RUNNING",
-        message: `Prediction ${queued.prediction_run_id} telah dikirim dan berjalan di belakang layar. Anda tetap dapat menggunakan aplikasi.`,
+        message: `Prediction ${queued.prediction_run_id} telah masuk antrean. Anda dapat langsung mengirim prediction berikutnya tanpa menunggu task ini selesai.`,
       });
       setHistory(await apiGet<HistoryRow[]>(`/api/v1/phase6/predictions?depot_id=${encodeURIComponent(depotId)}`));
     } catch (reason) {
@@ -430,8 +696,8 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
 
   async function generateDemoLoadingOrders() {
     const totalOrderKl = Number(demoTotalKl);
-    if (!depotId || !modelId || !Number.isFinite(totalOrderKl) || totalOrderKl <= 0 || totalOrderKl > 40000) {
-      setError("Total order harus lebih dari 0 dan maksimum 40.000 KL.");
+    if (!depotId || !modelId || !Number.isFinite(totalOrderKl) || totalOrderKl <= 0 || totalOrderKl > 40000 || totalOrderKl % 8 !== 0) {
+      setError("Total order harus kelipatan 8 KL, lebih dari 0, dan maksimum 40.000 KL.");
       return;
     }
     setDemoLoading(true);
@@ -471,7 +737,7 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
       const file = await apiFile(
         "/api/v1/phase6/demo/mt-availability",
         "POST",
-        { depot_id: depotId, model_id: modelId, total_capacity_kl: targetCapacityKl },
+        { depot_id: depotId, model_id: modelId, total_capacity_kl: targetCapacityKl, random_availability: mtDemoRandomAvailability },
         "phase6-demo-mt-availability.xlsx",
       );
       setMtFile(file);
@@ -485,7 +751,7 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
           0,
         );
         setMtDemoNotice(
-          `Data demo memilih ${validation.row_count.toLocaleString("id-ID")} MT dengan total ${selectedCapacity.toLocaleString("id-ID", { maximumFractionDigits: 3 })} KL, mendekati target ${targetCapacityKl.toLocaleString("id-ID", { maximumFractionDigits: 3 })} KL.`,
+          `Data demo memilih ${validation.row_count.toLocaleString("id-ID")} MT dengan total ${selectedCapacity.toLocaleString("id-ID", { maximumFractionDigits: 3 })} KL, mendekati target ${targetCapacityKl.toLocaleString("id-ID", { maximumFractionDigits: 3 })} KL. ${mtDemoRandomAvailability ? "Jam availability dibuat acak." : "Semua MT tersedia sejak awal operasional depot."}`,
         );
       }
     } catch (reason) {
@@ -505,15 +771,61 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
     await downloadFormFromApi("/api/v1/phase6/validation-report", body, "phase6-validation-report.xlsx");
   }
 
+  function predictionResultUrl(runId: string, page: number, pageSize: number, shift: string) {
+    const query = new URLSearchParams({ shipment_page: String(page), shipment_page_size: String(pageSize) });
+    if (shift !== "ALL") query.set("shift_id", shift);
+    return `/api/v1/phase6/predictions/${runId}?${query.toString()}`;
+  }
+
+  async function loadPredictionPage(runId: string, page: number, pageSize: number, shift: string) {
+    setResultPageLoading(true);
+    try {
+      const payload = await apiGet<PredictionResult>(predictionResultUrl(runId, page, pageSize, shift));
+      setResult(payload);
+      setShipmentPage(payload.shipment_pagination.page);
+      setShipmentsPerPage(payload.shipment_pagination.page_size);
+      setShiftTab(payload.shipment_pagination.shift_id ?? "ALL");
+      setExpanded(null);
+      return payload;
+    } finally {
+      setResultPageLoading(false);
+    }
+  }
+
+  async function toggleShipmentDetail(shipment: Shipment) {
+    if (!result) return;
+    if (expanded === shipment.id) {
+      setExpanded(null);
+      return;
+    }
+    setExpanded(shipment.id);
+    if (shipment.candidates_loaded) return;
+    setCandidateLoadingShipment(shipment.id);
+    try {
+      const payload = await apiGet<ShipmentCandidatesResponse>(`/api/v1/phase6/predictions/${result.id}/shipments/${shipment.id}/candidates`);
+      setResult((current) => current ? {
+        ...current,
+        shipments: current.shipments.map((row) => row.id === shipment.id
+          ? { ...row, candidates: payload.candidates, candidates_loaded: true }
+          : row),
+      } : current);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Kandidat MT gagal dimuat.");
+    } finally {
+      setCandidateLoadingShipment(null);
+    }
+  }
+
   async function applyAssignmentOverride(shipment: Shipment, vehicleId: string) {
     if (!result || !shipment.assignment.id) return;
     setLoading(true);
     try {
-      setResult(await apiSend<PredictionResult>(
+      await apiSend<PredictionResult>(
         `/api/v1/phase6/predictions/${result.id}/assignments/${shipment.assignment.id}`,
         "PATCH",
         { vehicle_id: vehicleId, override_reason: overrideReason[shipment.id] || null },
-      ));
+      );
+      await loadPredictionPage(result.id, shipmentPage, shipmentsPerPage, shiftTab);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Override failed.");
     } finally {
@@ -525,11 +837,12 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
     if (!result) return;
     setLoading(true);
     try {
-      setResult(await apiSend<PredictionResult>(
+      await apiSend<PredictionResult>(
         `/api/v1/phase6/predictions/${result.id}/shipments/${shipment.id}`,
         "PATCH",
         { action, line_ids: lineIds, target_shipment_id: targetShipmentId || null },
-      ));
+      );
+      await loadPredictionPage(result.id, shipmentPage, shipmentsPerPage, shiftTab);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Shipment adjustment failed.");
     } finally {
@@ -540,8 +853,9 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
   async function openHistory(runId: string) {
     const historyRow = history.find((row) => row.id === runId);
     if (historyRow && (historyRow.status === "QUEUED" || historyRow.status === "RUNNING")) {
-      setResult(null);
-      setActiveRun({ id: historyRow.id, predictionRunId: historyRow.prediction_run_id, depotId: historyRow.depot_id });
+      setActiveRuns((current) => current.some((task) => task.id === historyRow.id)
+        ? current
+        : [...current, { id: historyRow.id, predictionRunId: historyRow.prediction_run_id, depotId: historyRow.depot_id }]);
       setRunFeedback({
         status: "RUNNING",
         message: `Prediction ${historyRow.prediction_run_id} masih berjalan di belakang layar. Hasil akan ditampilkan otomatis.`,
@@ -550,9 +864,7 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
     }
     setLoading(true);
     try {
-      const payload = await apiGet<PredictionResult>(`/api/v1/phase6/predictions/${runId}`);
-      setResult(payload);
-      setExpanded(payload.shipments[0]?.id ?? null);
+      await loadPredictionPage(runId, 1, shipmentsPerPage, "ALL");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Run could not be opened.");
     } finally {
@@ -583,13 +895,13 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
   }
 
   async function rerun(runId: string) {
-    if (activeRun) return;
     setLoading(true);
     setError(null);
     try {
       const queued = await apiSend<PredictionTask>(`/api/v1/phase6/predictions/${runId}/recalculate`, "POST", { model_id: modelId || null });
-      setResult(null);
-      setActiveRun({ id: queued.id, predictionRunId: queued.prediction_run_id, depotId });
+      setActiveRuns((current) => current.some((task) => task.id === queued.id)
+        ? current
+        : [...current, { id: queued.id, predictionRunId: queued.prediction_run_id, depotId }]);
       setRunFeedback({
         status: "RUNNING",
         message: `Prediction ${queued.prediction_run_id} telah masuk antrean retry/re-run dan akan diproses worker terpisah.`,
@@ -602,33 +914,39 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
     }
   }
 
-  const visibleShipments = useMemo(
-    () => result?.shipments.filter((shipment) => shiftTab === "ALL" || shipment.shift_id === shiftTab) ?? [],
-    [result, shiftTab],
-  );
-  const shipmentPageCount = Math.max(1, Math.ceil(visibleShipments.length / shipmentsPerPage));
-  const currentShipmentPage = Math.min(shipmentPage, shipmentPageCount);
-  const paginatedShipments = useMemo(() => {
-    const start = (currentShipmentPage - 1) * shipmentsPerPage;
-    return visibleShipments.slice(start, start + shipmentsPerPage);
-  }, [currentShipmentPage, shipmentsPerPage, visibleShipments]);
+  const visibleShipments = result?.shipments ?? [];
+  const shipmentPageCount = result?.shipment_pagination.total_pages ?? 1;
+  const currentShipmentPage = result?.shipment_pagination.page ?? shipmentPage;
+  const paginatedShipments = visibleShipments;
   const shipmentPaginationPages = useMemo(
     () => [...new Set([1, currentShipmentPage - 1, currentShipmentPage, currentShipmentPage + 1, shipmentPageCount])]
       .filter((page) => page >= 1 && page <= shipmentPageCount)
       .sort((left, right) => left - right),
     [currentShipmentPage, shipmentPageCount],
   );
-  const shipmentRangeStart = visibleShipments.length === 0 ? 0 : (currentShipmentPage - 1) * shipmentsPerPage + 1;
-  const shipmentRangeEnd = Math.min(currentShipmentPage * shipmentsPerPage, visibleShipments.length);
-
-  useEffect(() => {
-    setShipmentPage(1);
-    setExpanded(null);
-  }, [result?.id, shiftTab, shipmentsPerPage]);
+  const shipmentRangeStart = (result?.shipment_pagination.total ?? 0) === 0 ? 0 : (currentShipmentPage - 1) * shipmentsPerPage + 1;
+  const shipmentRangeEnd = Math.min(currentShipmentPage * shipmentsPerPage, result?.shipment_pagination.total ?? 0);
 
   function goToShipmentPage(page: number) {
-    setShipmentPage(Math.min(Math.max(1, page), shipmentPageCount));
-    setExpanded(null);
+    if (!result || resultPageLoading) return;
+    const target = Math.min(Math.max(1, page), shipmentPageCount);
+    void loadPredictionPage(result.id, target, shipmentsPerPage, shiftTab).catch((reason) => {
+      setError(reason instanceof Error ? reason.message : "Halaman shipment gagal dimuat.");
+    });
+  }
+
+  function changeShipmentShift(nextShift: string) {
+    if (!result || resultPageLoading) return;
+    void loadPredictionPage(result.id, 1, shipmentsPerPage, nextShift).catch((reason) => {
+      setError(reason instanceof Error ? reason.message : "Filter shift gagal dimuat.");
+    });
+  }
+
+  function changeShipmentsPerPage(nextSize: number) {
+    if (!result || resultPageLoading) return;
+    void loadPredictionPage(result.id, 1, nextSize, shiftTab).catch((reason) => {
+      setError(reason instanceof Error ? reason.message : "Ukuran halaman gagal diterapkan.");
+    });
   }
   const shifts = result?.summary_by_shift ?? [];
   const networkOption = useMemo(() => {
@@ -663,10 +981,13 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
     };
   }, [visibleShipments]);
 
-  const matrixVehicles = useMemo(
-    () => [...new Map(visibleShipments.flatMap((shipment) => shipment.candidates.map((candidate) => [candidate.vehicle_id, candidate.vehicle_registration_no]))).entries()],
-    [visibleShipments],
-  );
+  const matrixVehicles = useMemo(() => [...new Map(visibleShipments.flatMap((shipment) => {
+    const rows = shipment.candidates.map((candidate) => [candidate.vehicle_id, candidate.vehicle_registration_no] as [string, string]);
+    if (shipment.assignment.assigned_vehicle_id && shipment.assignment.assigned_vehicle_registration) {
+      rows.push([shipment.assignment.assigned_vehicle_id, shipment.assignment.assigned_vehicle_registration]);
+    }
+    return rows;
+  })).entries()], [visibleShipments]);
   const timelineRows = result?.mt_timeline ?? [];
   const timelinePageCount = Math.max(1, Math.ceil(timelineRows.length / mtPerTimelinePage));
   const currentTimelinePage = Math.min(timelinePage, timelinePageCount);
@@ -719,6 +1040,47 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
     };
   }, [paginatedTimelineRows]);
 
+  const hourlyDistributionOption = useMemo(() => {
+    const rows = result?.hourly_distribution ?? [];
+    return {
+      color: ["#0b73bf", "#b8d211"],
+      tooltip: {
+        trigger: "axis",
+        valueFormatter: (value: number) => `${Number(value).toLocaleString("id-ID", { maximumFractionDigits: 3 })} KL`,
+      },
+      legend: { data: ["KL tersalurkan per jam", "Kumulatif penyaluran"] },
+      grid: { left: 72, right: 72, top: 56, bottom: rows.length > 24 ? 78 : 48 },
+      xAxis: {
+        type: "category",
+        data: rows.map((row) => new Date(row.hour_start).toLocaleString("id-ID", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })),
+        axisLabel: { hideOverlap: true, rotate: rows.length > 12 ? 35 : 0 },
+      },
+      yAxis: [
+        { type: "value", name: "KL / jam", min: 0 },
+        { type: "value", name: "Kumulatif KL", min: 0 },
+      ],
+      dataZoom: rows.length > 24 ? [{ type: "inside" }, { type: "slider", height: 18 }] : [],
+      series: [
+        {
+          name: "KL tersalurkan per jam",
+          type: "bar",
+          barMaxWidth: 42,
+          data: rows.map((row) => row.delivered_kl),
+        },
+        {
+          name: "Kumulatif penyaluran",
+          type: "line",
+          yAxisIndex: 1,
+          smooth: true,
+          showSymbol: rows.length <= 48,
+          symbolSize: 7,
+          lineStyle: { width: 3 },
+          data: rows.map((row) => row.cumulative_kl),
+        },
+      ],
+    };
+  }, [result]);
+
   return (
     <div className="space-y-5">
       {error && <div className="flex items-start justify-between border border-rust bg-rust/5 px-4 py-3 text-sm text-rust"><span>{error}</span><button onClick={() => setError(null)}><XCircle size={17} /></button></div>}
@@ -727,10 +1089,10 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-petroink/50 p-4" role="dialog" aria-modal="true" aria-labelledby="demo-loading-order-title">
           <form className="w-full max-w-md border border-line bg-white p-5 shadow-xl" onSubmit={(event) => { event.preventDefault(); void generateDemoLoadingOrders(); }}>
             <div id="demo-loading-order-title" className="text-base font-semibold text-petroink">Buat Data Demo Loading Order</div>
-            <p className="mt-2 text-sm text-slate-500">Masukkan total order. Sistem membaginya menjadi Loading Order berkapasitas 8 KL, memilih SPBU aktif secara acak, lalu membuat timestamp siap-kirim yang sesuai shift model.</p>
+            <p className="mt-2 text-sm text-slate-500">Masukkan total order kelipatan 8 KL. Sistem membuat satu Loading Order 8 KL per kompartemen dan hanya memilih SPBU aktif yang tercakup model Fase 5. LO dibuat per kelompok cluster/shift agar data demo dapat menguji shipment multi-SPBU tanpa UNSEEN_SPBU.</p>
             <label className="mt-5 grid gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
               Total Order (KL)
-              <input autoFocus required className="border border-line px-3 py-2 text-base font-normal normal-case tracking-normal text-petroink" type="number" min="0.001" max="40000" step="0.001" value={demoTotalKl} onChange={(event) => setDemoTotalKl(event.target.value)} />
+              <input autoFocus required className="border border-line px-3 py-2 text-base font-normal normal-case tracking-normal text-petroink" type="number" min="8" max="40000" step="8" value={demoTotalKl} onChange={(event) => setDemoTotalKl(event.target.value)} />
             </label>
             <div className="mt-5 flex justify-end gap-2">
               <button type="button" className="border border-line px-4 py-2 text-sm" disabled={demoLoading} onClick={() => setDemoDialogOpen(false)}>Batal</button>
@@ -744,10 +1106,14 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-petroink/50 p-4" role="dialog" aria-modal="true" aria-labelledby="demo-mt-availability-title">
           <form className="w-full max-w-md border border-line bg-white p-5 shadow-xl" onSubmit={(event) => { event.preventDefault(); void generateDemoMtAvailability(); }}>
             <div id="demo-mt-availability-title" className="text-base font-semibold text-petroink">Buat Data Demo MT Availability</div>
-            <p className="mt-2 text-sm text-slate-500">Masukkan total kapasitas MT yang tersedia hari itu. Sistem memilih MT aktif dari master data secara acak dengan total kapasitas paling dekat ke target, lalu membuat jam availability acak.</p>
+            <p className="mt-2 text-sm text-slate-500">Masukkan total kapasitas MT yang tersedia hari itu. Sistem memilih MT aktif dari master data secara acak dengan total kapasitas paling dekat ke target. Secara default semua MT tersedia sejak awal operasional depot.</p>
             <label className="mt-5 grid gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
               Total Tonase / Kapasitas MT (KL)
               <input autoFocus required className="border border-line px-3 py-2 text-base font-normal normal-case tracking-normal text-petroink" type="number" min="0.001" max="40000" step="0.001" value={mtDemoTotalKl} onChange={(event) => setMtDemoTotalKl(event.target.value)} />
+            </label>
+            <label className="mt-4 flex cursor-pointer items-start gap-3 border border-line bg-slate-50 p-3 text-sm text-petroink">
+              <input className="mt-0.5 h-4 w-4 accent-petroblue" type="checkbox" checked={mtDemoRandomAvailability} onChange={(event) => setMtDemoRandomAvailability(event.target.checked)} />
+              <span><span className="font-semibold">Random availability</span><span className="mt-1 block text-xs text-slate-500">Jika dipilih, jam availability setiap MT dibuat acak antara awal shift pertama dan akhir shift terakhir. Jika tidak dipilih, semua MT tersedia tepat pada awal shift pertama.</span></span>
             </label>
             <div className="mt-5 flex justify-end gap-2">
               <button type="button" className="border border-line px-4 py-2 text-sm" disabled={mtDemoLoading} onClick={() => setMtDemoDialogOpen(false)}>Batal</button>
@@ -772,7 +1138,7 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
           </label>
           <label className="grid gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
             Max Pairing Gap (min)
-            <input className="border border-line px-3 py-2 text-sm font-normal normal-case tracking-normal text-petroink" type="number" min="0" max="1440" value={maximumPairingGap} onChange={(event) => setMaximumPairingGap(event.target.value)} />
+            <input className="border border-line px-3 py-2 text-sm font-normal normal-case tracking-normal text-petroink" type="number" min="0" max="1440" step="15" value={maximumPairingGap} onChange={(event) => setMaximumPairingGap(event.target.value)} title="Default 90 menit; grup tetap harus lolos kapasitas, confidence, dan kelayakan rute." />
           </label>
           <label className="grid gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
             Assignment Mode
@@ -879,7 +1245,7 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
           ) : <div className="mt-4 border border-mint bg-mint/5 p-3 text-sm text-mint">Both input files passed validation.</div>}
           <div className="mt-5">
             <div className="flex justify-end">
-              <button className="inline-flex items-center gap-2 bg-petroblue px-5 py-3 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-40" disabled={!canRun || loading || Boolean(activeRun)} onClick={() => void runPrediction()}>{loading || activeRun ? <RefreshCw className="animate-spin" size={16} /> : <Play size={16} />} {loading ? "Mengirim Task…" : activeRun ? "Prediction Berjalan…" : "Run Prediction"}</button>
+              <button className="inline-flex items-center gap-2 bg-petroblue px-5 py-3 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-40" disabled={!canRun || loading} onClick={() => void runPrediction()}>{loading ? <RefreshCw className="animate-spin" size={16} /> : <Play size={16} />} {loading ? "Mengirim Task…" : activeRuns.length > 0 ? `Kirim Prediction Baru (${activeRuns.length} aktif)` : "Run Prediction"}</button>
             </div>
             {runFeedback && (
               <div
@@ -912,7 +1278,7 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
             <div className="mb-4 flex flex-wrap items-center justify-between gap-3"><div><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">6. Prediction Summary · {result.prediction_run_id}</div><p className="mt-1 text-xs text-slate-500">Completed in {result.durations_ms.total} ms · model and input snapshots retained.</p></div><Badge value={result.status} /></div>
             <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6">
               <Metric label="Loading Orders" value={result.summary.loading_orders} /><Metric label="Order Volume" value={`${result.summary.total_order_kl.toLocaleString("id-ID", { maximumFractionDigits: 3 })} KL`} /><Metric label="Unique SPBU" value={result.summary.unique_spbu} /><Metric label="Shipments" value={result.summary.predicted_shipments} /><Metric label="Available MT" value={result.summary.available_mt} />
-              <Metric label="Assigned" value={result.summary.assigned_shipments} /><Metric label="Delayed" value={result.summary.assigned_with_delay} /><Metric label="Unassigned" value={result.summary.unassigned_shipments} /><Metric label="Multi-Trip MT" value={result.summary.multi_trip_mt} /><Metric label="Drive Fallback" value={result.summary.fallback_trips} /><Metric label="Avg MT" value={pct(result.summary.average_mt_assignment_confidence)} />
+              <Metric label="Assigned Shipments" value={result.summary.assigned_shipments} /><Metric label="Assigned LO" value={result.summary.assigned_loading_orders} /><Metric label="Assigned Volume" value={`${result.summary.assigned_order_kl.toLocaleString("id-ID")} KL`} /><Metric label="Delayed" value={result.summary.assigned_with_delay} /><Metric label="Unassigned Shipments" value={result.summary.unassigned_shipments} /><Metric label="Multi-Trip MT" value={result.summary.multi_trip_mt} /><Metric label="Drive Fallback" value={result.summary.fallback_trips} /><Metric label="Avg MT" value={pct(result.summary.average_mt_assignment_confidence)} />
             </div>
             <div className="mt-4 overflow-x-auto"><table className="min-w-full text-left text-sm"><thead className="bg-slate-50 text-xs uppercase text-slate-500"><tr>{["Derived Shift", "LO", "Volume (KL)", "SPBU", "Predicted Shipment", "Assigned", "Unassigned"].map((item) => <th key={item} className="px-3 py-2">{item}</th>)}</tr></thead><tbody>{result.summary_by_shift.map((row) => <tr key={String(row.shift_id)} className="border-t border-line"><td className="px-3 py-2 font-medium">{row.shift}</td><td className="px-3 py-2">{row.loading_orders}</td><td className="px-3 py-2">{row.total_order_kl}</td><td className="px-3 py-2">{row.unique_spbu}</td><td className="px-3 py-2">{row.predicted_shipments}</td><td className="px-3 py-2">{row.assigned}</td><td className="px-3 py-2">{row.unassigned}</td></tr>)}</tbody></table></div>
             <div className="mt-3 flex flex-wrap gap-2 text-xs text-slate-500"><span>Routes calls: {result.routing_metrics.google_routes_request_count ?? 0}</span><span>· Cache hits: {result.routing_metrics.google_routes_cache_hit_count ?? 0}</span><span>· Cache misses: {result.routing_metrics.google_routes_cache_miss_count ?? 0}</span></div>
@@ -920,10 +1286,10 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
 
           <section className="border border-line bg-white p-5">
             <div className="mb-4 flex flex-wrap items-end justify-between gap-4">
-              <div><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">7–8. Predicted Shipment & MT Assignment Result</div><div className="mt-3 flex flex-wrap gap-2"><button className={`border px-3 py-1 text-sm ${shiftTab === "ALL" ? "border-petroblue bg-petroblue text-white" : "border-line"}`} onClick={() => setShiftTab("ALL")}>All</button>{shifts.map((shift) => <button key={String(shift.shift_id)} className={`border px-3 py-1 text-sm ${shiftTab === shift.shift_id ? "border-petroblue bg-petroblue text-white" : "border-line"}`} onClick={() => setShiftTab(String(shift.shift_id))}>{shift.shift}</button>)}</div></div>
+              <div><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">7–8. Predicted Shipment & MT Assignment Result</div><div className="mt-3 flex flex-wrap gap-2"><button className={`border px-3 py-1 text-sm ${shiftTab === "ALL" ? "border-petroblue bg-petroblue text-white" : "border-line"}`} disabled={resultPageLoading} onClick={() => changeShipmentShift("ALL")}>All</button>{shifts.map((shift) => <button key={String(shift.shift_id)} className={`border px-3 py-1 text-sm ${shiftTab === shift.shift_id ? "border-petroblue bg-petroblue text-white" : "border-line"}`} disabled={resultPageLoading} onClick={() => changeShipmentShift(String(shift.shift_id))}>{shift.shift}</button>)}</div></div>
               <label className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-500">
                 Rows per page
-                <select className="border border-line bg-white px-3 py-2 text-sm font-normal normal-case tracking-normal text-petroink" value={shipmentsPerPage} onChange={(event) => setShipmentsPerPage(Number(event.target.value))}>
+                <select className="border border-line bg-white px-3 py-2 text-sm font-normal normal-case tracking-normal text-petroink" value={shipmentsPerPage} disabled={resultPageLoading} onChange={(event) => changeShipmentsPerPage(Number(event.target.value))}>
                   {[25, 50, 100].map((size) => <option key={size} value={size}>{size}</option>)}
                 </select>
               </label>
@@ -931,18 +1297,19 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
             <div className="overflow-x-auto">
               <table className="min-w-full text-left text-sm"><thead className="bg-slate-50 text-xs uppercase text-slate-500"><tr>{["", "Trip", "MT", "Shipment / SPBU", "Planned Start", "Predicted Departure", "Estimated Return", "Next Available", "Confidence", "Status"].map((item, index) => <th key={`${item}-${index}`} className="px-3 py-2">{item}</th>)}</tr></thead>
                 <tbody>{paginatedShipments.map((shipment) => (
-                  <>
-                    <tr key={shipment.id} className="border-t border-line align-top">
-                      <td className="px-3 py-3"><button onClick={() => setExpanded(expanded === shipment.id ? null : shipment.id)}>{expanded === shipment.id ? <ChevronDown size={17} /> : <ChevronRight size={17} />}</button></td>
-                      <td className="px-3 py-3 font-mono text-xs">{shipment.trip?.trip_id ?? "—"}<div className="mt-1 text-slate-400">#{shipment.trip?.trip_number ?? "—"}</div></td><td className="px-3 py-3">{shipment.assignment.assigned_vehicle_registration ?? "—"}</td><td className="px-3 py-3"><div className="font-mono text-xs">{shipment.predicted_shipment_id}</div><div className="mt-1">{shipment.lines.map((line) => line.spbu_no).join(" + ")}</div></td><td className="whitespace-nowrap px-3 py-3">{dateTime(shipment.planned_start_datetime)}<div className="mt-1 text-xs text-slate-400">{shipment.shift}</div></td><td className="whitespace-nowrap px-3 py-3">{dateTime(shipment.trip?.predicted_departure_datetime)}{Boolean(shipment.trip?.delay_minutes) && <div className="mt-1 text-xs text-amber">+{shipment.trip?.delay_minutes} min</div>}</td><td className="whitespace-nowrap px-3 py-3">{dateTime(shipment.trip?.estimated_return_datetime)}</td><td className="whitespace-nowrap px-3 py-3">{dateTime(shipment.trip?.next_available_datetime)}</td><td className="px-3 py-3"><div>{pct(shipment.shipment_prediction_score)} / {pct(shipment.assignment.mt_assignment_score)}</div>{shipment.trip?.routing_confidence && <Badge value={shipment.trip.routing_confidence} />}</td><td className="px-3 py-3"><Badge value={shipment.assignment.assignment_status} />{shipment.trip?.fallback_used && <div className="mt-1"><Badge value="ROUTE_FALLBACK" /></div>}{shipment.assignment.unassigned_reason && <div className="mt-1 text-xs text-rust">{shipment.assignment.unassigned_reason.replace(/_/g, " ")}</div>}</td>
+                  <Fragment key={shipment.id}>
+                    <tr className="border-t border-line align-top">
+                      <td className="px-3 py-3"><button aria-label={`${expanded === shipment.id ? "Tutup" : "Buka"} detail ${shipment.predicted_shipment_id}`} onClick={() => void toggleShipmentDetail(shipment)}>{expanded === shipment.id ? <ChevronDown size={17} /> : <ChevronRight size={17} />}</button></td>
+                      <td className="px-3 py-3 font-mono text-xs">{shipment.trip?.trip_id ?? "—"}<div className="mt-1 text-slate-400">#{shipment.trip?.trip_number ?? "—"}</div></td><td className="px-3 py-3">{shipment.assignment.assigned_vehicle_registration ?? "—"}{shipment.assignment.assigned_vehicle_capacity_kl !== null && <div className="mt-1 text-xs text-slate-400">{shipment.assignment.assigned_vehicle_capacity_kl} KL · {shipment.assignment.assigned_vehicle_compartments} compartment</div>}</td><td className="px-3 py-3"><div className="font-mono text-xs">{shipment.predicted_shipment_id}</div><div className="mt-1">{shipment.lines.map((line) => line.spbu_no).join(" → ")}</div><div className="mt-1 text-xs text-slate-400">{shipment.lines.length} LO · {shipment.total_order_kl} KL · {shipment.required_compartments} compartment</div></td><td className="whitespace-nowrap px-3 py-3">{dateTime(shipment.planned_start_datetime)}<div className="mt-1 text-xs text-slate-400">{shipment.shift}</div></td><td className="whitespace-nowrap px-3 py-3">{dateTime(shipment.trip?.predicted_departure_datetime)}{Boolean(shipment.trip?.delay_minutes) && <div className="mt-1 text-xs text-amber">+{shipment.trip?.delay_minutes} min</div>}</td><td className="whitespace-nowrap px-3 py-3">{dateTime(shipment.trip?.estimated_return_datetime)}</td><td className="whitespace-nowrap px-3 py-3">{dateTime(shipment.trip?.next_available_datetime)}</td><td className="px-3 py-3"><div>{pct(shipment.shipment_prediction_score)} / {pct(shipment.assignment.mt_assignment_score)}</div>{shipment.trip?.routing_confidence && <Badge value={shipment.trip.routing_confidence} />}</td><td className="px-3 py-3"><Badge value={shipment.assignment.assignment_status} />{shipment.trip?.fallback_used && <div className="mt-1"><Badge value="ROUTE_FALLBACK" /></div>}{shipment.assignment.unassigned_reason && <div className="mt-1 text-xs text-rust">{shipment.assignment.unassigned_reason.replace(/_/g, " ")}</div>}</td>
                     </tr>
                     {expanded === shipment.id && (
                       <tr key={`${shipment.id}-detail`} className="border-t border-line bg-slate-50/60"><td colSpan={10} className="p-4">
                         <div className="grid gap-5 xl:grid-cols-2">
                           <div>
                             <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Loading Orders & Shipment Override</div>
+                            <div className="mt-2 border border-petroblue/30 bg-petroblue/5 p-3 text-xs text-petroblue"><strong>{shipment.predicted_shipment_id}</strong> · {shipment.total_order_kl} KL · {shipment.required_compartments} × {shipment.compartment_unit_kl} KL compartment · SPBU {shipment.lines.map((line) => line.spbu_no).join(" → ")}</div>
                             <div className="mt-2 space-y-2">{shipment.lines.map((line) => (
-                              <div key={line.id} className="flex flex-wrap items-center justify-between gap-2 border border-line bg-white p-3 text-sm"><div><span className="font-medium">{line.loading_order_no}</span> · {line.spbu_no} {line.spbu_name && `· ${line.spbu_name}`} {line.order_quantity_kl !== null && `· ${line.order_quantity_kl} KL`}<div className="mt-1 text-[11px] text-slate-400">Ready: {dateTime(line.shipment_start_datetime)} · Model layer: {line.model_predicted_shipment_id}</div></div><div className="flex flex-wrap gap-2"><button className="inline-flex items-center gap-1 border border-line px-2 py-1 text-xs" disabled={shipment.lines.length === 1 || loading} onClick={() => void adjustShipment(shipment, "SPLIT_SINGLE", [line.id])}><Split size={13} /> New single</button><select className="border border-line bg-white px-2 py-1 text-xs" value={moveTargets[line.id] ?? ""} onChange={(event) => setMoveTargets((current) => ({ ...current, [line.id]: event.target.value }))}><option value="">Move to…</option>{result.shipments.filter((item) => item.shift_id === shipment.shift_id && item.id !== shipment.id).map((item) => <option key={item.id} value={item.id}>{item.predicted_shipment_id}</option>)}</select><button className="border border-line px-2 py-1 text-xs disabled:opacity-40" disabled={!moveTargets[line.id] || loading} onClick={() => void adjustShipment(shipment, "MOVE_LINES", [line.id], moveTargets[line.id])}>Move</button></div></div>
+                              <div key={line.id} className="flex flex-wrap items-center justify-between gap-2 border border-line bg-white p-3 text-sm"><div><span className="font-medium">{line.loading_order_no}</span> · {line.spbu_no} {line.spbu_name && `· ${line.spbu_name}`} {line.order_quantity_kl !== null && `· ${line.order_quantity_kl} KL`}<div className="mt-1 text-[11px] text-slate-400">Ready: {dateTime(line.shipment_start_datetime)} · Model layer: {line.model_predicted_shipment_id}</div></div><div className="flex flex-wrap gap-2"><button className="inline-flex items-center gap-1 border border-line px-2 py-1 text-xs" disabled={shipment.lines.length === 1 || loading} onClick={() => void adjustShipment(shipment, "SPLIT_SINGLE", [line.id])}><Split size={13} /> New single</button><select className="border border-line bg-white px-2 py-1 text-xs" value={moveTargets[line.id] ?? ""} onChange={(event) => setMoveTargets((current) => ({ ...current, [line.id]: event.target.value }))}><option value="">Move to…</option>{result.shipment_options.filter((item) => item.shift_id === shipment.shift_id && item.id !== shipment.id).map((item) => <option key={item.id} value={item.id}>{item.predicted_shipment_id}</option>)}</select><button className="border border-line px-2 py-1 text-xs disabled:opacity-40" disabled={!moveTargets[line.id] || loading} onClick={() => void adjustShipment(shipment, "MOVE_LINES", [line.id], moveTargets[line.id])}>Move</button></div></div>
                             ))}</div>
                             <div className="mt-4 text-xs font-semibold uppercase tracking-wide text-slate-500">Structured Shipment Explanation</div>
                             <dl className="mt-2 grid gap-2 sm:grid-cols-2">{explanationRows(shipment.explanation).map(([key, value]) => <div key={key} className="border border-line bg-white p-2"><dt className="text-[11px] uppercase text-slate-400">{key.replace(/_/g, " ")}</dt><dd className="mt-1 text-xs">{String(value)}</dd></div>)}</dl>
@@ -951,27 +1318,28 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
                           <div>
                             <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Recommended MT & Change MT</div>
                             <input className="mt-2 w-full border border-line bg-white px-3 py-2 text-sm" placeholder="Optional override reason" value={overrideReason[shipment.id] ?? ""} onChange={(event) => setOverrideReason((current) => ({ ...current, [shipment.id]: event.target.value }))} />
-                            <div className="mt-2 overflow-x-auto"><table className="min-w-full bg-white text-left text-xs"><thead><tr className="border-b border-line text-slate-500"><th className="p-2">Rank</th><th className="p-2">MT</th><th className="p-2">Score</th><th className="p-2">Compatibility</th><th className="p-2">Action</th></tr></thead><tbody>{shipment.candidates.filter((candidate) => candidate.compatibility_status === "PASS").map((candidate) => <tr key={candidate.id} className="border-b border-line"><td className="p-2">{candidate.candidate_rank}</td><td className="p-2">{candidate.vehicle_registration_no}</td><td className="p-2">{pct(candidate.prediction_score)}</td><td className="p-2"><Badge value="PASS" /></td><td className="p-2"><button className="border border-petroblue px-2 py-1 text-petroblue disabled:opacity-40" disabled={candidate.vehicle_id === shipment.assignment.assigned_vehicle_id || loading} onClick={() => void applyAssignmentOverride(shipment, candidate.vehicle_id)}>Change MT</button></td></tr>)}</tbody></table></div>
+                            {candidateLoadingShipment === shipment.id && <div className="mt-2 flex items-center gap-2 border border-petroblue/30 bg-petroblue/5 p-3 text-xs text-petroblue" role="status"><RefreshCw className="animate-spin" size={14} /> Memuat kandidat MT saat detail dibuka…</div>}
+                            <div className="mt-2 overflow-x-auto"><table className="min-w-full bg-white text-left text-xs"><thead><tr className="border-b border-line text-slate-500"><th className="p-2">Rank</th><th className="p-2">MT</th><th className="p-2">Capacity</th><th className="p-2">Score</th><th className="p-2">Compatibility</th><th className="p-2">Action</th></tr></thead><tbody>{shipment.candidates.filter((candidate) => candidate.compatibility_status === "PASS").map((candidate) => <tr key={candidate.id} className="border-b border-line"><td className="p-2">{candidate.candidate_rank}</td><td className="p-2">{candidate.vehicle_registration_no}</td><td className="p-2">{candidate.capacity_kl ?? "—"} KL · {candidate.number_of_compartments ?? "—"} compartment</td><td className="p-2">{pct(candidate.prediction_score)}</td><td className="p-2"><Badge value="PASS" /></td><td className="p-2"><button className="border border-petroblue px-2 py-1 text-petroblue disabled:opacity-40" disabled={candidate.vehicle_id === shipment.assignment.assigned_vehicle_id || loading} onClick={() => void applyAssignmentOverride(shipment, candidate.vehicle_id)}>Change MT</button></td></tr>)}</tbody></table></div>
                             {shipment.candidates.some((candidate) => candidate.compatibility_status === "FAIL") && <div className="mt-4"><div className="text-xs font-semibold uppercase tracking-wide text-rust">Excluded Candidate</div>{shipment.candidates.filter((candidate) => candidate.compatibility_status === "FAIL").map((candidate) => <div key={candidate.id} className="mt-2 border border-rust/30 bg-rust/5 p-2 text-xs"><span className="font-medium">{candidate.vehicle_registration_no}</span> · {candidate.exclusion_reason}</div>)}</div>}
                           </div>
                         </div>
                       </td></tr>
                     )}
-                  </>
+                  </Fragment>
                 ))}</tbody>
               </table>
             </div>
             <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-line pt-4 text-sm">
-              <div className="text-slate-500">Showing {shipmentRangeStart.toLocaleString("id-ID")}–{shipmentRangeEnd.toLocaleString("id-ID")} of {visibleShipments.length.toLocaleString("id-ID")} shipments</div>
+              <div className="text-slate-500">Showing {shipmentRangeStart.toLocaleString("id-ID")}–{shipmentRangeEnd.toLocaleString("id-ID")} of {(result?.shipment_pagination.total ?? 0).toLocaleString("id-ID")} shipments {resultPageLoading && "· memuat halaman…"}</div>
               <div className="flex items-center gap-1">
-                <button className="border border-line px-3 py-2 disabled:cursor-not-allowed disabled:opacity-40" disabled={currentShipmentPage === 1} onClick={() => goToShipmentPage(currentShipmentPage - 1)}>Previous</button>
+                <button className="border border-line px-3 py-2 disabled:cursor-not-allowed disabled:opacity-40" disabled={currentShipmentPage === 1 || resultPageLoading} onClick={() => goToShipmentPage(currentShipmentPage - 1)}>Previous</button>
                 {shipmentPaginationPages.map((page, index) => (
                   <span key={page} className="contents">
                     {index > 0 && page - shipmentPaginationPages[index - 1] > 1 && <span className="px-1 text-slate-400">…</span>}
-                    <button className={`min-w-9 border px-3 py-2 ${page === currentShipmentPage ? "border-petroblue bg-petroblue text-white" : "border-line"}`} aria-current={page === currentShipmentPage ? "page" : undefined} onClick={() => goToShipmentPage(page)}>{page}</button>
+                    <button className={`min-w-9 border px-3 py-2 disabled:opacity-40 ${page === currentShipmentPage ? "border-petroblue bg-petroblue text-white" : "border-line"}`} disabled={resultPageLoading} aria-current={page === currentShipmentPage ? "page" : undefined} onClick={() => goToShipmentPage(page)}>{page}</button>
                   </span>
                 ))}
-                <button className="border border-line px-3 py-2 disabled:cursor-not-allowed disabled:opacity-40" disabled={currentShipmentPage === shipmentPageCount} onClick={() => goToShipmentPage(currentShipmentPage + 1)}>Next</button>
+                <button className="border border-line px-3 py-2 disabled:cursor-not-allowed disabled:opacity-40" disabled={currentShipmentPage === shipmentPageCount || resultPageLoading} onClick={() => goToShipmentPage(currentShipmentPage + 1)}>Next</button>
               </div>
             </div>
           </section>
@@ -1013,16 +1381,32 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
               return <td key={vehicleId} className={`p-2 ${assigned ? "outline outline-2 outline-petroblue" : ""}`} style={{ backgroundColor: candidate?.compatibility_status === "PASS" ? `rgba(184,210,17,${Math.max(0.08, candidate.prediction_score)})` : undefined }}>{candidate ? candidate.compatibility_status === "FAIL" ? "X" : pct(candidate.prediction_score) : "—"}</td>;
             })}</tr>)}</tbody></table></div></div>
           </section>
+
+          <section className="grid gap-5">
+            <div className="border border-line bg-white p-5">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">10A. Penyaluran KL per Jam & Kumulatif</div>
+                  <p className="mt-1 text-xs text-slate-500">Hanya assigned shipment, dikelompokkan berdasarkan predicted departure pada zona waktu depot. Manual assignment dan perubahan shipment menghitung ulang grafik ini bersama jadwal multi-trip.</p>
+                </div>
+                <div className="border border-line bg-slate-50 px-4 py-2 text-right text-xs text-slate-500"><span className="block uppercase tracking-wide">Total assigned</span><strong className="mt-1 block text-lg text-petroink">{result.summary.assigned_order_kl.toLocaleString("id-ID", { maximumFractionDigits: 3 })} KL</strong></div>
+              </div>
+              {result.hourly_distribution.length > 0
+                ? <ReactECharts option={hourlyDistributionOption} style={{ height: 430 }} />
+                : <div className="mt-4 border border-dashed border-line p-6 text-center text-sm text-slate-500">Belum ada assigned shipment untuk dihitung.</div>}
+            </div>
+            <GeographicMTRouteMap payload={result.geographic_routes} runId={result.id} />
+          </section>
         </>
       )}
 
       <section className="border border-line bg-white p-5">
-        <div className="mb-4 flex flex-wrap items-start justify-between gap-3"><div><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">10. Prediction Run History</div><p className="mt-1 text-xs text-slate-500">View and export immutable runs, or create a new run from an input snapshot.</p>{historyFeedback && <p className={`mt-2 text-xs ${historyFeedback.status === "SUCCESS" ? "text-mint" : "text-rust"}`} role="status" aria-live="polite">{historyFeedback.message}</p>}</div>{depotId && <button className="inline-flex items-center gap-2 border border-line px-3 py-2 text-sm disabled:cursor-wait disabled:opacity-50" disabled={historyRefreshing} onClick={() => void refreshHistory()}><RefreshCw className={historyRefreshing ? "animate-spin" : ""} size={14} /> {historyRefreshing ? "Memperbarui…" : "Refresh"}</button>}</div>
-        {history.length === 0 ? <div className="border border-dashed border-line p-6 text-center text-sm text-slate-500">No prediction runs for the selected depot.</div> : <div className="overflow-x-auto"><table className="min-w-full text-left text-sm"><thead className="bg-slate-50 text-xs uppercase text-slate-500"><tr>{["Run ID", "Date", "Status", "Depot", "Model", "LO", "Shipment", "Assigned", "Unassigned", "User", "Actions"].map((item) => <th key={item} className="px-3 py-2">{item}</th>)}</tr></thead><tbody>{history.map((row) => <tr key={row.id} className="border-t border-line"><td className="px-3 py-2 font-mono text-xs">{row.prediction_run_id}</td><td className="px-3 py-2">{new Date(row.date).toLocaleString()}</td><td className="px-3 py-2"><Badge value={row.status} />{["QUEUED", "RUNNING"].includes(row.status) && <div className="mt-1 whitespace-nowrap text-[11px] text-slate-500">Attempt {Math.max(1, row.attempt_count)}/{Math.max(1, row.max_attempts)}{row.heartbeat_at ? ` · heartbeat ${new Date(row.heartbeat_at).toLocaleTimeString("id-ID")}` : ""}</div>}</td><td className="px-3 py-2">{row.depot}</td><td className="px-3 py-2">{row.model}</td><td className="px-3 py-2">{row.loading_orders}</td><td className="px-3 py-2">{row.shipments}</td><td className="px-3 py-2">{row.assigned}</td><td className="px-3 py-2">{row.unassigned}</td><td className="px-3 py-2">{row.user}</td><td className="px-3 py-2"><div className="flex gap-2"><button title="View" className="border border-line p-2" onClick={() => void openHistory(row.id)}><Eye size={14} /></button><button title="Download" className="border border-line p-2 disabled:opacity-40" disabled={row.status !== "COMPLETED"} onClick={() => downloadFromApi(`/api/v1/phase6/predictions/${row.id}/export`, `${row.prediction_run_id}.xlsx`)}><Download size={14} /></button><button title={row.status === "FAILED" ? "Retry from saved input" : "Duplicate / Re-run"} className="border border-line p-2 disabled:opacity-40" disabled={!(["COMPLETED", "FAILED"].includes(row.status)) || loading || Boolean(activeRun)} onClick={() => void rerun(row.id)}><RefreshCw size={14} /></button></div></td></tr>)}</tbody></table></div>}
+        <div className="mb-4 flex flex-wrap items-start justify-between gap-3"><div><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">11. Prediction Run History</div><p className="mt-1 text-xs text-slate-500">View and export immutable runs, or create a new run from an input snapshot.</p>{historyFeedback && <p className={`mt-2 text-xs ${historyFeedback.status === "SUCCESS" ? "text-mint" : "text-rust"}`} role="status" aria-live="polite">{historyFeedback.message}</p>}</div>{depotId && <button className="inline-flex items-center gap-2 border border-line px-3 py-2 text-sm disabled:cursor-wait disabled:opacity-50" disabled={historyRefreshing} onClick={() => void refreshHistory()}><RefreshCw className={historyRefreshing ? "animate-spin" : ""} size={14} /> {historyRefreshing ? "Memperbarui…" : "Refresh"}</button>}</div>
+        {history.length === 0 ? <div className="border border-dashed border-line p-6 text-center text-sm text-slate-500">No prediction runs for the selected depot.</div> : <div className="overflow-x-auto"><table className="min-w-full text-left text-sm"><thead className="bg-slate-50 text-xs uppercase text-slate-500"><tr>{["Run ID", "Date", "Status", "Depot", "Model", "LO", "Shipment", "Assigned", "Unassigned", "User", "Actions"].map((item) => <th key={item} className="px-3 py-2">{item}</th>)}</tr></thead><tbody>{history.map((row) => <tr key={row.id} className="border-t border-line"><td className="px-3 py-2 font-mono text-xs">{row.prediction_run_id}</td><td className="px-3 py-2">{new Date(row.date).toLocaleString()}</td><td className="px-3 py-2"><Badge value={row.status} />{["QUEUED", "RUNNING"].includes(row.status) && <div className="mt-1 whitespace-nowrap text-[11px] text-slate-500">Attempt {Math.max(1, row.attempt_count)}/{Math.max(1, row.max_attempts)}{row.heartbeat_at ? ` · heartbeat ${new Date(row.heartbeat_at).toLocaleTimeString("id-ID")}` : ""}</div>}</td><td className="px-3 py-2">{row.depot}</td><td className="px-3 py-2">{row.model}</td><td className="px-3 py-2">{row.loading_orders}</td><td className="px-3 py-2">{row.shipments}</td><td className="px-3 py-2">{row.assigned}</td><td className="px-3 py-2">{row.unassigned}</td><td className="px-3 py-2">{row.user}</td><td className="px-3 py-2"><div className="flex gap-2"><button title="View" className="border border-line p-2" onClick={() => void openHistory(row.id)}><Eye size={14} /></button><button title="Download" className="border border-line p-2 disabled:opacity-40" disabled={row.status !== "COMPLETED"} onClick={() => downloadFromApi(`/api/v1/phase6/predictions/${row.id}/export`, `${row.prediction_run_id}.xlsx`)}><Download size={14} /></button><button title={row.status === "FAILED" ? "Retry from saved input" : "Duplicate / Re-run"} className="border border-line p-2 disabled:opacity-40" disabled={!(["COMPLETED", "FAILED"].includes(row.status)) || loading} onClick={() => void rerun(row.id)}><RefreshCw size={14} /></button></div></td></tr>)}</tbody></table></div>}
       </section>
 
       <section className="border border-line bg-white p-5">
-        <div className="flex flex-wrap items-center justify-between gap-3"><div><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">11. Export Result</div><p className="mt-1 text-xs text-slate-500">Summary, Shipment Result, MT Assignment, MT Candidates, and Validation sheets.</p></div><button className="inline-flex items-center gap-2 bg-petroblue px-4 py-2 text-sm font-semibold text-white disabled:opacity-40" disabled={!result} onClick={() => result && downloadFromApi(`/api/v1/phase6/predictions/${result.id}/export`, `${result.prediction_run_id}.xlsx`)}><Download size={16} /> Export Prediction Result</button></div>
+        <div className="flex flex-wrap items-center justify-between gap-3"><div><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">12. Export Result</div><p className="mt-1 text-xs text-slate-500">Summary, Shipment Result, MT Assignment, MT Candidates, and Validation sheets.</p></div><button className="inline-flex items-center gap-2 bg-petroblue px-4 py-2 text-sm font-semibold text-white disabled:opacity-40" disabled={!result} onClick={() => result && downloadFromApi(`/api/v1/phase6/predictions/${result.id}/export`, `${result.prediction_run_id}.xlsx`)}><Download size={16} /> Export Prediction Result</button></div>
       </section>
     </div>
   );
