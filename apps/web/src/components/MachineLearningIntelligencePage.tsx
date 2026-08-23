@@ -250,6 +250,9 @@ function Metric({ title, value, hint }: { title: string; value: string | number;
 type MappedAssignment = Assignment & { latitude: number; longitude: number };
 type DepotLocation = { depot_id: string; depot_name: string; latitude: number | null; longitude: number | null };
 type MappedDepotLocation = DepotLocation & { latitude: number; longitude: number };
+type GeographicMapFocus = "DEPOT_REGION" | "ALL";
+
+const DEPOT_FOCUS_RADIUS_KM = 150;
 
 function hasGeographicCoordinates(assignment: Assignment): assignment is MappedAssignment {
   return typeof assignment.latitude === "number"
@@ -274,18 +277,43 @@ function hasDepotCoordinates(depot: DepotLocation | null): depot is MappedDepotL
     && depot.longitude <= 180;
 }
 
-function FitGeographicBounds({ assignments, depot }: { assignments: MappedAssignment[]; depot: MappedDepotLocation | null }) {
+function geographicDistanceKm(
+  origin: { latitude: number; longitude: number },
+  destination: { latitude: number; longitude: number }
+) {
+  const degreesToRadians = (value: number) => value * Math.PI / 180;
+  const earthRadiusKm = 6371;
+  const latitudeDelta = degreesToRadians(destination.latitude - origin.latitude);
+  const longitudeDelta = degreesToRadians(destination.longitude - origin.longitude);
+  const originLatitude = degreesToRadians(origin.latitude);
+  const destinationLatitude = degreesToRadians(destination.latitude);
+  const haversine = Math.sin(latitudeDelta / 2) ** 2
+    + Math.cos(originLatitude) * Math.cos(destinationLatitude) * Math.sin(longitudeDelta / 2) ** 2;
+
+  return earthRadiusKm * 2 * Math.atan2(Math.sqrt(haversine), Math.sqrt(1 - haversine));
+}
+
+function FitGeographicBounds({ assignments, depot, focus }: {
+  assignments: MappedAssignment[];
+  depot: MappedDepotLocation | null;
+  focus: GeographicMapFocus;
+}) {
   const map = useMap();
 
   useEffect(() => {
-    const positions = assignments.map((assignment) => [assignment.latitude, assignment.longitude] as [number, number]);
+    const focusedAssignments = focus === "DEPOT_REGION" && depot
+      ? assignments.filter((assignment) => geographicDistanceKm(depot, assignment) <= DEPOT_FOCUS_RADIUS_KM)
+      : assignments;
+    const assignmentsForBounds = focusedAssignments.length ? focusedAssignments : assignments;
+    const positions = assignmentsForBounds.map((assignment) => [assignment.latitude, assignment.longitude] as [number, number]);
     if (depot) positions.push([depot.latitude, depot.longitude]);
     if (!positions.length) return;
+    map.invalidateSize({ animate: false });
     map.fitBounds(
       positions,
       { padding: [28, 28], maxZoom: 12 }
     );
-  }, [assignments, depot, map]);
+  }, [assignments, depot, focus, map]);
 
   return null;
 }
@@ -293,11 +321,25 @@ function FitGeographicBounds({ assignments, depot }: { assignments: MappedAssign
 function GeographicClusterMap({ assignments, depot }: { assignments: Assignment[]; depot: DepotLocation | null }) {
   const mappedAssignments = useMemo(() => assignments.filter(hasGeographicCoordinates), [assignments]);
   const mappedDepot = hasDepotCoordinates(depot) ? depot : null;
+  const depotRegionAssignments = useMemo(
+    () => mappedDepot
+      ? mappedAssignments.filter((assignment) => geographicDistanceKm(mappedDepot, assignment) <= DEPOT_FOCUS_RADIUS_KM)
+      : [],
+    [mappedAssignments, mappedDepot]
+  );
+  const defaultMapFocus: GeographicMapFocus = mappedDepot && mappedAssignments.length > 250 && depotRegionAssignments.length
+    ? "DEPOT_REGION"
+    : "ALL";
+  const [mapFocus, setMapFocus] = useState<GeographicMapFocus>(defaultMapFocus);
   const clusterLabels = useMemo(
     () => Array.from(new Set(mappedAssignments.map((assignment) => assignment.cluster_label))),
     [mappedAssignments]
   );
   const missingCoordinateCount = assignments.length - mappedAssignments.length;
+
+  useEffect(() => {
+    setMapFocus(defaultMapFocus);
+  }, [assignments, defaultMapFocus]);
 
   return (
     <div className="border border-line bg-white p-4 lg:col-span-2">
@@ -312,6 +354,28 @@ function GeographicClusterMap({ assignments, depot }: { assignments: Assignment[
       </div>
       {mappedAssignments.length || mappedDepot ? (
         <>
+          <div className="mt-3 flex flex-col gap-2 border border-line bg-slate-50 px-3 py-2 sm:flex-row sm:items-center sm:justify-between">
+            <div className="text-xs text-slate-600">
+              Semua marker tetap berada pada koordinat Master SPBU; pilihan berikut hanya mengubah area tampilan peta.
+            </div>
+            <div className="flex shrink-0 flex-wrap items-center gap-2" aria-label="Geographic map focus">
+              <button
+                type="button"
+                className={`border px-3 py-1.5 text-xs font-semibold ${mapFocus === "DEPOT_REGION" ? "border-petroblue bg-petroblue text-white" : "border-line bg-white text-petroink hover:border-petroblue"}`}
+                disabled={!mappedDepot || !depotRegionAssignments.length}
+                onClick={() => setMapFocus("DEPOT_REGION")}
+              >
+                Fokus Depot ≤ {DEPOT_FOCUS_RADIUS_KM} km ({depotRegionAssignments.length.toLocaleString()})
+              </button>
+              <button
+                type="button"
+                className={`border px-3 py-1.5 text-xs font-semibold ${mapFocus === "ALL" ? "border-petroblue bg-petroblue text-white" : "border-line bg-white text-petroink hover:border-petroblue"}`}
+                onClick={() => setMapFocus("ALL")}
+              >
+                Tampilkan Semua ({mappedAssignments.length.toLocaleString()})
+              </button>
+            </div>
+          </div>
           <div className="relative z-0 mt-3 overflow-hidden rounded-2xl border border-line" role="region" aria-label="Geographic cluster map using Master SPBU and Master Depot coordinates">
             <MapContainer
               center={mappedDepot ? [mappedDepot.latitude, mappedDepot.longitude] : [mappedAssignments[0].latitude, mappedAssignments[0].longitude]}
@@ -324,7 +388,7 @@ function GeographicClusterMap({ assignments, depot }: { assignments: Assignment[
                 attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
                 url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
               />
-              <FitGeographicBounds assignments={mappedAssignments} depot={mappedDepot} />
+              <FitGeographicBounds assignments={mappedAssignments} depot={mappedDepot} focus={mapFocus} />
               {mappedAssignments.map((assignment) => (
                 <CircleMarker
                   key={assignment.spbu_id}

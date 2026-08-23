@@ -1,4 +1,4 @@
-import { AlertTriangle, ArrowDown, ArrowUp, ArrowUpDown, CalendarDays, CheckCircle2, ChevronLeft, ChevronRight, Database, Download, Eye, FileUp, GitBranch, Pencil, Plus, RefreshCw, Route, Save, Search, Trash2, X } from "lucide-react";
+import { AlertTriangle, ArrowDown, ArrowUp, ArrowUpDown, CalendarDays, CheckCircle2, ChevronLeft, ChevronRight, Database, Download, Eye, FileUp, GitBranch, MapPinned, Menu, Pencil, Plus, RefreshCw, Route, Save, Search, Trash2, UserCircle, X } from "lucide-react";
 import ReactECharts from "echarts-for-react";
 import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
 import "./index.css";
@@ -8,6 +8,8 @@ import { AffinityIntelligencePage } from "./components/AffinityIntelligencePage"
 import { MachineLearningIntelligencePage } from "./components/MachineLearningIntelligencePage";
 import { PredictionAssignmentPage } from "./components/PredictionAssignmentPage";
 import { GoogleMapsIntegrationPage } from "./components/GoogleMapsIntegrationPage";
+import { AppSidebar, type AppPage } from "./components/AppSidebar";
+import { DocumentationPage } from "./components/DocumentationPage";
 
 type Overview = Record<string, number>;
 type Charts = Record<string, SeriesPoint[]>;
@@ -75,7 +77,59 @@ type CrudDomainConfig = {
   depotFilter?: boolean;
   statusFilter?: boolean;
 };
-type Page = "dashboard" | "master-data" | "tag-consistency" | "departure-intelligence" | "pairing-intelligence" | "affinity-intelligence" | "machine-learning-intelligence" | "prediction-assignment" | "google-maps-integration";
+type Page = AppPage;
+const pageMetadata: Record<Page, { eyebrow: string; title: string; description: string }> = {
+  dashboard: {
+    eyebrow: "Overview",
+    title: "Dashboard",
+    description: "Data foundation overview and operational intelligence summary.",
+  },
+  "master-data": {
+    eyebrow: "Data Foundation",
+    title: "Master Data Management",
+    description: "Manage canonical MT, SPBU, depot, product, tag, and loading-order records.",
+  },
+  "tag-consistency": {
+    eyebrow: "Data Foundation",
+    title: "Tag Consistency Analysis",
+    description: "Evaluate daily Loading Order assignments against MT–SPBU tagging rules.",
+  },
+  "departure-intelligence": {
+    eyebrow: "Phase 2 · Intelligence",
+    title: "Depot Departure Time Intelligence",
+    description: "Historical depot departure profiles and operational shift patterns by SPBU.",
+  },
+  "pairing-intelligence": {
+    eyebrow: "Phase 3 · Intelligence",
+    title: "SPBU Pairing Probability Intelligence",
+    description: "Same-shipment SPBU relationship intelligence with directional GPS evidence.",
+  },
+  "affinity-intelligence": {
+    eyebrow: "Phase 4 · Intelligence",
+    title: "SPBU–MT Affinity & Stability",
+    description: "Historical SPBU–MT affinity, concentration, and temporal stability intelligence.",
+  },
+  "machine-learning-intelligence": {
+    eyebrow: "Phase 5 · Intelligence",
+    title: "Machine Learning Intelligence",
+    description: "Historical concentration anomaly detection and SPBU behavioral clustering.",
+  },
+  "prediction-assignment": {
+    eyebrow: "Phase 6 · Planning",
+    title: "Prediction & Assignment",
+    description: "Time-aware shipment prediction, rolling multi-trip MT assignment, and availability estimates.",
+  },
+  "google-maps-integration": {
+    eyebrow: "Settings",
+    title: "Google Maps Integration",
+    description: "Secure DRIVE-only route estimation, cache, fallback, and cycle-time settings.",
+  },
+  documentation: {
+    eyebrow: "Support",
+    title: "Documentation",
+    description: "Panduan fungsi, penggunaan, cara membaca card, rumus, dan contoh perhitungan.",
+  },
+};
 type CrudPageSize = 10 | 50 | 100 | "ALL";
 type CrudSortDirection = "asc" | "desc";
 type CrudModalMode = "add" | "edit" | null;
@@ -702,6 +756,7 @@ function pageFromPath(pathname: string): Page {
   if (pathname === "/machine-learning-intelligence") return "machine-learning-intelligence";
   if (pathname === "/prediction-assignment") return "prediction-assignment";
   if (pathname === "/settings/google-maps-integration") return "google-maps-integration";
+  if (pathname === "/documentation") return "documentation";
   return "dashboard";
 }
 
@@ -992,6 +1047,8 @@ function initialTagConsistencyFilters(): TagConsistencyFilters {
 
 function App() {
   const [currentPage, setCurrentPage] = useState<Page>(() => pageFromPath(window.location.pathname));
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => window.localStorage.getItem("dispatch-sidebar-collapsed") === "true");
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [overview, setOverview] = useState<Overview>({});
   const [charts, setCharts] = useState<Charts>({});
   const [imports, setImports] = useState<ImportAudit[]>([]);
@@ -2152,83 +2209,80 @@ function App() {
                     ? "/prediction-assignment"
                     : page === "google-maps-integration"
                       ? "/settings/google-maps-integration"
+                      : page === "documentation"
+                        ? "/documentation"
               : "/";
     if (window.location.pathname !== path) {
       window.history.pushState({}, "", path);
     }
     setCurrentPage(page);
+    setMobileSidebarOpen(false);
   }
 
-  function pageNavButtonClass(page: Page) {
-    return `rounded-full border px-4 py-2 text-sm font-semibold transition ${
-      currentPage === page
-        ? "border-transparent bg-gradient-to-r from-petrolime to-lime-300 text-petroink shadow-sm"
-        : "border-petroblue/10 bg-white/85 text-slate-600 hover:border-petrolime/50 hover:bg-petrocloud hover:text-petroblue"
-    }`;
+  function toggleSidebarCollapsed() {
+    setSidebarCollapsed((current) => {
+      const next = !current;
+      window.localStorage.setItem("dispatch-sidebar-collapsed", String(next));
+      return next;
+    });
   }
+
+  const activePageMetadata = pageMetadata[currentPage];
 
   return (
-    <main className="min-h-screen bg-transparent text-petroink">
-      <header className="px-5 pt-5">
-        <div className="mx-auto flex max-w-7xl flex-col gap-4 rounded-[28px] border border-petroblue/10 bg-gradient-to-br from-white via-white to-petrocloud/70 px-5 py-5 shadow-card lg:flex-row lg:items-center lg:justify-between">
-          <div>
-            <div className="mb-2 inline-flex items-center rounded-full bg-petrolime/15 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-petroblue">
-              Petrofin Dispatch Analytics
-            </div>
-            <h1 className="font-display text-2xl font-semibold text-petroink">Dispatch Intelligence Platform</h1>
-            <p className="mt-1 text-sm text-slate-600">
-              {currentPage === "master-data"
-                ? "Master Data Management"
-                : currentPage === "tag-consistency"
-                  ? "Evaluate daily Loading Order assignments against MT-SPBU tagging rules."
-                  : currentPage === "departure-intelligence"
-                    ? "Phase 2 historical depot departure profiles by SPBU."
-                    : currentPage === "pairing-intelligence"
-                      ? "Phase 3 same-shipment SPBU relationship intelligence."
-                      : currentPage === "affinity-intelligence"
-                        ? "Phase 4 historical SPBU–MT affinity and temporal stability intelligence."
-                        : currentPage === "machine-learning-intelligence"
-                          ? "Phase 5 historical concentration anomaly detection and SPBU behavioral clustering."
-                          : currentPage === "prediction-assignment"
-                            ? "Phase 6 time-aware shipment prediction, rolling multi-trip MT assignment, and availability estimates."
-                            : currentPage === "google-maps-integration"
-                              ? "Secure Google Routes integration with DRIVE-only estimation, cache, fallback, and cycle-time settings."
-                  : "Data Foundation Overview"}
-            </p>
-          </div>
-          <div className="flex flex-wrap justify-end gap-2">
-            <button className={pageNavButtonClass("dashboard")} onClick={() => navigate("dashboard")} title="Open dashboard visualization">
-              Dashboard
-            </button>
-            <button className={pageNavButtonClass("master-data")} onClick={() => navigate("master-data")} title="Open master data CRUD">
-              Master Data
-            </button>
-            <button className={pageNavButtonClass("tag-consistency")} onClick={() => navigate("tag-consistency")} title="Open tag consistency analysis">
-              Tag Consistency Analysis
-            </button>
-            <button className={pageNavButtonClass("departure-intelligence")} onClick={() => navigate("departure-intelligence")} title="Open Phase 2 departure intelligence">
-              Phase 2 - Depot Departure Time Intelligence
-            </button>
-            <button className={pageNavButtonClass("pairing-intelligence")} onClick={() => navigate("pairing-intelligence")} title="Open Phase 3 SPBU pairing probability intelligence">
-              Phase 3 - SPBU Pairing Probability Intelligence
-            </button>
-            <button className={pageNavButtonClass("affinity-intelligence")} onClick={() => navigate("affinity-intelligence")} title="Open Phase 4 SPBU-MT historical affinity and stability intelligence">
-              Phase 4 - SPBU–MT Affinity & Stability
-            </button>
-            <button className={pageNavButtonClass("machine-learning-intelligence")} onClick={() => navigate("machine-learning-intelligence")} title="Open Phase 5 Machine Learning Intelligence">
-              Phase 5 - Machine Learning Intelligence
-            </button>
-            <button className={pageNavButtonClass("prediction-assignment")} onClick={() => navigate("prediction-assignment")} title="Open Phase 6 Prediction and Assignment">
-              Phase 6 - Prediction & Assignment
-            </button>
-            <button className={pageNavButtonClass("google-maps-integration")} onClick={() => navigate("google-maps-integration")} title="Open Google Maps Integration settings">
-              Settings - Google Maps
-            </button>
-          </div>
-        </div>
-      </header>
+    <div className={`app-shell ${sidebarCollapsed ? "sidebar-is-collapsed" : ""}`}>
+      <AppSidebar
+        currentPage={currentPage}
+        collapsed={sidebarCollapsed}
+        mobileOpen={mobileSidebarOpen}
+        onNavigate={navigate}
+        onToggleCollapsed={toggleSidebarCollapsed}
+        onCloseMobile={() => setMobileSidebarOpen(false)}
+      />
 
-      <div className="mx-auto max-w-7xl px-5 py-5">
+      <main className="app-main min-h-screen bg-transparent text-petroink">
+        <header className="app-topbar">
+          <div className="app-topbar-left">
+            <button
+              type="button"
+              className="mobile-menu-button"
+              onClick={() => setMobileSidebarOpen(true)}
+              aria-label="Open navigation menu"
+            >
+              <Menu size={20} />
+            </button>
+            <div className="topbar-context">
+              <span>Dispatch Intelligence</span>
+              <strong>{activePageMetadata.title}</strong>
+            </div>
+          </div>
+          <div className="app-topbar-actions">
+            <button
+              type="button"
+              className="topbar-settings-button"
+              onClick={() => navigate("google-maps-integration")}
+            >
+              <MapPinned size={18} />
+              <span>Google Maps Settings</span>
+            </button>
+            <div className="topbar-profile" aria-label="Current workspace profile">
+              <span className="topbar-avatar"><UserCircle size={22} /></span>
+              <span className="topbar-profile-copy">
+                <strong>Petrofin</strong>
+                <small>Operations</small>
+              </span>
+            </div>
+          </div>
+        </header>
+
+        <div className="app-content mx-auto max-w-[1600px] px-5 py-5 lg:px-7 lg:py-6">
+          {currentPage !== "documentation" && (
+            <section className="app-page-intro">
+              <div className="app-page-eyebrow">{activePageMetadata.eyebrow}</div>
+              <h1>{activePageMetadata.title}</h1>
+              <p>{activePageMetadata.description}</p>
+            </section>
+          )}
         {error && <div className="mb-4 border border-rust bg-white px-4 py-3 text-sm text-rust">{error}</div>}
         {shiftHelpOpen && (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/35 px-4">
@@ -2299,6 +2353,10 @@ function App() {
 
         {currentPage === "google-maps-integration" && (
           <GoogleMapsIntegrationPage />
+        )}
+
+        {currentPage === "documentation" && (
+          <DocumentationPage onNavigate={navigate} />
         )}
 
         {currentPage === "pairing-intelligence" && (
@@ -3937,8 +3995,9 @@ function App() {
           </div>
         </div>
         )}
-      </div>
-    </main>
+        </div>
+      </main>
+    </div>
   );
 }
 

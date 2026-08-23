@@ -42,6 +42,9 @@ WEB_PORT=3001 docker compose up -d web
 - Phase 5 - Machine Learning Intelligence: `/machine-learning-intelligence`
 - Phase 6 - Shipment & MT Assignment Prediction: `/prediction-assignment`
 - Settings - Google Maps Integration: `/settings/google-maps-integration`
+- Documentation - Panduan Pengguna: `/documentation`
+
+Halaman Documentation menyediakan panduan Bahasa Indonesia untuk seluruh page aktif, tree table of contents yang dapat diklik, deep-link per topik, pencarian card/metric/rumus, cara penggunaan, cara membaca output, formula, dan contoh perhitungan.
 
 Tema UI saat ini diselaraskan dengan aplikasi `vrp_planner` dan palet Petrofin:
 
