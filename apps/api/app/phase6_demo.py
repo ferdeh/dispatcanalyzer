@@ -101,13 +101,15 @@ def generate_demo_loading_orders(
             },
         )
 
-    covered_rows = db.execute(
+    historical_rows = db.execute(
         select(MasterSPBU, MLSPBUClusterAssignment)
         .join(MLSPBUClusterAssignment, MLSPBUClusterAssignment.spbu_id == MasterSPBU.spbu_id)
         .where(
             MasterSPBU.primary_depot_id == depot_id,
             MasterSPBU.active_status == "ACTIVE",
             MLSPBUClusterAssignment.model_id == model.model_id,
+            MLSPBUClusterAssignment.history_eligible.is_(True),
+            MLSPBUClusterAssignment.coverage_source == "BEHAVIORAL_HISTORY",
             MLSPBUClusterAssignment.is_noise.is_(False),
             MLSPBUClusterAssignment.cluster_id.is_not(None),
         )
@@ -117,12 +119,12 @@ def generate_demo_loading_orders(
             MasterSPBU.spbu_code,
         )
     ).all()
-    if not covered_rows:
+    if not historical_rows:
         raise HTTPException(
             status_code=409,
             detail={
                 "code": "DEMO_MODEL_COVERAGE_NOT_FOUND",
-                "message": "The selected Phase 5 model has no active, non-noise SPBU coverage for demo generation.",
+                "message": "The selected Phase 5 model has no active, non-noise SPBU with sufficient historical shipment evidence for demo generation.",
             },
         )
 
@@ -142,16 +144,15 @@ def generate_demo_loading_orders(
     token = f"{seed % 1_000_000:06d}"
     planning_day = datetime.now(depot_timezone).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
     shift_by_name = {shift["name"]: shift for shift in shifts}
-    strong_rows = [
+    demo_pool = [
         (spbu, assignment)
-        for spbu, assignment in covered_rows
-        if float(assignment.membership_probability) >= 0.5 and assignment.dominant_shift in shift_by_name
-    ]
-    demo_pool = strong_rows or [
-        (spbu, assignment)
-        for spbu, assignment in covered_rows
+        for spbu, assignment in historical_rows
         if assignment.dominant_shift in shift_by_name
-    ] or list(covered_rows)
+    ]
+    # Legacy model snapshots can contain a historical assignment whose shift label
+    # is no longer present. Keep the model-history restriction, then derive a
+    # usable shift below instead of falling back to cold-start SPBU coverage.
+    demo_pool = demo_pool or list(historical_rows)
     coverage_buckets: dict[tuple[int, str], list[tuple[MasterSPBU, MLSPBUClusterAssignment]]] = {}
     for spbu, assignment in demo_pool:
         key = (int(assignment.cluster_id), assignment.dominant_shift)

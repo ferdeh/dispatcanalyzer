@@ -22,7 +22,7 @@ from .models import (
     MasterSPBU,
     PredictionRun,
 )
-from .phase5_behavioral import artifact_checksum
+from .phase5_behavioral import _cluster_profiles, artifact_checksum
 from .phase5_readiness import require_phase5_readiness
 
 
@@ -66,6 +66,10 @@ def save_behavioral_model(db: Session, training_run_id: str, *, model_name: str,
         training_end_date=run.training_end_date,
         training_shipment_count=int(run.dataset_summary.get("shipment_count", 0)),
         training_spbu_count=int(summary["training_spbu_count"]),
+        total_covered_spbu_count=int(summary.get("total_covered_spbu_count", summary["training_spbu_count"])),
+        cold_start_covered_spbu_count=int(summary.get("cold_start_covered_spbu_count", 0)),
+        no_history_spbu_count=int(summary.get("no_history_spbu_count", 0)),
+        insufficient_history_spbu_count=int(summary.get("insufficient_history_spbu_count", 0)),
         minimum_shipment_observation=run.minimum_shipment_observation,
         tag_feature_configuration=run.dataset_payload.get("tag_feature_configuration", {}),
         tag_encoder_reference={
@@ -119,6 +123,9 @@ def save_behavioral_model(db: Session, training_run_id: str, *, model_name: str,
                     cluster_label=assignment["cluster_label"],
                     membership_probability=assignment["membership_probability"],
                     is_noise=assignment["is_noise"],
+                    shipment_observation_count=assignment.get("shipment_observation_count", 0),
+                    coverage_source=assignment.get("coverage_source", "BEHAVIORAL_HISTORY"),
+                    history_eligible=bool(assignment.get("history_eligible", True)),
                     dominant_shift=assignment["dominant_shift"],
                     key_tags=assignment["key_tags"],
                     visualization_x=assignment["visualization_x"],
@@ -133,6 +140,9 @@ def save_behavioral_model(db: Session, training_run_id: str, *, model_name: str,
                     cluster_id=profile["cluster_id"],
                     cluster_label=profile["cluster_label"],
                     cluster_size=profile["cluster_size"],
+                    historical_member_count=profile.get("historical_member_count", profile["cluster_size"]),
+                    cold_start_member_count=profile.get("cold_start_member_count", 0),
+                    no_history_member_count=profile.get("no_history_member_count", 0),
                     training_spbu_percentage=profile["training_spbu_percentage"],
                     common_tags=profile["common_tags"],
                     shift_distribution=profile["shift_distribution"],
@@ -177,6 +187,11 @@ def _model_summary(model: MLBehavioralModel, depot_name: str | None = None) -> d
         "training_end_date": model.training_end_date.isoformat(),
         "training_shipment_count": model.training_shipment_count,
         "training_spbu_count": model.training_spbu_count,
+        "historical_training_spbu_count": model.training_spbu_count,
+        "total_covered_spbu_count": model.total_covered_spbu_count,
+        "cold_start_covered_spbu_count": model.cold_start_covered_spbu_count,
+        "no_history_spbu_count": model.no_history_spbu_count,
+        "insufficient_history_spbu_count": model.insufficient_history_spbu_count,
         "minimum_shipment_observation": model.minimum_shipment_observation,
         "cluster_count": model.cluster_count,
         "noise_spbu_count": model.noise_spbu_count,
@@ -213,6 +228,65 @@ def get_behavioral_model(db: Session, model_id: str) -> dict:
     artifacts = db.scalars(select(MLModelArtifact).where(MLModelArtifact.model_id == model_id)).all()
     spbu_ids = [assignment.spbu_id for assignment in assignments]
     spbus = {row.spbu_id: row for row in (db.scalars(select(MasterSPBU).where(MasterSPBU.spbu_id.in_(spbu_ids))).all() if spbu_ids else [])}
+    assignment_payloads = [
+        {
+            "spbu_id": assignment.spbu_id,
+            "spbu_code": spbus[assignment.spbu_id].spbu_code if assignment.spbu_id in spbus else assignment.spbu_id,
+            "spbu_name": spbus[assignment.spbu_id].spbu_name if assignment.spbu_id in spbus else None,
+            "latitude": (
+                float(spbus[assignment.spbu_id].latitude)
+                if assignment.spbu_id in spbus and spbus[assignment.spbu_id].latitude is not None
+                else None
+            ),
+            "longitude": (
+                float(spbus[assignment.spbu_id].longitude)
+                if assignment.spbu_id in spbus and spbus[assignment.spbu_id].longitude is not None
+                else None
+            ),
+            "shipment_observation_count": assignment.shipment_observation_count,
+            "coverage_source": assignment.coverage_source,
+            "history_eligible": assignment.history_eligible,
+            "cluster_id": assignment.cluster_id,
+            "cluster_label": assignment.cluster_label,
+            "membership_probability": assignment.membership_probability,
+            "is_noise": assignment.is_noise,
+            "dominant_shift": assignment.dominant_shift,
+            "vehicle_class": spbus[assignment.spbu_id].vehicle_type_tag if assignment.spbu_id in spbus else None,
+            "key_tags": assignment.key_tags,
+            "visualization_x": assignment.visualization_x,
+            "visualization_y": assignment.visualization_y,
+        }
+        for assignment in assignments
+    ]
+    stored_profile_payloads = [
+        {
+            "cluster_id": profile.cluster_id,
+            "cluster_label": profile.cluster_label,
+            "cluster_size": profile.cluster_size,
+            "historical_member_count": profile.historical_member_count,
+            "cold_start_member_count": profile.cold_start_member_count,
+            "no_history_member_count": profile.no_history_member_count,
+            "training_spbu_percentage": profile.training_spbu_percentage,
+            "common_tags": profile.common_tags,
+            "shift_distribution": profile.shift_distribution,
+            "dominant_shift": profile.dominant_shift,
+            "top_internal_pairings": profile.top_internal_pairings,
+            "average_membership_probability": profile.average_membership_probability,
+            "low_confidence_member_count": profile.low_confidence_member_count,
+            "evidence_scope": "Historical members only; cold-start coverage is reported separately.",
+        }
+        for profile in profiles
+    ]
+    source_run = db.get(MLTrainingRun, model.source_training_run_id) if model.source_training_run_id else None
+    if source_run and (source_run.dataset_payload or {}).get("records"):
+        profile_payloads = _cluster_profiles(
+            assignment_payloads,
+            source_run.dataset_payload.get("records", []),
+            source_run.dataset_payload.get("pair_rows", []),
+            model.shift_definition_snapshot,
+        )
+    else:
+        profile_payloads = stored_profile_payloads
     return {
         **_model_summary(model, depot.depot_name if depot else None),
         "tag_feature_configuration": model.tag_feature_configuration,
@@ -225,48 +299,8 @@ def get_behavioral_model(db: Session, model_id: str) -> dict:
         "dependency_metadata": model.dependency_metadata,
         "library_versions": model.library_versions,
         "random_seed": model.random_seed,
-        "assignments": [
-            {
-                "spbu_id": assignment.spbu_id,
-                "spbu_code": spbus[assignment.spbu_id].spbu_code if assignment.spbu_id in spbus else assignment.spbu_id,
-                "spbu_name": spbus[assignment.spbu_id].spbu_name if assignment.spbu_id in spbus else None,
-                "latitude": (
-                    float(spbus[assignment.spbu_id].latitude)
-                    if assignment.spbu_id in spbus and spbus[assignment.spbu_id].latitude is not None
-                    else None
-                ),
-                "longitude": (
-                    float(spbus[assignment.spbu_id].longitude)
-                    if assignment.spbu_id in spbus and spbus[assignment.spbu_id].longitude is not None
-                    else None
-                ),
-                "cluster_id": assignment.cluster_id,
-                "cluster_label": assignment.cluster_label,
-                "membership_probability": assignment.membership_probability,
-                "is_noise": assignment.is_noise,
-                "dominant_shift": assignment.dominant_shift,
-                "vehicle_class": spbus[assignment.spbu_id].vehicle_type_tag if assignment.spbu_id in spbus else None,
-                "key_tags": assignment.key_tags,
-                "visualization_x": assignment.visualization_x,
-                "visualization_y": assignment.visualization_y,
-            }
-            for assignment in assignments
-        ],
-        "cluster_profiles": [
-            {
-                "cluster_id": profile.cluster_id,
-                "cluster_label": profile.cluster_label,
-                "cluster_size": profile.cluster_size,
-                "training_spbu_percentage": profile.training_spbu_percentage,
-                "common_tags": profile.common_tags,
-                "shift_distribution": profile.shift_distribution,
-                "dominant_shift": profile.dominant_shift,
-                "top_internal_pairings": profile.top_internal_pairings,
-                "average_membership_probability": profile.average_membership_probability,
-                "low_confidence_member_count": profile.low_confidence_member_count,
-            }
-            for profile in profiles
-        ],
+        "assignments": assignment_payloads,
+        "cluster_profiles": profile_payloads,
         "artifacts": [
             {
                 "artifact_type": artifact.artifact_type,
@@ -341,6 +375,8 @@ def _assignment_sets(db: Session, model_id: str) -> tuple[dict[int, set[str]], s
     noise = set()
     lookup = {}
     for assignment in assignments:
+        if not assignment.history_eligible:
+            continue
         lookup[assignment.spbu_id] = assignment
         if assignment.is_noise or assignment.cluster_id is None:
             noise.add(assignment.spbu_id)
@@ -439,5 +475,5 @@ def compare_behavioral_models(db: Session, model_a_id: str, model_b_id: str) -> 
         "removed_spbu_ids": sorted(set(lookup_a) - set(lookup_b)),
         "cluster_splits": splits,
         "cluster_merges": merges,
-        "methodology": "Cluster IDs are ignored. Hungarian optimal matching maximizes Jaccard similarity between SPBU membership sets; stable neighborhood requires a matched-cluster Jaccard score >= 0.5.",
+        "methodology": "Only sufficient-history SPBUs are compared; cold-start coverage is excluded. Cluster IDs are ignored. Hungarian optimal matching maximizes Jaccard similarity between historical SPBU membership sets; stable neighborhood requires a matched-cluster Jaccard score >= 0.5.",
     }

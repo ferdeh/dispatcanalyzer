@@ -96,6 +96,9 @@ type Shipment = {
     spbu_id: string;
     spbu_no: string;
     spbu_name: string | null;
+    cluster_id: number | null;
+    cluster_number: number | null;
+    cluster_label: string | null;
     order_quantity_kl: number | null;
     model_predicted_shipment_id: string;
   }>;
@@ -123,6 +126,15 @@ type HourlyDistribution = {
   cumulative_kl: number;
   shipment_count: number;
   loading_order_count: number;
+};
+type CapacityIteration = {
+  tier_compartments: number;
+  tier_capacity_kl: number;
+  loading_orders_considered: number;
+  candidate_shipments: number;
+  assigned_shipments: number;
+  assigned_loading_orders: number;
+  carried_forward_loading_orders: number;
 };
 type GeographicRoutePoint = {
   type: "DEPOT" | "SPBU" | "DEPOT_RETURN";
@@ -214,7 +226,19 @@ type PredictionResult = {
     total_pages: number;
     shift_id: string | null;
   };
-  shipment_options: Array<{ id: string; predicted_shipment_id: string; shift_id: string; shift: string }>;
+  shipment_options: Array<{
+    id: string;
+    predicted_shipment_id: string;
+    shift_id: string;
+    shift: string;
+    spbus: Array<{
+      spbu_id: string;
+      spbu_no: string;
+      cluster_id: number | null;
+      cluster_number: number | null;
+      cluster_label: string | null;
+    }>;
+  }>;
   shipments: Shipment[];
   trips: Trip[];
   hourly_distribution: HourlyDistribution[];
@@ -298,6 +322,21 @@ function explanationRows(value: Record<string, unknown>) {
 
 function dateTime(value: string | null | undefined) {
   return value ? new Date(value).toLocaleString("id-ID") : "—";
+}
+
+function clusterText(item: { cluster_number: number | null; cluster_label: string | null }) {
+  if (item.cluster_number !== null) return `Cluster ${item.cluster_number}`;
+  return item.cluster_label?.trim() || "Cluster —";
+}
+
+function spbuClusterText(lines: Array<{
+  spbu_id: string;
+  spbu_no: string;
+  cluster_number: number | null;
+  cluster_label: string | null;
+}>) {
+  const uniqueSpbus = [...new Map(lines.map((line) => [line.spbu_id, line])).values()];
+  return uniqueSpbus.map((line) => `SPBU ${line.spbu_no} · ${clusterText(line)}`).join(" → ");
 }
 
 function durationMinutes(value: number | null | undefined) {
@@ -489,6 +528,8 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
   const [history, setHistory] = useState<HistoryRow[]>([]);
   const [historyRefreshing, setHistoryRefreshing] = useState(false);
   const [historyFeedback, setHistoryFeedback] = useState<{ status: "SUCCESS" | "ERROR"; message: string } | null>(null);
+  const [historyPage, setHistoryPage] = useState(1);
+  const [historyPerPage, setHistoryPerPage] = useState(10);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [runFeedback, setRunFeedback] = useState<{ status: "RUNNING" | "SUCCESS" | "ERROR"; message: string } | null>(null);
@@ -533,6 +574,7 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
 
   useEffect(() => {
     setActiveRuns([]);
+    setHistoryPage(1);
     setModelId("");
     setModels([]);
     setLoadingOrderFile(null);
@@ -880,6 +922,7 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
       const rows = await apiGet<HistoryRow[]>(`/api/v1/phase6/predictions?depot_id=${encodeURIComponent(depotId)}`);
       setHistory(rows);
       if (!silent) {
+        setHistoryPage(1);
         setHistoryFeedback({
           status: "SUCCESS",
           message: `History diperbarui pada ${new Date().toLocaleTimeString("id-ID")}.`,
@@ -926,6 +969,29 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
   );
   const shipmentRangeStart = (result?.shipment_pagination.total ?? 0) === 0 ? 0 : (currentShipmentPage - 1) * shipmentsPerPage + 1;
   const shipmentRangeEnd = Math.min(currentShipmentPage * shipmentsPerPage, result?.shipment_pagination.total ?? 0);
+  const historyPageCount = Math.max(1, Math.ceil(history.length / historyPerPage));
+  const currentHistoryPage = Math.min(historyPage, historyPageCount);
+  const paginatedHistory = useMemo(() => {
+    const start = (currentHistoryPage - 1) * historyPerPage;
+    return history.slice(start, start + historyPerPage);
+  }, [currentHistoryPage, history, historyPerPage]);
+  const historyPaginationPages = useMemo(
+    () => [...new Set([1, currentHistoryPage - 1, currentHistoryPage, currentHistoryPage + 1, historyPageCount])]
+      .filter((page) => page >= 1 && page <= historyPageCount)
+      .sort((left, right) => left - right),
+    [currentHistoryPage, historyPageCount],
+  );
+  const historyRangeStart = history.length === 0 ? 0 : (currentHistoryPage - 1) * historyPerPage + 1;
+  const historyRangeEnd = Math.min(currentHistoryPage * historyPerPage, history.length);
+
+  function goToHistoryPage(page: number) {
+    setHistoryPage(Math.min(Math.max(1, page), historyPageCount));
+  }
+
+  function changeHistoryPerPage(nextSize: number) {
+    setHistoryPerPage(nextSize);
+    setHistoryPage(1);
+  }
 
   function goToShipmentPage(page: number) {
     if (!result || resultPageLoading) return;
@@ -1089,7 +1155,7 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-petroink/50 p-4" role="dialog" aria-modal="true" aria-labelledby="demo-loading-order-title">
           <form className="w-full max-w-md border border-line bg-white p-5 shadow-xl" onSubmit={(event) => { event.preventDefault(); void generateDemoLoadingOrders(); }}>
             <div id="demo-loading-order-title" className="text-base font-semibold text-petroink">Buat Data Demo Loading Order</div>
-            <p className="mt-2 text-sm text-slate-500">Masukkan total order kelipatan 8 KL. Sistem membuat satu Loading Order 8 KL per kompartemen dan hanya memilih SPBU aktif yang tercakup model Fase 5. LO dibuat per kelompok cluster/shift agar data demo dapat menguji shipment multi-SPBU tanpa UNSEEN_SPBU.</p>
+            <p className="mt-2 text-sm text-slate-500">Masukkan total order kelipatan 8 KL. Sistem membuat satu Loading Order 8 KL per kompartemen dan hanya memilih SPBU aktif yang memiliki histori shipment cukup pada model Fase 5 terpilih. SPBU cold-start, noise, tidak aktif, dan yang tidak tercakup model tidak digunakan. LO dibuat per kelompok cluster/shift agar data demo dapat menguji shipment multi-SPBU tanpa UNSEEN_SPBU.</p>
             <label className="mt-5 grid gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
               Total Order (KL)
               <input autoFocus required className="border border-line px-3 py-2 text-base font-normal normal-case tracking-normal text-petroink" type="number" min="8" max="40000" step="8" value={demoTotalKl} onChange={(event) => setDemoTotalKl(event.target.value)} />
@@ -1280,6 +1346,21 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
               <Metric label="Loading Orders" value={result.summary.loading_orders} /><Metric label="Order Volume" value={`${result.summary.total_order_kl.toLocaleString("id-ID", { maximumFractionDigits: 3 })} KL`} /><Metric label="Unique SPBU" value={result.summary.unique_spbu} /><Metric label="Shipments" value={result.summary.predicted_shipments} /><Metric label="Available MT" value={result.summary.available_mt} />
               <Metric label="Assigned Shipments" value={result.summary.assigned_shipments} /><Metric label="Assigned LO" value={result.summary.assigned_loading_orders} /><Metric label="Assigned Volume" value={`${result.summary.assigned_order_kl.toLocaleString("id-ID")} KL`} /><Metric label="Delayed" value={result.summary.assigned_with_delay} /><Metric label="Unassigned Shipments" value={result.summary.unassigned_shipments} /><Metric label="Multi-Trip MT" value={result.summary.multi_trip_mt} /><Metric label="Drive Fallback" value={result.summary.fallback_trips} /><Metric label="Avg MT" value={pct(result.summary.average_mt_assignment_confidence)} />
             </div>
+            {Array.isArray(result.model.capacity_iteration_summary) && (
+              <div className="mt-4 border border-petroblue/30 bg-petroblue/5 p-3">
+                <div className="text-xs font-semibold uppercase tracking-wide text-petroblue">Iterasi Kapasitas 32 → 24 → 16 → 8 KL</div>
+                <div className="mt-1 text-xs text-slate-500">Exact full-load wajib: kapasitas shipment harus sama dengan kapasitas MT. Partial load tidak digunakan.</div>
+                <div className="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+                  {(result.model.capacity_iteration_summary as CapacityIteration[]).map((row) => (
+                    <div key={row.tier_capacity_kl} className="border border-petroblue/20 bg-white p-3 text-xs">
+                      <div className="font-semibold text-petroink">{row.tier_capacity_kl} KL · {row.tier_compartments} LO</div>
+                      <div className="mt-1 text-slate-500">Assigned {row.assigned_shipments} shipment / {row.assigned_loading_orders} LO</div>
+                      <div className="mt-1 text-slate-400">Diteruskan ke tier berikutnya: {row.carried_forward_loading_orders} LO</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
             <div className="mt-4 overflow-x-auto"><table className="min-w-full text-left text-sm"><thead className="bg-slate-50 text-xs uppercase text-slate-500"><tr>{["Derived Shift", "LO", "Volume (KL)", "SPBU", "Predicted Shipment", "Assigned", "Unassigned"].map((item) => <th key={item} className="px-3 py-2">{item}</th>)}</tr></thead><tbody>{result.summary_by_shift.map((row) => <tr key={String(row.shift_id)} className="border-t border-line"><td className="px-3 py-2 font-medium">{row.shift}</td><td className="px-3 py-2">{row.loading_orders}</td><td className="px-3 py-2">{row.total_order_kl}</td><td className="px-3 py-2">{row.unique_spbu}</td><td className="px-3 py-2">{row.predicted_shipments}</td><td className="px-3 py-2">{row.assigned}</td><td className="px-3 py-2">{row.unassigned}</td></tr>)}</tbody></table></div>
             <div className="mt-3 flex flex-wrap gap-2 text-xs text-slate-500"><span>Routes calls: {result.routing_metrics.google_routes_request_count ?? 0}</span><span>· Cache hits: {result.routing_metrics.google_routes_cache_hit_count ?? 0}</span><span>· Cache misses: {result.routing_metrics.google_routes_cache_miss_count ?? 0}</span></div>
           </section>
@@ -1307,9 +1388,9 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
                         <div className="grid gap-5 xl:grid-cols-2">
                           <div>
                             <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Loading Orders & Shipment Override</div>
-                            <div className="mt-2 border border-petroblue/30 bg-petroblue/5 p-3 text-xs text-petroblue"><strong>{shipment.predicted_shipment_id}</strong> · {shipment.total_order_kl} KL · {shipment.required_compartments} × {shipment.compartment_unit_kl} KL compartment · SPBU {shipment.lines.map((line) => line.spbu_no).join(" → ")}</div>
+                            <div className="mt-2 border border-petroblue/30 bg-petroblue/5 p-3 text-xs text-petroblue"><strong>{shipment.predicted_shipment_id}</strong> · {shipment.total_order_kl} KL · {shipment.required_compartments} × {shipment.compartment_unit_kl} KL compartment · {spbuClusterText(shipment.lines)}</div>
                             <div className="mt-2 space-y-2">{shipment.lines.map((line) => (
-                              <div key={line.id} className="flex flex-wrap items-center justify-between gap-2 border border-line bg-white p-3 text-sm"><div><span className="font-medium">{line.loading_order_no}</span> · {line.spbu_no} {line.spbu_name && `· ${line.spbu_name}`} {line.order_quantity_kl !== null && `· ${line.order_quantity_kl} KL`}<div className="mt-1 text-[11px] text-slate-400">Ready: {dateTime(line.shipment_start_datetime)} · Model layer: {line.model_predicted_shipment_id}</div></div><div className="flex flex-wrap gap-2"><button className="inline-flex items-center gap-1 border border-line px-2 py-1 text-xs" disabled={shipment.lines.length === 1 || loading} onClick={() => void adjustShipment(shipment, "SPLIT_SINGLE", [line.id])}><Split size={13} /> New single</button><select className="border border-line bg-white px-2 py-1 text-xs" value={moveTargets[line.id] ?? ""} onChange={(event) => setMoveTargets((current) => ({ ...current, [line.id]: event.target.value }))}><option value="">Move to…</option>{result.shipment_options.filter((item) => item.shift_id === shipment.shift_id && item.id !== shipment.id).map((item) => <option key={item.id} value={item.id}>{item.predicted_shipment_id}</option>)}</select><button className="border border-line px-2 py-1 text-xs disabled:opacity-40" disabled={!moveTargets[line.id] || loading} onClick={() => void adjustShipment(shipment, "MOVE_LINES", [line.id], moveTargets[line.id])}>Move</button></div></div>
+                              <div key={line.id} className="flex flex-wrap items-center justify-between gap-2 border border-line bg-white p-3 text-sm"><div><span className="font-medium">{line.loading_order_no}</span> · SPBU {line.spbu_no} · {clusterText(line)} {line.spbu_name && `· ${line.spbu_name}`} {line.order_quantity_kl !== null && `· ${line.order_quantity_kl} KL`}<div className="mt-1 text-[11px] text-slate-400">Ready: {dateTime(line.shipment_start_datetime)} · Model layer: {line.model_predicted_shipment_id}</div></div><div className="flex flex-wrap gap-2"><button className="inline-flex items-center gap-1 border border-line px-2 py-1 text-xs" disabled={shipment.lines.length === 1 || loading} onClick={() => void adjustShipment(shipment, "SPLIT_SINGLE", [line.id])}><Split size={13} /> New single</button><select className="max-w-[30rem] border border-line bg-white px-2 py-1 text-xs" value={moveTargets[line.id] ?? ""} onChange={(event) => setMoveTargets((current) => ({ ...current, [line.id]: event.target.value }))}><option value="">Move to…</option>{result.shipment_options.filter((item) => item.shift_id === shipment.shift_id && item.id !== shipment.id).map((item) => <option key={item.id} value={item.id}>{item.predicted_shipment_id} · {spbuClusterText(item.spbus)}</option>)}</select><button className="border border-line px-2 py-1 text-xs disabled:opacity-40" disabled={!moveTargets[line.id] || loading} onClick={() => void adjustShipment(shipment, "MOVE_LINES", [line.id], moveTargets[line.id])}>Move</button></div></div>
                             ))}</div>
                             <div className="mt-4 text-xs font-semibold uppercase tracking-wide text-slate-500">Structured Shipment Explanation</div>
                             <dl className="mt-2 grid gap-2 sm:grid-cols-2">{explanationRows(shipment.explanation).map(([key, value]) => <div key={key} className="border border-line bg-white p-2"><dt className="text-[11px] uppercase text-slate-400">{key.replace(/_/g, " ")}</dt><dd className="mt-1 text-xs">{String(value)}</dd></div>)}</dl>
@@ -1401,8 +1482,24 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
       )}
 
       <section className="border border-line bg-white p-5">
-        <div className="mb-4 flex flex-wrap items-start justify-between gap-3"><div><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">11. Prediction Run History</div><p className="mt-1 text-xs text-slate-500">View and export immutable runs, or create a new run from an input snapshot.</p>{historyFeedback && <p className={`mt-2 text-xs ${historyFeedback.status === "SUCCESS" ? "text-mint" : "text-rust"}`} role="status" aria-live="polite">{historyFeedback.message}</p>}</div>{depotId && <button className="inline-flex items-center gap-2 border border-line px-3 py-2 text-sm disabled:cursor-wait disabled:opacity-50" disabled={historyRefreshing} onClick={() => void refreshHistory()}><RefreshCw className={historyRefreshing ? "animate-spin" : ""} size={14} /> {historyRefreshing ? "Memperbarui…" : "Refresh"}</button>}</div>
-        {history.length === 0 ? <div className="border border-dashed border-line p-6 text-center text-sm text-slate-500">No prediction runs for the selected depot.</div> : <div className="overflow-x-auto"><table className="min-w-full text-left text-sm"><thead className="bg-slate-50 text-xs uppercase text-slate-500"><tr>{["Run ID", "Date", "Status", "Depot", "Model", "LO", "Shipment", "Assigned", "Unassigned", "User", "Actions"].map((item) => <th key={item} className="px-3 py-2">{item}</th>)}</tr></thead><tbody>{history.map((row) => <tr key={row.id} className="border-t border-line"><td className="px-3 py-2 font-mono text-xs">{row.prediction_run_id}</td><td className="px-3 py-2">{new Date(row.date).toLocaleString()}</td><td className="px-3 py-2"><Badge value={row.status} />{["QUEUED", "RUNNING"].includes(row.status) && <div className="mt-1 whitespace-nowrap text-[11px] text-slate-500">Attempt {Math.max(1, row.attempt_count)}/{Math.max(1, row.max_attempts)}{row.heartbeat_at ? ` · heartbeat ${new Date(row.heartbeat_at).toLocaleTimeString("id-ID")}` : ""}</div>}</td><td className="px-3 py-2">{row.depot}</td><td className="px-3 py-2">{row.model}</td><td className="px-3 py-2">{row.loading_orders}</td><td className="px-3 py-2">{row.shipments}</td><td className="px-3 py-2">{row.assigned}</td><td className="px-3 py-2">{row.unassigned}</td><td className="px-3 py-2">{row.user}</td><td className="px-3 py-2"><div className="flex gap-2"><button title="View" className="border border-line p-2" onClick={() => void openHistory(row.id)}><Eye size={14} /></button><button title="Download" className="border border-line p-2 disabled:opacity-40" disabled={row.status !== "COMPLETED"} onClick={() => downloadFromApi(`/api/v1/phase6/predictions/${row.id}/export`, `${row.prediction_run_id}.xlsx`)}><Download size={14} /></button><button title={row.status === "FAILED" ? "Retry from saved input" : "Duplicate / Re-run"} className="border border-line p-2 disabled:opacity-40" disabled={!(["COMPLETED", "FAILED"].includes(row.status)) || loading} onClick={() => void rerun(row.id)}><RefreshCw size={14} /></button></div></td></tr>)}</tbody></table></div>}
+        <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
+          <div><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">11. Prediction Run History</div><p className="mt-1 text-xs text-slate-500">View and export immutable runs, or create a new run from an input snapshot.</p>{historyFeedback && <p className={`mt-2 text-xs ${historyFeedback.status === "SUCCESS" ? "text-mint" : "text-rust"}`} role="status" aria-live="polite">{historyFeedback.message}</p>}</div>
+          <div className="flex flex-wrap items-center gap-3">
+            {history.length > 0 && <label className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-500">Rows per page<select aria-label="History rows per page" className="border border-line bg-white px-3 py-2 text-sm font-normal normal-case tracking-normal text-petroink" value={historyPerPage} onChange={(event) => changeHistoryPerPage(Number(event.target.value))}>{[10, 25, 50].map((size) => <option key={size} value={size}>{size}</option>)}</select></label>}
+            {depotId && <button className="inline-flex items-center gap-2 border border-line px-3 py-2 text-sm disabled:cursor-wait disabled:opacity-50" disabled={historyRefreshing} onClick={() => void refreshHistory()}><RefreshCw className={historyRefreshing ? "animate-spin" : ""} size={14} /> {historyRefreshing ? "Memperbarui…" : "Refresh"}</button>}
+          </div>
+        </div>
+        {history.length === 0 ? <div className="border border-dashed border-line p-6 text-center text-sm text-slate-500">No prediction runs for the selected depot.</div> : <>
+          <div className="overflow-x-auto"><table className="min-w-full text-left text-sm"><thead className="bg-slate-50 text-xs uppercase text-slate-500"><tr>{["Run ID", "Date", "Status", "Depot", "Model", "LO", "Shipment", "Assigned", "Unassigned", "User", "Actions"].map((item) => <th key={item} className="px-3 py-2">{item}</th>)}</tr></thead><tbody>{paginatedHistory.map((row) => <tr key={row.id} className="border-t border-line"><td className="px-3 py-2 font-mono text-xs">{row.prediction_run_id}</td><td className="px-3 py-2">{new Date(row.date).toLocaleString()}</td><td className="px-3 py-2"><Badge value={row.status} />{["QUEUED", "RUNNING"].includes(row.status) && <div className="mt-1 whitespace-nowrap text-[11px] text-slate-500">Attempt {Math.max(1, row.attempt_count)}/{Math.max(1, row.max_attempts)}{row.heartbeat_at ? ` · heartbeat ${new Date(row.heartbeat_at).toLocaleTimeString("id-ID")}` : ""}</div>}</td><td className="px-3 py-2">{row.depot}</td><td className="px-3 py-2">{row.model}</td><td className="px-3 py-2">{row.loading_orders}</td><td className="px-3 py-2">{row.shipments}</td><td className="px-3 py-2">{row.assigned}</td><td className="px-3 py-2">{row.unassigned}</td><td className="px-3 py-2">{row.user}</td><td className="px-3 py-2"><div className="flex gap-2"><button title="View" className="border border-line p-2" onClick={() => void openHistory(row.id)}><Eye size={14} /></button><button title="Download" className="border border-line p-2 disabled:opacity-40" disabled={row.status !== "COMPLETED"} onClick={() => downloadFromApi(`/api/v1/phase6/predictions/${row.id}/export`, `${row.prediction_run_id}.xlsx`)}><Download size={14} /></button><button title={row.status === "FAILED" ? "Retry from saved input" : "Duplicate / Re-run"} className="border border-line p-2 disabled:opacity-40" disabled={!(["COMPLETED", "FAILED"].includes(row.status)) || loading} onClick={() => void rerun(row.id)}><RefreshCw size={14} /></button></div></td></tr>)}</tbody></table></div>
+          <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-line pt-4 text-sm">
+            <div className="text-slate-500">Showing {historyRangeStart.toLocaleString("id-ID")}–{historyRangeEnd.toLocaleString("id-ID")} of {history.length.toLocaleString("id-ID")} runs</div>
+            <div className="flex items-center gap-1">
+              <button className="border border-line px-3 py-2 disabled:cursor-not-allowed disabled:opacity-40" disabled={currentHistoryPage === 1} onClick={() => goToHistoryPage(currentHistoryPage - 1)}>Previous</button>
+              {historyPaginationPages.map((page, index) => <span key={page} className="contents">{index > 0 && page - historyPaginationPages[index - 1] > 1 && <span className="px-1 text-slate-400">…</span>}<button className={`min-w-9 border px-3 py-2 ${page === currentHistoryPage ? "border-petroblue bg-petroblue text-white" : "border-line"}`} aria-label={`Prediction history page ${page}`} aria-current={page === currentHistoryPage ? "page" : undefined} onClick={() => goToHistoryPage(page)}>{page}</button></span>)}
+              <button className="border border-line px-3 py-2 disabled:cursor-not-allowed disabled:opacity-40" disabled={currentHistoryPage === historyPageCount} onClick={() => goToHistoryPage(currentHistoryPage + 1)}>Next</button>
+            </div>
+          </div>
+        </>}
       </section>
 
       <section className="border border-line bg-white p-5">

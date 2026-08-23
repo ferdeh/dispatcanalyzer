@@ -18,6 +18,7 @@ from .config import get_settings
 from .google_routes import GoogleRoutesError, configuration_snapshot, get_google_routes_configuration
 from .models import (
     MLBehavioralModel,
+    MLSPBUClusterAssignment,
     MasterDepot,
     MasterMT,
     MasterSPBU,
@@ -39,6 +40,7 @@ from .phase5_registry import _model_summary
 from .phase6_constants import DEFAULT_PREDICTION_PARAMETERS, PHASE6_ALGORITHM_VERSION
 from .phase6_capacity import mt_compartment_profile, shipment_capacity
 from .phase6_inference import load_model_inference_evidence, predict_mt_candidates, predict_shipments
+from .phase6_iterative import build_iterative_capacity_plan
 from .phase6_routing import Phase6RouteEstimationService
 from .phase6_validation import require_prediction_model, validate_loading_orders, validate_mt_availability
 
@@ -282,9 +284,9 @@ def _parameters(overrides: dict | None) -> dict:
             raise HTTPException(status_code=400, detail={"code": "INVALID_PARAMETER", "message": f"{field} must be an integer."}) from exc
         if not minimum <= parameters[field] <= maximum:
             raise HTTPException(status_code=400, detail={"code": "INVALID_PARAMETER", "message": f"{field} must be between {minimum} and {maximum}."})
-    # One 8 KL LO may use any compatible MT with at least one free compartment.
-    # Full utilization is no longer a selectable policy in Phase 6 v5.
-    parameters["require_full_mt_utilization"] = False
+    # Phase 6 v9 only dispatches a fully utilized MT: 4/3/2/1 LO must use an
+    # MT with exactly 4/3/2/1 compartments respectively.
+    parameters["require_full_mt_utilization"] = True
     return parameters
 
 
@@ -312,6 +314,159 @@ def _persist_candidates(
                     explanation=candidate["explanation"],
                 )
             )
+
+
+def _persist_iterative_capacity_plan(db: Session, run: PredictionRun, planning: dict) -> None:
+    entities: dict[str, PredictionShipment] = {}
+    original_snapshot = []
+    for item in planning["plan"]:
+        prediction = item["prediction"]
+        entity = PredictionShipment(
+            id=uuid.uuid4().hex,
+            prediction_run_id=run.id,
+            predicted_shipment_id=prediction["predicted_shipment_id"],
+            shift_id=prediction["shift_id"],
+            shift_name=prediction["shift"],
+            planned_start_datetime=prediction["planned_start_datetime"],
+            shipment_prediction_score=prediction["score"],
+            confidence_level=prediction["confidence_level"],
+            low_confidence=prediction["low_confidence"],
+            explanation=prediction["explanation"],
+        )
+        db.add(entity)
+        entities[prediction["predicted_shipment_id"]] = entity
+        selected = item["selected_candidate"]
+        original_snapshot.append(
+            {
+                "predicted_shipment_id": prediction["predicted_shipment_id"],
+                "shift_id": prediction["shift_id"],
+                "planned_start_datetime": _iso(prediction["planned_start_datetime"]),
+                "score": prediction["score"],
+                "loading_order_nos": [line["loading_order_no"] for line in prediction["lines"]],
+                "spbu_ids": [line["spbu_id"] for line in prediction["lines"]],
+                "assigned_vehicle_id": selected["vehicle_id"] if selected else None,
+                "assignment_score": selected["prediction_score"] if selected else None,
+            }
+        )
+    # These models intentionally use scalar foreign-key IDs instead of ORM
+    # relationships, so persist all shipment parents first.
+    db.flush()
+
+    for item in planning["plan"]:
+        prediction = item["prediction"]
+        entity = entities[prediction["predicted_shipment_id"]]
+        for line in prediction["lines"]:
+            db.add(
+                PredictionShipmentLine(
+                    id=uuid.uuid4().hex,
+                    prediction_run_id=run.id,
+                    prediction_shipment_id=entity.id,
+                    loading_order_no=line["loading_order_no"],
+                    spbu_id=line["spbu_id"],
+                    spbu_no=line["spbu_no"],
+                    order_quantity_kl=line.get("order_quantity_kl"),
+                    shipment_start_datetime=datetime.fromisoformat(line["shipment_start_datetime"]),
+                    model_predicted_shipment_id=prediction["predicted_shipment_id"],
+                )
+            )
+    _persist_candidates(
+        db,
+        entities,
+        {
+            item["prediction"]["predicted_shipment_id"]: item["candidates"]
+            for item in planning["plan"]
+        },
+    )
+    db.flush()
+
+    final_snapshot = []
+    for sequence, item in enumerate(planning["plan"], start=1):
+        prediction = item["prediction"]
+        shipment = entities[prediction["predicted_shipment_id"]]
+        candidate = item["selected_candidate"]
+        estimate = item["estimate"]
+        status = item["assignment_status"]
+        unassigned_reason = item["unassigned_reason"]
+        assignment = PredictionAssignment(
+            id=uuid.uuid4().hex,
+            prediction_shipment_id=shipment.id,
+            original_vehicle_id=candidate["vehicle_id"] if candidate else None,
+            original_assignment_score=candidate["prediction_score"] if candidate else None,
+            final_vehicle_id=candidate["vehicle_id"] if candidate else None,
+            final_assignment_score=candidate["prediction_score"] if candidate else None,
+            assignment_status=status,
+            unassigned_reason=unassigned_reason,
+        )
+        db.add(assignment)
+        planned = _utc(prediction["planned_start_datetime"])
+        if candidate and estimate:
+            trip = PredictionTrip(
+                id=uuid.uuid4().hex,
+                prediction_run_id=run.id,
+                prediction_shipment_id=shipment.id,
+                trip_id=f"TRIP-{sequence:04d}",
+                trip_number=item["trip_number"],
+                vehicle_id=candidate["vehicle_id"],
+                planned_start_datetime=planned,
+                predicted_departure_datetime=item["departure"],
+                delay_minutes=item["delay_minutes"],
+                estimated_visit_sequence=estimate["estimated_visit_sequence_codes"],
+                routing_provider=estimate["routing_provider"],
+                routing_mode=estimate["routing_mode"],
+                routing_preference=estimate["routing_preference"],
+                large_vehicle_used=estimate["large_vehicle_used"],
+                route_distance_meters=estimate["route_distance_meters"],
+                route_duration_seconds=estimate["route_duration_seconds"],
+                static_duration_seconds=estimate["static_duration_seconds"],
+                service_duration_seconds=estimate["service_duration_seconds"],
+                turnaround_buffer_seconds=estimate["turnaround_buffer_seconds"],
+                total_cycle_duration_seconds=estimate["total_cycle_duration_seconds"],
+                estimated_return_datetime=estimate["estimated_return_datetime"],
+                next_available_datetime=estimate["next_available_datetime"],
+                routing_confidence=estimate["routing_confidence"],
+                route_estimation_source=estimate["route_estimation_source"],
+                route_geometry=estimate["route_geometry"],
+                route_geometry_source=estimate["route_geometry_source"],
+                service_time_source=estimate["service_time_source"],
+                assignment_status=status,
+                fallback_used=estimate["fallback_used"],
+                warning_codes=estimate["warning_codes"],
+                vehicle_profile_snapshot=estimate["vehicle_profile_snapshot"],
+            )
+        else:
+            final_reason = unassigned_reason or "NO_MT_AVAILABLE_AT_REQUIRED_TIME"
+            trip = PredictionTrip(
+                id=uuid.uuid4().hex,
+                prediction_run_id=run.id,
+                prediction_shipment_id=shipment.id,
+                trip_id=f"TRIP-{sequence:04d}",
+                planned_start_datetime=planned,
+                delay_minutes=0,
+                assignment_status="UNASSIGNED",
+                unassigned_reason=final_reason,
+                warning_codes=[final_reason],
+            )
+        db.add(trip)
+        final_snapshot.append(
+            {
+                "trip_id": trip.trip_id,
+                "predicted_shipment_id": prediction["predicted_shipment_id"],
+                "vehicle_id": trip.vehicle_id,
+                "planned_start_datetime": _iso(planned),
+                "predicted_departure_datetime": _iso(trip.predicted_departure_datetime),
+                "estimated_return_datetime": _iso(trip.estimated_return_datetime),
+                "next_available_datetime": _iso(trip.next_available_datetime),
+                "predicted_visit_sequence": trip.estimated_visit_sequence,
+                "shipment_score": prediction["score"],
+                "vehicle_score": candidate["prediction_score"] if candidate else None,
+                "assignment_status": trip.assignment_status,
+                "route_estimation_source": trip.route_estimation_source,
+            }
+        )
+
+    run.original_prediction_snapshot = original_snapshot
+    run.final_prediction_snapshot = final_snapshot
+    run.routing_metrics_snapshot = planning["routing_metrics"]
 
 
 def enqueue_prediction_run(
@@ -425,86 +580,25 @@ def process_prediction_run(db: Session, run_id: str, *, lease_token: str | None 
     )
     try:
         model = require_prediction_model(db, run.depot_id, run.model_id)
-        parameter_snapshot = run.parameter_snapshot
-        shipment_started = perf_counter()
         evidence = load_model_inference_evidence(db, model)
         run.model_snapshot = {**run.model_snapshot, **{key: evidence[key] for key in ("artifact_checksum", "artifact_source")}}
-        predictions = predict_shipments(run.input_loading_order_snapshot, model, evidence, parameter_snapshot)
-        run.shipment_prediction_duration_ms = round((perf_counter() - shipment_started) * 1000)
-
-        candidate_started = perf_counter()
-        candidate_map = predict_mt_candidates(
-            db,
-            depot_id=run.depot_id,
-            shipments=predictions,
-            availability=run.input_mt_availability_snapshot,
-            vehicle_compatibility_mode=get_settings().vehicle_compatibility_mode,
-            require_full_utilization=False,
-        )
-        run.mt_prediction_duration_ms = round((perf_counter() - candidate_started) * 1000)
-
-        entities: dict[str, PredictionShipment] = {}
-        original_snapshot = []
-        for prediction in predictions:
-            entity = PredictionShipment(
-                id=uuid.uuid4().hex,
-                prediction_run_id=run.id,
-                predicted_shipment_id=prediction["predicted_shipment_id"],
-                shift_id=prediction["shift_id"],
-                shift_name=prediction["shift"],
-                planned_start_datetime=prediction["planned_start_datetime"],
-                shipment_prediction_score=prediction["score"],
-                confidence_level=prediction["confidence_level"],
-                low_confidence=prediction["low_confidence"],
-                explanation=prediction["explanation"],
-            )
-            db.add(entity)
-            entities[prediction["predicted_shipment_id"]] = entity
-            original_snapshot.append(
-                {
-                    "predicted_shipment_id": prediction["predicted_shipment_id"],
-                    "shift_id": prediction["shift_id"],
-                    "planned_start_datetime": _iso(prediction["planned_start_datetime"]),
-                    "score": prediction["score"],
-                    "loading_order_nos": [line["loading_order_no"] for line in prediction["lines"]],
-                    "spbu_ids": [line["spbu_id"] for line in prediction["lines"]],
-                }
-            )
-
-        # These models intentionally use scalar foreign-key IDs instead of ORM
-        # relationships. Flush the parent rows explicitly so PostgreSQL never
-        # receives shipment lines or MT candidates before their shipment.
-        db.flush()
-
-        for prediction in predictions:
-            entity = entities[prediction["predicted_shipment_id"]]
-            for line in prediction["lines"]:
-                db.add(
-                    PredictionShipmentLine(
-                        id=uuid.uuid4().hex,
-                        prediction_run_id=run.id,
-                        prediction_shipment_id=entity.id,
-                        loading_order_no=line["loading_order_no"],
-                        spbu_id=line["spbu_id"],
-                        spbu_no=line["spbu_no"],
-                        order_quantity_kl=line.get("order_quantity_kl"),
-                        shipment_start_datetime=datetime.fromisoformat(line["shipment_start_datetime"]),
-                        model_predicted_shipment_id=prediction["predicted_shipment_id"],
-                    )
-                )
-        run.original_prediction_snapshot = original_snapshot
-        _persist_candidates(db, entities, candidate_map)
-        db.flush()
-        assignment_started = perf_counter()
-        _rolling_assign_and_persist(db, run, initial=True)
-        run.assignment_optimization_duration_ms = round((perf_counter() - assignment_started) * 1000)
+        planning = build_iterative_capacity_plan(db, run=run, model=model, evidence=evidence)
+        run.model_snapshot = {
+            **run.model_snapshot,
+            "capacity_iteration_order": [32, 24, 16, 8],
+            "capacity_iteration_summary": planning["iteration_summary"],
+        }
+        run.shipment_prediction_duration_ms = planning["durations_ms"]["shipment_prediction"]
+        run.mt_prediction_duration_ms = planning["durations_ms"]["mt_prediction"]
+        run.assignment_optimization_duration_ms = planning["durations_ms"]["assignment_optimization"]
+        _persist_iterative_capacity_plan(db, run, planning)
         run.total_prediction_duration_ms = round((perf_counter() - total_started) * 1000)
         complete_prediction_job(db, run_id=run_db_id, lease_token=lease_token)
         run.status = "COMPLETED"
         run.completed_at = datetime.now(timezone.utc)
         db.commit()
         logger.info(
-            "rolling_assignment_completed",
+            "iterative_capacity_assignment_completed",
             extra={"prediction_run_id": run_no, "model_id": run_model_id, "depot_id": run_depot_id},
         )
         return get_prediction_run(db, run_db_id)
@@ -634,10 +728,35 @@ def _rolling_assign_and_persist(db: Session, run: PredictionRun, *, initial: boo
     blocking = run.parameter_snapshot.get("blocking_prediction_confidence")
     final_snapshot = []
 
+    # Recalculation after a manual shipment/MT change follows the same capacity
+    # priority as the initial iterative planner: 32, then 24, 16, and 8 KL.
+    shipments.sort(
+        key=lambda shipment: (
+            -shipment_capacity(
+                [{"order_quantity_kl": line.order_quantity_kl} for line in lines_by_shipment[shipment.id]]
+            )["required_compartments"],
+            _utc(shipment.planned_start_datetime),
+            shipment.predicted_shipment_id,
+        )
+    )
+
     for sequence_number, shipment in enumerate(shipments, start=1):
         planned = _utc(shipment.planned_start_datetime)
+        required_compartments = shipment_capacity(
+            [{"order_quantity_kl": line.order_quantity_kl} for line in lines_by_shipment[shipment.id]]
+        )["required_compartments"]
         compatible = [candidate for candidate in candidates_by_shipment[shipment.id] if candidate.compatibility_status == "PASS"]
-        compatible.sort(key=lambda row: (-row.prediction_score, (mts.get(row.vehicle_id).vehicle_registration if mts.get(row.vehicle_id) else row.vehicle_id)))
+        compatible.sort(
+            key=lambda row: (
+                max(
+                    0,
+                    int(mt_compartment_profile(mts[row.vehicle_id])["effective_compartments"] or 999)
+                    - required_compartments,
+                ) if row.vehicle_id in mts else 999,
+                -row.prediction_score,
+                mts[row.vehicle_id].vehicle_registration if row.vehicle_id in mts else row.vehicle_id,
+            )
+        )
         fixed_vehicle = fixed_manual.get(shipment.id)
         if fixed_vehicle:
             compatible = sorted(compatible, key=lambda row: row.vehicle_id != fixed_vehicle)
@@ -908,6 +1027,19 @@ def get_prediction_run(
     mts = {row.mt_id: row for row in db.scalars(select(MasterMT).where(MasterMT.mt_id.in_(mt_ids))).all()} if mt_ids else {}
     spbu_ids = {line.spbu_id for line in lines}
     spbus = {row.spbu_id: row for row in db.scalars(select(MasterSPBU).where(MasterSPBU.spbu_id.in_(spbu_ids))).all()} if spbu_ids else {}
+    cluster_assignments = {
+        row.spbu_id: row
+        for row in (
+            db.scalars(
+                select(MLSPBUClusterAssignment).where(
+                    MLSPBUClusterAssignment.model_id == run.model_id,
+                    MLSPBUClusterAssignment.spbu_id.in_(spbu_ids),
+                )
+            ).all()
+            if spbu_ids
+            else []
+        )
+    }
     output_shipments = []
     output_trips = []
     for shipment in shipments:
@@ -940,6 +1072,13 @@ def get_prediction_run(
                 "spbu_id": line.spbu_id,
                 "spbu_no": line.spbu_no,
                 "spbu_name": spbus[line.spbu_id].spbu_name if line.spbu_id in spbus else None,
+                "cluster_id": cluster_assignments[line.spbu_id].cluster_id if line.spbu_id in cluster_assignments else None,
+                "cluster_number": (
+                    int(cluster_assignments[line.spbu_id].cluster_id) + 1
+                    if line.spbu_id in cluster_assignments and cluster_assignments[line.spbu_id].cluster_id is not None
+                    else None
+                ),
+                "cluster_label": cluster_assignments[line.spbu_id].cluster_label if line.spbu_id in cluster_assignments else None,
                 "order_quantity_kl": line.order_quantity_kl,
                 "model_predicted_shipment_id": line.model_predicted_shipment_id,
             }
@@ -1098,6 +1237,22 @@ def get_prediction_run(
                 "predicted_shipment_id": shipment.predicted_shipment_id,
                 "shift_id": shipment.shift_id,
                 "shift": shipment.shift_name,
+                "spbus": list(
+                    {
+                        line.spbu_id: {
+                            "spbu_id": line.spbu_id,
+                            "spbu_no": line.spbu_no,
+                            "cluster_id": cluster_assignments[line.spbu_id].cluster_id if line.spbu_id in cluster_assignments else None,
+                            "cluster_number": (
+                                int(cluster_assignments[line.spbu_id].cluster_id) + 1
+                                if line.spbu_id in cluster_assignments and cluster_assignments[line.spbu_id].cluster_id is not None
+                                else None
+                            ),
+                            "cluster_label": cluster_assignments[line.spbu_id].cluster_label if line.spbu_id in cluster_assignments else None,
+                        }
+                        for line in sorted(lines_by[shipment.id], key=lambda row: (row.spbu_no, row.loading_order_no))
+                    }.values()
+                ),
             }
             for shipment in shipments
         ],
@@ -1374,7 +1529,7 @@ def _rebuild_candidates_and_timeline(db: Session, run: PredictionRun) -> None:
         shipments=payload,
         availability=run.input_mt_availability_snapshot,
         vehicle_compatibility_mode=get_settings().vehicle_compatibility_mode,
-        require_full_utilization=False,
+        require_full_utilization=True,
     )
     if shipment_ids:
         db.execute(delete(PredictionMTCandidate).where(PredictionMTCandidate.prediction_shipment_id.in_(shipment_ids)))

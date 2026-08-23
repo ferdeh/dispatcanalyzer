@@ -64,7 +64,7 @@ def mt_compartment_profile(mt: MasterMT) -> dict:
     }
 
 
-def capacity_compatible(lines: list[dict], mt: MasterMT, *, require_full_utilization: bool = False) -> dict:
+def capacity_compatible(lines: list[dict], mt: MasterMT, *, require_full_utilization: bool = True) -> dict:
     shipment = shipment_capacity(lines)
     vehicle = mt_compartment_profile(mt)
     required = shipment["required_compartments"]

@@ -23,7 +23,19 @@ from app.google_routes import (
     public_google_routes_configuration,
     save_google_routes_configuration,
 )
-from app.models import Base, MLBehavioralModel, MLSPBUClusterAssignment, MasterDepot, MasterMT, MasterSPBU, PredictionJob
+from app.models import (
+    Base,
+    BridgeMTTag,
+    BridgeSPBUTag,
+    MLBehavioralModel,
+    MLSPBUClusterAssignment,
+    MasterDepot,
+    MasterMT,
+    MasterSPBU,
+    MasterTag,
+    MasterTagType,
+    PredictionJob,
+)
 from app.main import app
 from app.phase6_demo import generate_demo_loading_orders, generate_demo_mt_availability
 from app.phase6_routing import Phase6RouteEstimationService
@@ -237,6 +249,24 @@ def test_prediction_result_is_paginated_and_candidates_are_lazy() -> None:
         assert len(page["shipments"]) == 1
         assert page["shipments"][0]["candidates"] == []
         assert page["shipments"][0]["candidates_loaded"] is False
+        line = page["shipments"][0]["lines"][0]
+        assert line["spbu_no"] == "SPBU-A"
+        assert line["cluster_id"] == 0
+        assert line["cluster_number"] == 1
+        assert line["cluster_label"] == "Cluster 1"
+        shipment_option = next(
+            item for item in page["shipment_options"]
+            if item["id"] == page["shipments"][0]["id"]
+        )
+        assert shipment_option["spbus"] == [
+            {
+                "spbu_id": "A",
+                "spbu_no": "SPBU-A",
+                "cluster_id": 0,
+                "cluster_number": 1,
+                "cluster_label": "Cluster 1",
+            }
+        ]
         assert all("route_geometry" not in trip for trip in page["trips"])
         candidates = get_prediction_shipment_candidates(session, result["id"], page["shipments"][0]["id"])
         assert candidates["candidates"]
@@ -528,6 +558,8 @@ def test_capacity_aware_grouping_builds_three_lo_shipment_for_24_kl_mt() -> None
         assert shipment["explanation"]["group_optimization"]["route_feasible"] is True
         assert shipment["explanation"]["group_optimization"]["time_span_minutes"] == 10
         assert shipment["assignment"]["assigned_vehicle_id"] == "T24"
+        assert shipment["explanation"]["capacity_iteration"]["tier_capacity_kl"] == 24
+        assert result["model"]["capacity_iteration_summary"][1]["assigned_shipments"] == 1
         assert shipment["trip"]["estimated_visit_sequence"] == ["SPBU-D", "SPBU-E", "SPBU-F"]
         route = result["geographic_routes"]["routes"][0]
         assert [stop["spbu_code"] for stop in route["stops"]] == ["SPBU-D", "SPBU-E", "SPBU-F"]
@@ -535,7 +567,70 @@ def test_capacity_aware_grouping_builds_three_lo_shipment_for_24_kl_mt() -> None
         assert route["points"][-1]["type"] == "DEPOT_RETURN"
 
 
-def test_one_8_kl_lo_can_use_compatible_16_kl_mt_as_partial_load() -> None:
+def test_iterative_capacity_assignment_regroups_unassigned_32_kl_into_tag_compatible_16_kl() -> None:
+    Session = make_session()
+    with Session() as session:
+        seed(session)
+        session.add(
+            MasterMT(
+                mt_id="T4",
+                vehicle_name_raw="Truck 16 without required project tag",
+                vehicle_registration="B1004AA",
+                capacity_label="16KL",
+                vehicle_type_tag=16,
+                number_of_compartments=2,
+                depot_id="D1",
+                active_status="ACTIVE",
+            )
+        )
+        session.add(MasterTagType(tag_type_id="PROJECT", code="PROJECT", name="Project"))
+        session.flush()
+        session.add(MasterTag(tag_id="TAG-REQ", tag_type_id="PROJECT", tag_value="Required", normalized_tag="REQUIRED"))
+        session.flush()
+        session.add_all(
+            [
+                BridgeSPBUTag(spbu_id="LIMITED", tag_id="TAG-REQ"),
+                BridgeMTTag(mt_id="T3", tag_id="TAG-REQ"),
+            ]
+        )
+        session.commit()
+
+        result = run_prediction(
+            session,
+            [
+                ["LO1", "2026-08-22 09:00:00", "SPBU-LIMITED", 8],
+                ["LO2", "2026-08-22 09:01:00", "SPBU-LIMITED", 8],
+                ["LO3", "2026-08-22 09:02:00", "SPBU-LIMITED", 8],
+                ["LO4", "2026-08-22 09:03:00", "SPBU-LIMITED", 8],
+            ],
+            [["B1003AA", "2026-08-22 08:00:00"], ["B1004AA", "2026-08-22 08:00:00"]],
+            {"assignment_mode": "ALLOW_DELAY", "maximum_allowed_delay_minutes": 300},
+        )
+
+        assert [shipment["total_order_kl"] for shipment in result["shipments"]] == [16, 16]
+        assert all(shipment["assignment"]["assigned_vehicle_id"] == "T3" for shipment in result["shipments"])
+        assert {trip["assignment_status"] for trip in result["trips"]} == {"ASSIGNED", "ASSIGNED_WITH_DELAY"}
+        assert result["summary"]["assigned_loading_orders"] == 4
+        assert result["summary"]["assigned_order_kl"] == 32
+        assert result["model"]["capacity_iteration_order"] == [32, 24, 16, 8]
+        iterations = {row["tier_capacity_kl"]: row for row in result["model"]["capacity_iteration_summary"]}
+        assert iterations[32]["assigned_shipments"] == 0
+        assert iterations[16]["assigned_shipments"] == 2
+        assert iterations[16]["carried_forward_loading_orders"] == 0
+        assert all(shipment["explanation"]["capacity_iteration"]["spbu_cluster_evidence_required_for_multi_lo"] for shipment in result["shipments"])
+        assert all(shipment["explanation"]["capacity_iteration"]["spbu_mt_master_tag_compatibility_required"] for shipment in result["shipments"])
+        failed_untagged = [
+            candidate
+            for shipment in result["shipments"]
+            for candidate in shipment["candidates"]
+            if candidate["vehicle_id"] == "T4"
+        ]
+        assert failed_untagged
+        assert all(candidate["compatibility_status"] == "FAIL" for candidate in failed_untagged)
+        assert all("PROJECT_TAGS" in candidate["explanation"]["failed_rules"] for candidate in failed_untagged)
+
+
+def test_one_8_kl_lo_cannot_use_16_kl_mt_when_full_load_is_required() -> None:
     Session = make_session()
     with Session() as session:
         seed(session)
@@ -545,14 +640,16 @@ def test_one_8_kl_lo_can_use_compatible_16_kl_mt_as_partial_load() -> None:
             [["B1003AA", "2026-08-22 08:00:00"]],
         )
         candidate = result["shipments"][0]["candidates"][0]
-        assert candidate["compatibility_status"] == "PASS"
-        assert candidate["exclusion_reason"] is None
-        assert candidate["explanation"]["capacity_policy"] == "ALLOW_PARTIAL_LOAD"
+        assert candidate["compatibility_status"] == "FAIL"
+        assert candidate["exclusion_reason"] == "CAPACITY_COMPARTMENT_MISMATCH"
+        assert candidate["explanation"]["capacity_policy"] == "EXACT_COMPARTMENT_MATCH"
         assert candidate["explanation"]["shipment_required_compartments"] == 1
         assert candidate["explanation"]["mt_number_of_compartments"] == 2
-        assert result["trips"][0]["vehicle_id"] == "T3"
-        assert result["summary"]["assigned_loading_orders"] == 1
-        assert result["summary"]["assigned_order_kl"] == 8
+        assert result["shipments"][0]["explanation"]["capacity_iteration"]["tier_capacity_kl"] == 8
+        assert result["trips"][0]["vehicle_id"] is None
+        assert result["trips"][0]["unassigned_reason"] == "NO_COMPATIBLE_MT"
+        assert result["summary"]["assigned_loading_orders"] == 0
+        assert result["summary"]["assigned_order_kl"] == 0
 
 
 def test_demo_loading_order_uses_timestamps_and_requested_total() -> None:
@@ -571,6 +668,35 @@ def test_demo_loading_order_uses_timestamps_and_requested_total() -> None:
                 active_status="ACTIVE",
             )
         )
+        session.add(
+            MasterSPBU(
+                spbu_id="COLD",
+                spbu_code="SPBU-COLD",
+                spbu_name="Cold Start",
+                latitude=-6.31,
+                longitude=106.91,
+                vehicle_type_tag=8,
+                primary_depot_id="D1",
+                active_status="ACTIVE",
+            )
+        )
+        session.flush()
+        session.add(
+            MLSPBUClusterAssignment(
+                assignment_id="AS-COLD",
+                model_id="M1",
+                depot_id="D1",
+                spbu_id="COLD",
+                cluster_id=0,
+                cluster_label="Cluster 1",
+                membership_probability=0.99,
+                is_noise=False,
+                dominant_shift="Shift 1",
+                shipment_observation_count=0,
+                coverage_source="ACTIVE_MASTER_COLD_START",
+                history_eligible=False,
+            )
+        )
         session.commit()
         with pytest.raises(HTTPException) as raised:
             generate_demo_loading_orders(session, depot_id="D1", model=model, total_order_kl=18, random_seed=42)
@@ -583,6 +709,7 @@ def test_demo_loading_order_uses_timestamps_and_requested_total() -> None:
         assert filename.startswith("phase6-demo-loading-order-")
         assert [row[4] for row in rows] == [8, 8, 8]
         assert {row[2] for row in rows} <= {"SPBU-A", "SPBU-B", "SPBU-C", "SPBU-LIMITED"}
+        assert "SPBU-COLD" not in {row[2] for row in rows}
         generated_times = [datetime.fromisoformat(row[1]) for row in rows]
         assert (max(generated_times) - min(generated_times)).total_seconds() <= 2 * 60
         validated = validate_loading_orders(session, depot_id="D1", model=model, content=content, file_name=filename)

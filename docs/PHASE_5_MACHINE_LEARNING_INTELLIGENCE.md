@@ -45,7 +45,7 @@ Preparation is explicit and persisted as `MLTrainingRun` with status `DATASET_RE
 - Pairing group: Phase 3 same-shipment membership and pair metrics. Symmetric graph weight is the mean of `P(B|A)` and `P(A|B)`.
 - Geographic snapshot: Master SPBU latitude/longitude is retained only for the Geographic Cluster Map. Coordinates do not enter feature fusion, UMAP, or HDBSCAN and therefore cannot influence cluster membership.
 
-SPBUs below the minimum shipment count are recorded in the dataset exclusion summary.
+SPBUs below the minimum shipment count no longer disappear from saved-model coverage. HDBSCAN, scaler, and behavioral features are fit only on sufficient-history SPBUs. After training, every remaining active master SPBU is projected through the saved preprocessing pipeline and assigned conservatively to the nearest non-noise cluster centroid with membership capped below 0.50. Each assignment stores `shipment_observation_count`, `coverage_source`, and `history_eligible`; no-history and insufficient-history counts remain separate in the dataset/model summary. Inactive historical SPBUs remain excluded.
 
 ## Engine B training
 
@@ -60,7 +60,7 @@ pairing embedding ────────────────┘
 
 Node2Vec transitions and UMAP receive explicit seeds. The second-order `p`/`q` walk semantics remain intact, while the walk contexts are converted to a positive-PMI matrix and reduced with deterministic `sklearn.decomposition.TruncatedSVD`. This removes the Gensim native Word2Vec extension that could terminate an ARM64 API process with `Illegal instruction`. The Docker runtime also targets Numba's generic CPU profile so UMAP/PyNNDescent does not JIT instructions unsupported by the container CPU. Isolated nodes receive a zero pairing vector. If the graph has no edges, every pairing vector is zero and training continues with a visible warning. The implementation uses the maintained `sklearn.cluster.HDBSCAN`; HDBSCAN noise is never reassigned.
 
-A separate seeded 2D UMAP creates visualization coordinates. The internal UMAP dimension may be higher. Cluster profiles contain common tags (at least 50% membership), mean shift distribution, dominant shift, strongest internal Phase 3 pairings, average membership, and low-confidence count.
+A separate seeded 2D UMAP creates visualization coordinates. The internal UMAP dimension may be higher. Cluster profiles report historical and cold-start member counts separately. Common tags (at least 50% membership), mean shift distribution, dominant shift, strongest internal Phase 3 pairings, average membership, and low-confidence count are calculated only from historical members so cold-start projection cannot rewrite behavioral evidence.
 
 The UI presents the UMAP behavioral-similarity map separately from an OpenStreetMap geographic view. A fresh training result uses its snapshotted Master SPBU latitude/longitude. When a saved registry model is reopened, the same stored cluster assignments are enriched with the current Master SPBU coordinates and Vehicle Class so master-data corrections are reflected without changing any cluster. A larger dark marker with a yellow outline shows the current Master Depot latitude/longitude and is included in automatic map bounds. Hovering a geographic node shows the SPBU name/code, cluster, dominant shift, Vehicle Class, and all other typed tags; hovering the depot marker shows its master name and coordinates. Records without complete coordinates remain in the model and membership table but are excluded from the geographic layer with a visible count.
 
@@ -83,7 +83,7 @@ The Behavioral Clustering workspace can list saved models for the selected depot
 
 ## Model comparison
 
-HDBSCAN labels are arbitrary. Comparison builds SPBU membership sets, calculates every cross-model Jaccard similarity, and applies Hungarian optimal matching. It reports stable neighborhoods, changed matched clusters, new/returning noise, new/removed SPBUs, splits, and merges.
+HDBSCAN labels are arbitrary. Comparison builds sufficient-history SPBU membership sets, excludes cold-start coverage, calculates every cross-model Jaccard similarity, and applies Hungarian optimal matching. It reports stable neighborhoods, changed matched clusters, new/returning noise, new/removed historical SPBUs, splits, and merges.
 
 ## API
 
@@ -107,8 +107,8 @@ HDBSCAN labels are arbitrary. Comparison builds SPBU membership sets, calculates
 
 ## Operational limitations
 
-- Jobs are synchronous because the repository has no worker/queue architecture. Persisted states and friendly errors make later worker migration straightforward, but very large depots should run behind an API timeout appropriate for ML workloads.
+- Phase 5 training masih synchronous di proses API; durable worker queue yang tersedia saat ini khusus Phase 6 prediction. Persisted training states dan friendly errors tetap menjadi seam untuk migrasi worker Phase 5, tetapi depot sangat besar harus memakai API timeout yang sesuai workload ML.
 - API startup marks any stale `PREPARING_DATA`, `TRAINING`, or `CALCULATING_PROFILES` run as `FAILED`, retaining the diagnostic and allowing a complete retained dataset to be retried. Docker Compose also restarts the API after an unexpected process exit.
 - The existing repository has no login provider. Header-based permission hooks are an integration seam, not production authentication.
 - Node2Vec embeddings describe the training-period graph. Isolated/no-edge fallback deliberately contributes no pairing signal.
-- The active-model interface serves saved assignments/profiles to later phases; Phase 6/7 logic is not implemented here.
+- The active-model interface serves saved assignments/profiles and explicit evidence coverage to later phases. Phase 6 Data Demo uses only active, non-noise assignments with `coverage_source=BEHAVIORAL_HISTORY` and `history_eligible=true`.

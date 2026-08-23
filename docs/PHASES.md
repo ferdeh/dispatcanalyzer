@@ -57,7 +57,9 @@ The repository includes read-only Phase 2–4 intelligence, persisted Phase 5 ML
 - Engine A observation: unique `depot_id + shipment_id + spbu_id + mt_id`
 - Engine B features: typed master-tag vector + full shift distribution + Phase 3 pairing embedding from seeded Node2Vec walks and PPMI/SVD
 - Engine B pipeline: independently scaled/weighted feature fusion → UMAP → HDBSCAN
-- Isolated pairing nodes: deterministic zero embedding; HDBSCAN noise remains unassigned
+- Coverage: HDBSCAN is fit only to sufficient-history SPBUs; every other active master SPBU receives conservative nearest-cluster cold-start coverage with explicit `coverage_source` and `history_eligible=false`
+- Cluster profiles and model comparison use historical members only; no-history/insufficient-history counts are reported separately
+- Isolated pairing nodes: deterministic zero embedding; historical HDBSCAN noise remains unassigned
 - Lifecycle: prepare, validate, train, review, name, save, activate/archive/version, compare
 - Comparison: optimal Jaccard membership matching; cluster numbers are never treated as stable identities
 - Schema: `ml_concentration_analysis_run`, `ml_spbu_concentration_profile`, `ml_training_run`, `ml_behavioral_model`, `ml_model_artifact`, `ml_spbu_cluster_assignment`, `ml_cluster_profile`
@@ -70,21 +72,24 @@ The repository includes read-only Phase 2–4 intelligence, persisted Phase 5 ML
 - UI: `/prediction-assignment`
 - Google settings UI: `/settings/google-maps-integration`
 - Scope: exactly one depot and one `SAVED`/`ACTIVE` Phase 5 model per run
-- Inputs: Loading Order (`loading_order_no`, `shipment_start_datetime`, `spbu_no`) and initial MT availability (`vehicle_registration_no`, `initial_available_datetime`) workbooks
-- Demo input: total KL is split into 8 KL Loading Orders (with a remainder), using random active depot SPBU and generated timestamps valid for the selected model shift snapshot
-- Demo MT availability: target KL is matched to the closest random subset of active depot MT master capacities, with randomized availability timestamps on the planning day
+- Inputs: Loading Order (`loading_order_no`, `shipment_start_datetime`, `spbu_no`, `order_quantity_kl`) and initial MT availability (`vehicle_registration_no`, `initial_available_datetime`) workbooks; every LO must equal exactly 8 KL
+- Demo LO: total KL must be divisible by 8; one 8 KL LO is generated per unit using only active, non-noise `BEHAVIORAL_HISTORY` SPBUs with `history_eligible=true` from the selected model
+- Demo MT availability: target KL is matched to the closest random subset of active depot MT master capacities. Default availability equals the first shift start; optional Random availability samples within first-shift start through last-shift end
 - Validation: complete datetime, planning horizon, unique LO/MT, canonical master, active MT, depot, timezone, and full-day model shift snapshot
 - Derived shift: `shipment_start_datetime` is mapped through the immutable Phase 2/Phase 5 shift snapshot; shift is not the availability input
-- Shipment inference: deterministic, time-aware within `maximum_pairing_time_gap_minutes`, same-derived-shift only; planned start is the latest LO timestamp
+- Shipment inference: capacity/time/route set packing within `maximum_pairing_time_gap_minutes`, same-derived-shift only; cluster, pairing, tag, capacity, and route feasibility remain explicit evidence/constraints
 - MT score: Phase 4 historical affinity; master compatibility remains a separate Phase 1 hard filter
 - Multi-SPBU compatibility: intersection across all shipment SPBU
-- Assignment: chronological rolling vehicle state with `STRICT_START` or bounded `ALLOW_DELAY`; the same MT can serve multiple non-overlapping trips
+- Assignment: iterative 32→24→16→8 KL tiers followed by chronological rolling vehicle state with `STRICT_START` or bounded `ALLOW_DELAY`; only assigned groups consume LO and unsuccessful larger groups are retried in smaller tiers
+- Capacity: exact full-load only (`4/3/2/1 LO = 32/24/16/8 KL MT`); no larger-MT partial-load fallback
 - Route estimate: server-side Google Compute Routes/Matrix client in enforced DRIVE-only mode for Indonesia, time/config-aware cache, and visibly marked historical/default fallback
 - Cycle time: depot processing + travel legs + per-stop service + return processing; turnaround buffer is added once to return for next availability
 - Persistence: run, shipment, line, candidate, assignment, trip, Google configuration, route cache, routing metrics, original/final snapshots, and audit
-- Overrides: compatible MT change or same-shift shipment restructure recalculates route estimate, return, next availability, and downstream rolling state without Phase 5 training
+- Overrides: compatible MT change or same-shift shipment restructure recalculates route estimate, return, next availability, hourly/cumulative assigned KL, geographic routes, and downstream rolling state without Phase 5 training
+- Shipment detail: every LO/SPBU shows its selected-model cluster; `Move to…` options show shipment ID, target SPBU, and target cluster
+- Prediction Run History: client-side 10/25/50-row pagination, visible range, Previous/page/Next controls, immutable View/Export/Re-run actions, and refresh feedback
 - Export: Summary, Shipment Result, Trip Timeline, MT Assignment, MT Candidates, Validation
-- Visualization: predicted same-shipment network, assignment matrix, and MT multi-trip Gantt timeline
-- Algorithm: `phase6.capacity_time_route_set_packing.v7`
+- Visualization: predicted same-shipment network, assignment matrix, paginated MT multi-trip timeline, assigned KL hourly/cumulative chart, and searchable geographic route-per-MT map using master coordinates plus Google road geometry/fallback
+- Algorithm: `phase6.iterative_exact_capacity_assignment.v9` using `CAPACITY_TIME_ROUTE_SET_PACKING` within each capacity tier
 - Security: encrypted API key using environment-provided encryption secret; browser receives masked value only
 - Phase 7 boundary: Phase 6 never calls Google Route Optimization/GMPRO `optimizeTours` and never solves fleet-wide VRP; Phase 7 owns final globally optimized route and constraints

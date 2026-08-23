@@ -480,7 +480,7 @@ def predict_mt_candidates(
     shipments: list[dict],
     availability: list[dict],
     vehicle_compatibility_mode: str,
-    require_full_utilization: bool = False,
+    require_full_utilization: bool = True,
 ) -> dict[str, list[dict]]:
     vehicle_ids = sorted({row["vehicle_id"] for row in availability})
     spbu_ids = sorted({line["spbu_id"] for shipment in shipments for line in shipment["lines"]})

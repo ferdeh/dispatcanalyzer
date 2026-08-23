@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-PHASE6_ALGORITHM_VERSION = "phase6.capacity_time_route_set_packing.v7"
+PHASE6_ALGORITHM_VERSION = "phase6.iterative_exact_capacity_assignment.v9"
 
 PHASE6_PERMISSIONS = {
     "view": "phase6:view",
@@ -20,7 +20,7 @@ DEFAULT_PREDICTION_PARAMETERS = {
     "maximum_pairing_time_gap_minutes": 90,
     "maximum_shipment_compartments": 4,
     "maximum_group_route_detour_ratio": 2.0,
-    "require_full_mt_utilization": False,
+    "require_full_mt_utilization": True,
     "assignment_mode": "STRICT_START",
     "maximum_allowed_delay_minutes": 30,
     "max_exact_sequence_stops": 4,

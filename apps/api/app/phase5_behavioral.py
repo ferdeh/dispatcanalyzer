@@ -478,6 +478,8 @@ def prepare_training_dataset(
             "master_compatibility_pass_percentage": readiness["master_compatibility_pass_percentage"],
             "sufficient_history_spbu_count": len(eligible_ids),
             "cold_start_active_spbu_count": len(cold_start_ids),
+            "no_history_active_spbu_count": sum(observation_counts[spbu_id] == 0 for spbu_id in cold_start_ids),
+            "insufficient_history_active_spbu_count": sum(observation_counts[spbu_id] > 0 for spbu_id in cold_start_ids),
             "excluded_insufficient_data_spbu_count": 0,
             "excluded_inactive_history_spbu_count": len(inactive_history_ids),
             "geocoded_training_spbu_count": sum(record["latitude"] is not None and record["longitude"] is not None for record in records),
@@ -555,21 +557,26 @@ def _validated_training_configuration(configuration: dict[str, Any] | None) -> d
 
 def _cluster_profiles(assignments: list[dict], records: list[dict], pair_rows: list[dict], shift_snapshot: list[dict]) -> list[dict]:
     record_lookup = {record["spbu_id"]: record for record in records}
+    historical_assignment_count = sum(bool(assignment.get("history_eligible", True)) for assignment in assignments)
     by_cluster: dict[int, list[dict]] = defaultdict(list)
     for assignment in assignments:
         if not assignment["is_noise"]:
             by_cluster[int(assignment["cluster_id"])].append(assignment)
     profiles = []
     for cluster_id, members in sorted(by_cluster.items()):
-        member_ids = {member["spbu_id"] for member in members}
-        tag_counts = Counter(tag for member in members for tag in record_lookup[member["spbu_id"]]["key_tags"])
+        historical_members = [member for member in members if member.get("history_eligible", True)]
+        cold_start_members = [member for member in members if not member.get("history_eligible", True)]
+        member_ids = {member["spbu_id"] for member in historical_members}
+        all_member_ids = {member["spbu_id"] for member in members}
+        tag_counts = Counter(tag for member in historical_members for tag in record_lookup[member["spbu_id"]]["key_tags"])
         common_tags = [
-            {"tag": tag, "member_count": count, "member_share": round(count / len(members), 4)}
+            {"tag": tag, "member_count": count, "member_share": round(count / len(historical_members), 4)}
             for tag, count in sorted(tag_counts.items(), key=lambda item: (-item[1], item[0]))
-            if count >= math.ceil(len(members) * 0.5)
+            if historical_members and count >= math.ceil(len(historical_members) * 0.5)
         ][:10]
         shift_means = [
-            float(np.mean([record_lookup[member["spbu_id"]]["shift_vector"][index] for member in members]))
+            float(np.mean([record_lookup[member["spbu_id"]]["shift_vector"][index] for member in historical_members]))
+            if historical_members else 0.0
             for index in range(len(shift_snapshot))
         ]
         dominant_index = max(range(len(shift_means)), key=lambda index: shift_means[index]) if shift_means else None
@@ -588,13 +595,16 @@ def _cluster_profiles(assignments: list[dict], records: list[dict], pair_rows: l
                     }
                 )
         internal_pairs.sort(key=lambda row: (-row["pairing_strength"], -row["pair_count"], row["spbu_a_code"], row["spbu_b_code"]))
-        average_probability = float(np.mean([member["membership_probability"] for member in members])) if members else 0.0
+        average_probability = float(np.mean([member["membership_probability"] for member in historical_members])) if historical_members else 0.0
         profiles.append(
             {
                 "cluster_id": cluster_id,
                 "cluster_label": f"Cluster {cluster_id + 1}",
                 "cluster_size": len(members),
-                "training_spbu_percentage": round(100 * len(members) / len(assignments), 2) if assignments else 0.0,
+                "historical_member_count": len(historical_members),
+                "cold_start_member_count": len(cold_start_members),
+                "no_history_member_count": sum(member.get("shipment_observation_count", 0) == 0 for member in cold_start_members),
+                "training_spbu_percentage": round(100 * len(historical_members) / historical_assignment_count, 2) if historical_assignment_count else 0.0,
                 "common_tags": common_tags,
                 "shift_distribution": [
                     {"shift_id": shift["shift_id"], "shift_name": shift["name"], "share": round(shift_means[index], 4)}
@@ -604,8 +614,10 @@ def _cluster_profiles(assignments: list[dict], records: list[dict], pair_rows: l
                 "top_internal_pairings": internal_pairs[:10],
                 "inference_internal_pairings": internal_pairs,
                 "average_membership_probability": round(average_probability, 4),
-                "low_confidence_member_count": sum(member["membership_probability"] < 0.5 for member in members),
+                "low_confidence_member_count": sum(member["membership_probability"] < 0.5 for member in historical_members),
                 "member_spbu_ids": sorted(member_ids),
+                "covered_member_spbu_ids": sorted(all_member_ids),
+                "evidence_scope": "Historical members only; cold-start coverage is reported separately and excluded from behavioral statistics.",
             }
         )
     return profiles
@@ -747,26 +759,32 @@ def train_behavioral_model(db: Session, training_run_id: str, configuration: dic
             )
         run.status = "CALCULATING_PROFILES"
         profiles = _cluster_profiles(assignments, records, pair_rows, run.shift_definition_snapshot)
-        cluster_count = len({assignment["cluster_id"] for assignment in assignments if not assignment["is_noise"]})
-        noise_count = sum(assignment["is_noise"] for assignment in assignments)
-        average_membership = float(np.mean([assignment["membership_probability"] for assignment in assignments]))
+        historical_assignments = [assignment for assignment in assignments if assignment["history_eligible"]]
+        cold_start_assignments = [assignment for assignment in assignments if not assignment["history_eligible"]]
+        cluster_count = len({assignment["cluster_id"] for assignment in historical_assignments if not assignment["is_noise"]})
+        noise_count = sum(assignment["is_noise"] for assignment in historical_assignments)
+        average_membership = float(np.mean([assignment["membership_probability"] for assignment in historical_assignments]))
         warnings = []
         if graph.number_of_edges() == 0:
             warnings.append("No pairing edges were available; every SPBU received the documented zero pairing embedding.")
         if noise_count == len(assignments):
             warnings.append("HDBSCAN marked every SPBU as noise. Review feature weights or density parameters before saving.")
-        cold_start_count = sum(not assignment["history_eligible"] for assignment in assignments)
+        cold_start_count = len(cold_start_assignments)
         if cold_start_count:
             warnings.append(
                 f"{cold_start_count} active SPBU lacked the minimum historical observations and received conservative nearest-cluster cold-start coverage."
             )
         result = {
             "summary": {
-                "training_spbu_count": len(assignments),
+                "training_spbu_count": len(historical_assignments),
                 "behavioral_history_spbu_count": len(history_indices),
+                "historical_training_spbu_count": len(historical_assignments),
+                "total_covered_spbu_count": len(assignments),
                 "cold_start_covered_spbu_count": cold_start_count,
+                "no_history_spbu_count": sum(assignment["shipment_observation_count"] == 0 for assignment in cold_start_assignments),
+                "insufficient_history_spbu_count": sum(assignment["shipment_observation_count"] > 0 for assignment in cold_start_assignments),
                 "cluster_count": cluster_count,
-                "clustered_spbu_count": len(assignments) - noise_count,
+                "clustered_spbu_count": len(historical_assignments) - noise_count,
                 "noise_spbu_count": noise_count,
                 "average_membership_probability": round(average_membership, 6),
             },

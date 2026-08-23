@@ -286,6 +286,8 @@ def test_engine_b_dataset_training_artifacts_versioning_activation_and_compariso
         assert prepared["dataset_summary"]["sufficient_history_spbu_count"] == 8
         assert prepared["dataset_summary"]["active_master_spbu_count"] == 9
         assert prepared["dataset_summary"]["cold_start_active_spbu_count"] == 1
+        assert prepared["dataset_summary"]["no_history_active_spbu_count"] == 1
+        assert prepared["dataset_summary"]["insufficient_history_active_spbu_count"] == 0
         assert prepared["dataset_summary"]["geocoded_training_spbu_count"] == 8
         assert prepared["dataset_summary"]["missing_coordinate_training_spbu_count"] == 1
         assert len(prepared["shift_definition_snapshot"]) == 4
@@ -307,6 +309,13 @@ def test_engine_b_dataset_training_artifacts_versioning_activation_and_compariso
         assert trained["library_versions"]["node2vec_implementation"] == "portable_walk_ppmi_svd.v1"
         assert "gensim" not in trained["library_versions"]
         assert len(trained["result"]["assignments"]) == 9
+        assert trained["result"]["summary"]["historical_training_spbu_count"] == 8
+        assert trained["result"]["summary"]["total_covered_spbu_count"] == 9
+        assert trained["result"]["summary"]["cold_start_covered_spbu_count"] == 1
+        assert trained["result"]["summary"]["no_history_spbu_count"] == 1
+        assert trained["result"]["summary"]["insufficient_history_spbu_count"] == 0
+        assert sum(profile["historical_member_count"] for profile in trained["result"]["cluster_profiles"]) == 8
+        assert sum(profile["cold_start_member_count"] for profile in trained["result"]["cluster_profiles"]) == 1
         cold_start = next(row for row in trained["result"]["assignments"] if row["spbu_id"] == "COLD")
         assert cold_start["coverage_source"] == "ACTIVE_MASTER_COLD_START"
         assert cold_start["history_eligible"] is False
@@ -317,6 +326,9 @@ def test_engine_b_dataset_training_artifacts_versioning_activation_and_compariso
         assert sum(row["latitude"] is None or row["longitude"] is None for row in trained["result"]["assignments"]) == 1
         model_v1 = save_behavioral_model(session, training_run_id, model_name="Behavior 2026", description="v1", created_by="tester")
         assert model_v1["model_version"] == 1
+        assert model_v1["historical_training_spbu_count"] == 8
+        assert model_v1["total_covered_spbu_count"] == 9
+        assert model_v1["cold_start_covered_spbu_count"] == 1
         assert model_v1["artifacts"]
         assert model_v1["shift_definition_snapshot"] == prepared["shift_definition_snapshot"]
         assert all(row["vehicle_class"] == 1 for row in model_v1["assignments"])
@@ -365,7 +377,8 @@ def test_engine_b_dataset_training_artifacts_versioning_activation_and_compariso
             assignment.membership_probability = 0.9
         session.commit()
         comparison = compare_behavioral_models(session, model_v1["model_id"], model_v2["model_id"])
-        assert len(comparison["stable_cluster_neighborhood_spbu_ids"]) == 9
+        assert len(comparison["stable_cluster_neighborhood_spbu_ids"]) == 8
+        assert "cold-start coverage is excluded" in comparison["methodology"]
         assert all(match["jaccard_similarity"] == 1.0 for match in comparison["cluster_matches"])
 
         activated_v1 = activate_behavioral_model(session, model_v1["model_id"])

@@ -734,12 +734,14 @@ Status saat ini: `IMPLEMENTED`.
 
 Phase 6 adalah inference, assignment, dan estimasi availability—bukan training dan bukan fleet route optimization. Satu run menggabungkan saved Phase 5 model, Loading Order bertimestamp, initial MT availability, master compatibility, dan estimasi perjalanan untuk menghasilkan trip plan auditable yang dapat menjadi input Phase 7.
 
+Detail teknis dan panduan operasional lengkap: `docs/PHASE_6_PREDICTION_ASSIGNMENT.md`.
+
 Input workbook:
 
 - Loading Order: `loading_order_no`, `shipment_start_datetime`, `spbu_no`, dan `order_quantity_kl`; setiap LO wajib tepat 8 KL
 - MT Availability: `vehicle_registration_no`, `initial_available_datetime`
 - template dapat diunduh dari page atau API; `.xlsx` dibatasi 10 MB
-- card **Loading Order Upload** menyediakan **Data Demo**: user memasukkan total order kelipatan 8 KL, sistem membuat satu LO 8 KL per unit order, hanya memilih SPBU aktif non-noise yang tercakup saved model, dan membentuk batch cluster/dominant-shift bertimestamp berdekatan agar demo dapat menguji multi-SPBU tanpa `UNSEEN_SPBU`; input dengan sisa di bawah 8 KL ditolak
+- card **Loading Order Upload** menyediakan **Data Demo**: user memasukkan total order kelipatan 8 KL, sistem membuat satu LO 8 KL per unit order, lalu hanya memilih SPBU aktif non-noise dengan `history_eligible=true` dan `coverage_source=BEHAVIORAL_HISTORY` pada saved model yang dipilih. Dengan demikian SPBU cold-start, inactive, noise, dan unseen tidak masuk data demo. LO dibentuk sebagai batch cluster/dominant-shift bertimestamp berdekatan agar demo dapat menguji multi-SPBU; input dengan sisa di bawah 8 KL ditolak
 - card **MT Availability Upload** menyediakan **Data Demo**: user memasukkan target total kapasitas MT dalam KL, sistem memilih kombinasi acak MT aktif dari master depot dengan total kapasitas paling dekat ke target; jam buka depot mengikuti `start_time` shift pertama dan jam tutup mengikuti `end_time` shift terakhir pada snapshot model. Secara default semua MT tersedia tepat pada jam buka, sedangkan opsi **Random availability** membuat jam availability secara acak di dalam window buka–tutup tersebut
 - workbook demo langsung dipasang sebagai file upload aktif dan melewati validator yang sama dengan file manual; nama SPBU, kuantitas order, kapasitas MT terpilih, dan timestamp ikut dipertahankan untuk audit
 - timestamp tanpa offset dibaca memakai timezone depot; normalized snapshot disimpan dalam UTC dan local time
@@ -755,7 +757,8 @@ Loading Order
         +
 Initial MT Availability
         ↓
-Capacity-Aware Shipment Grouping (1–4 LO)
+Iterative Capacity Grouping + Assignment
+32 KL (4 LO) → 24 KL (3 LO) → 16 KL (2 LO) → 8 KL (1 LO)
         ↓
 Phase 4 MT Candidate Score
         ↓
@@ -763,7 +766,7 @@ Phase 1 Master Compatibility Hard Filter
         +
 8 KL Compartment Capacity Sufficiency Hard Filter
         ↓
-Rolling Chronological MT Assignment
+Rolling Capacity-Tier + Chronological MT Assignment
         ↓
 Google Routes / Cache / Historical Estimate
         ↓
@@ -775,11 +778,13 @@ Final Dispatch Prediction
 Phase 7 Input
 ```
 
-Shipment inference memakai immutable Phase 5 artifact/normalized model registry: cluster membership probability, same-cluster evidence, model feature weights, derived-shift match, dan saved historical pairing strength. Grouping hanya dipertimbangkan dalam derived shift yang sama dan dalam `maximum_pairing_time_gap_minutes`; default window adalah 90 menit dan tetap configurable dari UI. Default minimum pairing confidence adalah 0,40 agar sufficient-history pair dapat terbentuk tanpa otomatis meloloskan cold-start coverage yang confidence-nya sengaja dibatasi. `planned_start_datetime` adalah timestamp LO paling akhir dalam shipment. Algoritma `CAPACITY_TIME_ROUTE_SET_PACKING` membangun connected candidate group hingga empat LO, lalu memilih kombinasi grup tidak-overlap secara global melalui binary MILP set packing (dengan deterministic greedy fallback). Objective memprioritaskan pengurangan shipment dan multi-SPBU, lalu mempertimbangkan group model score, time span, 8 KL compartment capacity, pair-evidence coverage, serta approximate nearest-to-farthest route dari koordinat master. Grup tidak lagi wajib complete clique, tetapi tetap harus lolos confidence minimum, time window, capacity, dan `maximum_group_route_detour_ratio`; Google Routes aktual baru dipanggil setelah grup terpilih. Versi algoritma ini adalah `phase6.capacity_time_route_set_packing.v7`.
+Shipment inference memakai immutable Phase 5 artifact/normalized model registry: cluster membership probability, same-cluster evidence, model feature weights, derived-shift match, dan saved historical pairing strength. Grouping hanya dipertimbangkan dalam derived shift yang sama dan dalam `maximum_pairing_time_gap_minutes`; default window adalah 90 menit dan tetap configurable dari UI. Default minimum pairing confidence adalah 0,40 agar sufficient-history pair dapat terbentuk tanpa otomatis meloloskan cold-start coverage yang confidence-nya sengaja dibatasi. `planned_start_datetime` adalah timestamp LO paling akhir dalam shipment. Algoritma `CAPACITY_TIME_ROUTE_SET_PACKING` membangun connected candidate group melalui binary MILP set packing (dengan deterministic greedy fallback), menggunakan group model score, time span, 8 KL compartment capacity, pair-evidence coverage, dan approximate route feasibility.
 
-MT ranking memakai Phase 4 historical `P(MT|SPBU)` dengan deterministic Laplace smoothing. Historical affinity hanya score/ranking; rule Phase 1 dari `app.compatibility.evaluate_compatibility_entities` tetap hard filter terpisah. Untuk multi-SPBU shipment, MT harus lulus rule untuk seluruh SPBU (intersection). Capacity profile dihitung dari master `capacity_label`/`vehicle_type_tag` dan `number_of_compartments`; setiap kompartemen bernilai 8 KL. Policy `ALLOW_PARTIAL_LOAD` menggunakan aturan `jumlah LO ≤ jumlah kompartemen`, sehingga satu LO 8 KL dapat dibawa MT 8/16/24/32 KL selama historical/master compatibility lulus. Candidate gagal disimpan sebagai diagnostic `MASTER_COMPATIBILITY_FAIL` atau `CAPACITY_COMPARTMENT_MISMATCH`; compartment count kosong dapat diinfer dari kapasitas dengan warning, tetapi data master yang saling bertentangan menjadi validation error.
+Orkestrasi `phase6.iterative_exact_capacity_assignment.v9` menjalankan grouping dan MT assignment secara bertingkat: 32 KL/4 LO, 24 KL/3 LO, 16 KL/2 LO, lalu 8 KL/1 LO. Hanya grup yang berhasil mendapat status `ASSIGNED` atau `ASSIGNED_WITH_DELAY` yang mengonsumsi LO. Jika grup besar tidak memiliki MT berkapasitas sama yang available dan compatible, grup tersebut dibubarkan dan LO-nya diprediksi ulang pada tier berikutnya. Di setiap tier, multi-LO tetap wajib memenuhi evidence cluster/shift/time/rute Fase 5, sedangkan candidate MT wajib lulus vehicle type, project tag, depot, dan kapasitas untuk seluruh SPBU. Tidak ada partial-load fallback: shipment 32/24/16/8 KL masing-masing hanya dapat memakai MT 32/24/16/8 KL. Dengan demikian optimizer menyesuaikan komposisi shipment terhadap armada aktual tanpa menjalankan MT yang kompartemennya tidak terisi penuh.
 
-Assignment diproses ascending `planned_start_datetime`. State awal tiap MT adalah `initial_available_datetime`; setelah trip dipilih, sistem menghitung return dan `next_available_datetime`. MT yang sama dapat mendapat Trip 1, 2, 3, dan seterusnya selama `previous.next_available <= next.predicted_departure`. Mode:
+MT ranking memakai Phase 4 historical `P(MT|SPBU)` dengan deterministic Laplace smoothing. Historical affinity hanya score/ranking; rule Phase 1 dari `app.compatibility.evaluate_compatibility_entities` tetap hard filter terpisah. Untuk multi-SPBU shipment, MT harus lulus rule untuk seluruh SPBU (intersection). Capacity profile dihitung dari master `capacity_label`/`vehicle_type_tag` dan `number_of_compartments`; setiap kompartemen bernilai 8 KL. Policy `EXACT_COMPARTMENT_MATCH` mewajibkan `jumlah LO = jumlah kompartemen MT`, sehingga seluruh kapasitas MT selalu terisi sebelum trip dijalankan. Candidate berbeda kapasitas disimpan sebagai diagnostic `CAPACITY_COMPARTMENT_MISMATCH`; candidate yang gagal master/tag compatibility disimpan sebagai `MASTER_COMPATIBILITY_FAIL`. Compartment count kosong dapat diinfer dari kapasitas dengan warning, tetapi data master yang saling bertentangan menjadi validation error.
+
+Assignment otomatis diproses berdasarkan tier kapasitas 32→24→16→8 KL, lalu ascending `planned_start_datetime` di dalam setiap tier. State awal tiap MT adalah `initial_available_datetime`; setelah trip dipilih, sistem menghitung return dan `next_available_datetime`. MT yang sama dapat mendapat Trip 1, 2, 3, dan seterusnya selama `previous.next_available <= next.predicted_departure`. Recalculation setelah manual assignment/grouping menggunakan urutan tier yang sama. Mode:
 
 - `STRICT_START`: MT harus available pada planned start
 - `ALLOW_DELAY`: departure boleh bergeser sampai `maximum_allowed_delay_minutes`, dengan status `ASSIGNED_WITH_DELAY`
@@ -826,6 +831,8 @@ Dispatcher dapat:
 
 - mengganti MT hanya ke candidate yang lulus historical/master compatibility dan mempunyai kompartemen cukup; route dan timeline downstream dihitung ulang dalam mode DRIVE
 - move LO/SPBU ke shipment same-shift, membuat shipment baru/single, atau combine same-shift shipment tanpa melewati batas kompartemen
+- melihat nomor cluster model aktif di samping setiap nomor SPBU; pilihan `Move to…` menampilkan shipment ID beserta daftar nomor SPBU dan cluster target
+- menelusuri **Prediction Run History** dengan pagination client-side 10/25/50 baris, indikator rentang, dan navigasi halaman tanpa mengubah immutable run data
 - memicu ulang candidate scoring, compatibility filter, rolling state, route duration, return, dan affected future availability tanpa training ulang
 - memicu kalkulasi ulang multi-trip MT, total assigned KL, distribusi KL per jam, cumulative distribution, dan geographic MT route pada setiap manual assignment atau perubahan grouping shipment
 - membandingkan immutable `original_model_prediction` dengan `final_dispatch_prediction`
@@ -852,12 +859,12 @@ Phase 7 tetap bertanggung jawab atas final route optimization, fleet-wide constr
 
 Verification terakhir:
 
-- migration PostgreSQL memiliki single head revision `0015_phase6_road_geometry`
-- seluruh **64 backend tests** lulus pada deployment image
-- **23 focused Phase 6 tests** lulus, termasuk asynchronous queue/worker recovery, three-LO/24-KL grouping, exact 8-KL validation, partial-load assignment, route geometry, dan pagination/lazy payload
+- migration PostgreSQL memiliki single head revision `0016_phase5_evidence_coverage`
+- seluruh **65 backend tests** lulus pada deployment image
+- **24 focused Phase 6 tests** lulus, termasuk asynchronous queue/worker recovery, iterative 32→24→16→8 KL assignment, three-LO/24-KL grouping, exact full-load capacity matching, tag compatibility, route geometry, dan pagination/lazy payload
 - TypeScript type checking dan Vite production build lulus
 - API health, kedua generator Data Demo, closest-capacity MT subset, timestamp validation, rolling assignment, DRIVE route cache/fallback, encrypted settings, exports, dan persistence telah diuji
-- Vite memberi non-blocking warning untuk application chunk sekitar 1.71 MB; code splitting ECharts/page modules menjadi technical debt performance
+- Vite memberi non-blocking warning untuk application chunk sekitar 1,79 MB; code splitting ECharts/page modules menjadi technical debt performance
 - host Python tanpa dependency ML lengkap tidak dapat menjalankan dua training tests Phase 5; deployment image adalah verification environment canonical dan membutuhkan `NUMBA_CPU_NAME=generic` serta `NUMBA_DISABLE_JIT=1` pada ARM untuk menghindari illegal-instruction dari Numba/UMAP
 
 ## Phase Quality Gate
@@ -966,5 +973,6 @@ Dokumen pendukung:
 - `docs/PHASE_0_STATUS.md`
 - `docs/PHASE_4_SPBU_MT_AFFINITY.md`
 - `docs/PHASE_5_MACHINE_LEARNING_INTELLIGENCE.md`
+- `docs/PHASE_6_PREDICTION_ASSIGNMENT.md`
 - `docs/FUTURE_VRP_INTEGRATION.md`
 - `docs/FUTURE_AI_ASSISTANT.md`
