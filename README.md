@@ -208,6 +208,7 @@ Card ini menjelaskan SPBU yang sedang dipilih. SPBU dapat dipilih melalui Search
 | Sub-card / metric | Arti | Cara membaca |
 |---|---|---|
 | SPBU | Kode SPBU aktif. | Semua affinity chart, temporal chart, recent comparison, dan evidence mengacu pada SPBU ini. |
+| SPBU Tag | Daftar tag master yang terhubung ke SPBU aktif. | Tanda `-` berarti SPBU tidak mempunyai tag aktif pada master data. |
 | Historical Shipments | Distinct shipment yang melayani SPBU pada scope aktif. | Ini denominator `P(MT|SPBU)`. |
 | Operating Days | Jumlah tanggal operasi unik yang mempunyai evidence. | Dua SPBU dengan shipment count sama dapat mempunyai temporal evidence berbeda jika operating days berbeda. |
 | Unique MT Used | Jumlah MT berbeda yang pernah melayani SPBU. | Baca bersama probability distribution, consistency, variability, dan confidence; jangan digunakan sendirian. |
@@ -254,7 +255,7 @@ Horizontal bar chart ini menampilkan historical MT distribution untuk SPBU aktif
 - Sumbu X berisi `P(MT|SPBU)` dalam persen.
 - Bar pertama berwarna lime untuk menandai dominant historical MT; bar lain berwarna biru.
 - Panjang bar menunjukkan seberapa sering MT tersebut digunakan relatif terhadap seluruh shipment SPBU.
-- Hover menampilkan MT, shipment count, probability, first observed, dan last observed.
+- Hover menampilkan MT, MT Tag, shipment count, probability, first observed, dan last observed.
 - Klik bar untuk memilih MT tersebut, memperbarui reverse detail dan evidence relationship.
 
 Contoh:
@@ -312,6 +313,13 @@ Satu shipment MT dapat melayani beberapa SPBU. Karena itu total `P(SPBU|MT)` sel
 
 Setiap titik mewakili satu SPBU.
 
+Kontrol navigasi di kanan atas chart:
+
+- ikon **kaca pembesar** memperbesar viewport secara bertahap; domain dan skala sumbu X/Y mengikuti kondisi zoom;
+- ikon **tangan** mengaktifkan pan; drag area plot untuk menggeser viewport pada kondisi zoom;
+- ikon **fit** mengembalikan viewport dan skala kedua sumbu ke posisi awal;
+- pada mode tangan, scroll mouse/trackpad pada area plot juga dapat memperbesar atau memperkecil viewport.
+
 - Sumbu X: **Unique MT Count**.
 - Sumbu Y: **Consistency Score**.
 - Ukuran titik: historical shipment count; titik besar mempunyai evidence shipment lebih banyak.
@@ -325,11 +333,13 @@ Cara membaca area plot:
 - Kiri bawah: sedikit MT dengan distribution lebih seimbang.
 - Kanan bawah: banyak MT dengan distribution tersebar; pola paling flexible.
 
-Hover menampilkan SPBU, shipment count, unique MT, dominant MT dan probability, consistency, variability, stability, serta confidence. Klik titik untuk membuka SPBU profile dan popup persisten berisi nama, kode, serta confidence SPBU. Titik terpilih diberi border gelap; popup dapat ditutup dengan tombol `×`.
+Hover menampilkan SPBU, SPBU Tag, shipment count, unique MT, dominant MT dan probability, consistency, variability, stability, serta confidence. Klik titik untuk membuka SPBU profile dan popup persisten berisi nama, kode, SPBU Tag, serta confidence SPBU. Titik terpilih diberi border gelap; popup dapat ditutup dengan tombol `×`.
 
 #### 6. Historical Pattern Matrix
 
 Matrix ini memberi operational overview berdasarkan dua dimensi:
+
+Matrix menyediakan kontrol kaca pembesar, tangan, dan fit yang sama dengan Scatter Plot. Zoom dan pan bekerja pada kedua sumbu, sedangkan fit mengembalikan domain `Unique MT` dan `Dominant Affinity` ke skala awal.
 
 - Sumbu X: Unique MT Count.
 - Sumbu Y: Dominant MT Affinity.
@@ -345,17 +355,31 @@ Empat quadrant dibaca sebagai berikut:
 | Kiri bawah | LIMITED BALANCED | Jumlah MT sedikit dan usage relatif terbagi. |
 | Kanan bawah | HIGHLY FLEXIBLE | Banyak MT dan dominant affinity rendah. |
 
-Warna titik mengikuti quadrant. Hover menampilkan SPBU, quadrant, unique MT, dominant affinity, dan shipment count. Klik titik untuk memilih SPBU.
+Warna titik mengikuti quadrant. Hover menampilkan SPBU, SPBU Tag, quadrant, unique MT, dominant affinity, dan shipment count. Klik titik untuk memilih SPBU.
 
 Matrix adalah ringkasan dua dimensi. Historical Pattern pada profile juga mempertimbangkan consistency dan Top-3 share, sehingga label detail dapat memberi konteks tambahan.
+
+Perbedaan utama kedua grafik:
+
+| Grafik | Pertanyaan yang dijawab | Distribution yang dipakai |
+|---|---|---|
+| SPBU Consistency Scatter Plot | Seberapa terkonsentrasi penggunaan MT pada setiap SPBU dibanding jumlah MT yang pernah digunakan? | Seluruh probability distribution MT melalui normalized HHI. |
+| Historical Pattern Matrix | Apakah SPBU lebih menyerupai dedicated, preferred-fleet, limited-balanced, atau highly-flexible? | Jumlah MT unik dan probability MT paling dominan. |
+
+Dua SPBU dapat berada pada quadrant Matrix yang sama tetapi mempunyai Consistency Score berbeda. Matrix hanya memakai dominant affinity dan jumlah MT unik, sedangkan Scatter Plot memperhitungkan pembagian shipment kepada seluruh MT.
 
 #### 7. Ranking cards
 
 Tiga ranking bukan recommendation list; semuanya ranking descriptive historical behavior.
 
-- **Most Historically Consistent SPBU** diurutkan berdasarkan Consistency Score. Kolom Unique MT dan Top-3 Share membantu membedakan concentration dengan ukuran fleet.
-- **Most Historically Variable SPBU** diurutkan berdasarkan Variability Score. Kolom Temporal Stability menunjukkan apakah variasi fleet tersebut tetap konsisten atau berubah antarperiode.
-- **Highest Historical Pattern Change** diurutkan dari Temporal Stability terendah. Pattern Shift serta Previous MT dan Recent MT menunjukkan arah perubahan dominant pattern.
+- **Most Historically Consistent SPBU** menjawab SPBU mana yang penggunaan MT-nya paling terkonsentrasi. Urutan dimulai dari Consistency Score tertinggi, lalu shipment terbanyak dan kode SPBU. Kolom Unique MT, Dominant %, dan Top-3 Share membantu membedakan concentration dengan ukuran fleet.
+- **Most Historically Variable SPBU** menjawab SPBU mana yang shipment-nya paling merata tersebar ke berbagai MT. Urutan dimulai dari Variability Score atau normalized entropy tertinggi, lalu shipment terbanyak dan kode SPBU. Variability tinggi tidak otomatis berarti pola sering berubah antarperiode.
+- **Highest Historical Pattern Change** menjawab SPBU mana yang distribusi MT-nya paling berubah antar-bucket waktu. Urutan dimulai dari Temporal Stability terendah, dilanjutkan Pattern Shift Distance terbesar dan shipment terbanyak. Previous MT, Recent MT, dan shift level menunjukkan arah serta besarnya perubahan dominant pattern.
+
+Contoh pembeda:
+
+- SPBU yang memakai banyak MT secara merata setiap minggu dapat mempunyai Variability tinggi tetapi Temporal Stability tetap tinggi karena pola pembagiannya konsisten.
+- SPBU yang hanya memakai dua MT dapat mempunyai Pattern Change tinggi apabila dominant MT berganti tajam antara periode sebelumnya dan periode terbaru.
 
 Klik nama/header kolom untuk mengubah sorting, gunakan Filter SPBU untuk menyaring ranking, dan klik row untuk membuka SPBU profile terkait. Selalu baca ranking bersama Shipment dan Confidence agar profile dengan evidence kecil tidak disamakan dengan profile ber-evidence kuat.
 
@@ -374,7 +398,8 @@ Cara membaca:
 - SPBU dengan banyak edge pernah dilayani oleh banyak MT.
 - MT dengan banyak edge mempunyai historical service footprint ke banyak SPBU.
 - Ketebalan edge menunjukkan historical shipment evidence. Pilihan Network Edge mengubah analytical edge value menjadi Shipment Count atau Affinity Probability, sedangkan tooltip tetap menampilkan kedua probability agar arah relationship dapat dibandingkan.
-- Hover edge menampilkan shipment count, `P(MT|SPBU)`, `P(SPBU|MT)`, first/last observed, operating days, dan confidence.
+- Hover node SPBU menampilkan SPBU Tag; hover node MT menampilkan MT Tag.
+- Hover edge menampilkan SPBU Tag, MT Tag, shipment count, `P(MT|SPBU)`, `P(SPBU|MT)`, first/last observed, operating days, dan confidence.
 - Klik node SPBU untuk highlight seluruh MT yang pernah melayaninya.
 - Klik node MT untuk membuka reverse service footprint MT tersebut.
 
@@ -692,18 +717,35 @@ Engine A — Historical MT–SPBU Concentration Anomaly:
 Engine B — SPBU Behavioral Clustering:
 
 - memakai workflow `Prepare Dataset → Validate → Configure → Train → Review → Save`
+- menilai setiap SPBU aktif dengan deterministic **Data Sufficiency Score 0–100** dari shipment count, operating days, training-period coverage, shift coverage, pairing evidence, dan recency. Ambang default terpusat adalah `SUFFICIENT >= 80`, `MARGINAL >= 50`, dan `INSUFFICIENT < 50`; konfigurasi serta component weights disnapshot bersama model
+- hanya `SUFFICIENT` yang membentuk scaler, UMAP geometry, dan HDBSCAN core boundary. `SUFFICIENT` tidak otomatis menjadi anggota cluster karena HDBSCAN tetap boleh menghasilkan `CORE_NOISE`
+- `MARGINAL` tidak ikut fit. Sesudah core training, fitted UMAP mentransform marginal record dan implementasi `sklearn.cluster.HDBSCAN` memakai fallback terdokumentasi **nearest core centroid in UMAP space**. Hanya confidence di atas ambang yang menjadi `MARGINAL_PROJECTED`; sisanya `MARGINAL_UNASSIGNED`
+- `INSUFFICIENT` selalu `INSUFFICIENT_UNASSIGNED`: tidak mempunyai cluster ID, membership probability, atau UMAP marker. **INSUFFICIENT bukan noise**, dan **marginal projection bukan core membership**
 - tag features mempertahankan tag-type boundary melalui typed multi-hot encoding; Vehicle Class disimpan sebagai feature ordinal
 - shift feature memakai seluruh historical shift distribution dan menyimpan exact shift-definition snapshot pada training run/model
 - Phase 3 same-shipment relationship dibentuk sebagai weighted graph; edge weight adalah mean dari dua directional conditional probabilities
 - pairing graph diubah menjadi embedding dengan Node2Vec memakai seed dan single worker; isolated nodes menerima zero pairing vector, dan graph tanpa edge menghasilkan zero vector untuk seluruh node
-- feature group Tag, Shift, Pairing distandardisasi sendiri-sendiri, dikalikan `sqrt(weight / group_dimension)`, lalu digabung agar group lebar tidak dominan hanya karena memiliki lebih banyak kolom
+- Geographic Proximity adalah feature group keempat. Koordinat canonical Master SPBU divalidasi sebagai `VALID`, `MISSING`, atau `INVALID`; `(0,0)`, out-of-range, null, dan duplicate-coordinate condition ditangani eksplisit. Haversine membentuk nearest distance, average/median K-nearest distance, serta local density. Missing/invalid coordinate memakai median core-training feature plus missing indicator, bukan silent zero
+- feature group Tag, Shift, Pairing, dan Geographic distandardisasi sendiri-sendiri, dikalikan `sqrt(weight / group_dimension)`, lalu digabung. Default weight adalah **30% / 20% / 30% / 20%**; geography dapat dimatikan dengan weight 0 dan remaining weights tervalidasi berjumlah 1
 - pipeline utama adalah **Node2Vec + UMAP + HDBSCAN**. HDBSCAN noise tetap noise dan ditampilkan sebagai `Noise / Unique Behavioral Pattern`
-- dataset v4 mempertahankan seluruh SPBU master berstatus `ACTIVE`. HDBSCAN dan scaler tetap di-fit hanya memakai SPBU yang memenuhi minimum historical observation; SPBU aktif lainnya dipetakan sesudah training ke centroid cluster terdekat sebagai `ACTIVE_MASTER_COLD_START` dengan membership maksimum 0,49 agar coverage lengkap tanpa menyamakan cold-start dengan behavioral evidence
-- pairing graph, shift distribution, dan shipment observation selalu dibangun ulang dari histori canonical dalam training period yang dipilih; dataset summary memisahkan sufficient-history, cold-start, dan inactive historical SPBU. Artifact inference menyimpan seluruh internal pairing edge, sedangkan panel review tetap membatasi tampilannya pada Top 10 per cluster
+- pairing graph, shift distribution, geographic representation, dan shipment evidence selalu dibangun ulang dari canonical history/master snapshot pada training period. Pairing graph dapat membawa `MARGINAL` agar dapat ditransform, tetapi hanya `SUFFICIENT` yang menentukan cluster
 - training result harus direview sebelum diberi nama dan disimpan; training tidak otomatis membuat registry model atau mengaktifkannya
 - saved model untuk depot aktif dapat dipilih dan dibuka langsung dari workspace Behavioral Clustering tanpa prepare dataset atau retraining; UMAP, Geographic Cluster Map, profiles, dan paginated membership memakai assignment model yang tersimpan
 - saved package berisi encoder/configuration, scaler metadata, Node2Vec embeddings, internal/visualization UMAP model, HDBSCAN model, vectors, assignments, profiles, dependency versions, manifest, dan checksum
 - binary package berada pada persistent `ML_ARTIFACT_DIR`; relational table hanya menyimpan artifact metadata/path/checksum
+
+Arsitektur Engine B:
+
+```text
+MASTER COMPATIBILITY → 100% PASS → DATA SUFFICIENCY
+                                      ├─ SUFFICIENT → TAG + SHIFT + PAIRING + GEOGRAPHY → UMAP → HDBSCAN → CORE / CORE NOISE
+                                      ├─ MARGINAL ─────────────────────────────────────→ POST-TRAINING PROJECTION / UNASSIGNED
+                                      └─ INSUFFICIENT ──────────────────────────────────→ NOT ASSIGNED
+```
+
+> Geographic Proximity in Phase 5 is a clustering feature only.
+
+Geographic Proximity memakai koordinat SPBU dan Haversine. Ini bukan road distance, large-vehicle route feasibility, travel time, traffic, atau route optimization; kebutuhan tersebut tetap berada pada phase routing/optimization berikutnya.
 
 Model lifecycle:
 
@@ -711,7 +753,7 @@ Model lifecycle:
 - hanya satu model `ACTIVE` per depot; aktivasi menurunkan model aktif lama menjadi `SAVED`
 - retraining tidak overwrite version lama; nama yang sama pada depot yang sama menghasilkan `v1`, `v2`, dan seterusnya
 - Duplicate hanya menyalin configuration ke training draft baru, bukan trained artifact
-- Compare mengabaikan arbitrary HDBSCAN cluster IDs. Cluster antar-model dipasangkan secara optimal berdasarkan Jaccard similarity membership set menggunakan Hungarian assignment
+- Compare mengabaikan arbitrary HDBSCAN cluster IDs. Core cluster antar-model dipasangkan berdasarkan Jaccard/Hungarian, sedangkan perubahan kematangan data (`INSUFFICIENT → MARGINAL`, `MARGINAL → SUFFICIENT`, dan arah lain) dilaporkan terpisah
 - active-model API menyediakan version, period, assignments, membership probability, dan cluster profiles untuk phase berikutnya
 
 Local ML setup di luar Docker:
@@ -859,8 +901,10 @@ Phase 7 tetap bertanggung jawab atas final route optimization, fleet-wide constr
 
 Verification terakhir:
 
-- migration PostgreSQL memiliki single head revision `0016_phase5_evidence_coverage`
-- seluruh **65 backend tests** lulus pada deployment image
+- migration PostgreSQL memiliki single head revision `0017_phase5_sufficiency_geo`
+- seluruh **68 backend tests** lulus pada deployment image
+- focused Phase 5 + Phase 6 regression suite berisi **33 tests** dan seluruhnya lulus pada deployment image
+- focused Phase 5 suite berisi **9 tests** untuk sufficiency boundaries, geographic validation/Haversine/KNN features, marginal projection, persistence contract, dan pemisahan insufficient dari HDBSCAN noise
 - **24 focused Phase 6 tests** lulus, termasuk asynchronous queue/worker recovery, iterative 32→24→16→8 KL assignment, three-LO/24-KL grouping, exact full-load capacity matching, tag compatibility, route geometry, dan pagination/lazy payload
 - TypeScript type checking dan Vite production build lulus
 - API health, kedua generator Data Demo, closest-capacity MT subset, timestamp validation, rolling assignment, DRIVE route cache/fallback, encrypted settings, exports, dan persistence telah diuji

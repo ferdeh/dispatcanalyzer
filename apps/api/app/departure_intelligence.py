@@ -9,7 +9,7 @@ from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .models import FactGPSEvent, FactLoadingOrderLine, FactShipment, FactShipmentSPBU, MasterDepot, MasterMT, MasterSPBU
+from .models import BridgeSPBUTag, FactGPSEvent, FactLoadingOrderLine, FactShipment, FactShipmentSPBU, MasterDepot, MasterMT, MasterSPBU, MasterTag
 
 
 ALGORITHM_VERSION = "departure_profile.circular_gap_v1"
@@ -50,6 +50,7 @@ def build_departure_intelligence_payload(
     sort_direction: str = "desc",
     confidence_level: str | None = None,
     spbu_ids: list[str] | None = None,
+    profile_search: str | None = None,
 ) -> dict:
     if bucket_minutes not in {30, 60}:
         raise HTTPException(status_code=400, detail="bucket_minutes must be 30 or 60.")
@@ -65,8 +66,10 @@ def build_departure_intelligence_payload(
     observations = build_observations(raw_rows, gps_lookup, quantity_lookup)
     valid_observations = [row for row in observations if row["departure_datetime_used"]]
 
-    all_profiles = sort_profiles(build_profiles(valid_observations, bucket_minutes), sort_column, sort_direction)
-    profiles = filter_departure_profiles(all_profiles, confidence_level, spbu_ids)
+    all_profiles = build_profiles(valid_observations, bucket_minutes)
+    attach_spbu_tags(db, all_profiles)
+    all_profiles = sort_profiles(all_profiles, sort_column, sort_direction)
+    profiles = filter_departure_profiles(all_profiles, confidence_level, spbu_ids, profile_search)
     total = len(profiles)
     visible_profiles = profiles[offset : offset + limit]
 
@@ -85,6 +88,7 @@ def build_departure_intelligence_payload(
             "sort_direction": "desc" if sort_direction == "desc" else "asc",
             "confidence_level": confidence_level or "ALL",
             "spbu_ids": spbu_ids or [],
+            "profile_search": profile_search or "",
         },
         "summary": build_summary(observations, valid_observations, all_profiles),
         "distribution": build_distribution(valid_observations, bucket_minutes),
@@ -448,7 +452,29 @@ def sort_profiles(profiles: list[dict], sort_column: str, sort_direction: str) -
     return sorted(profiles, key=lambda item: (key_fn(item), item.get("spbu_code") or item.get("spbu_id") or ""), reverse=reverse)
 
 
-def filter_departure_profiles(profiles: list[dict], confidence_level: str | None, spbu_ids: list[str] | None) -> list[dict]:
+def attach_spbu_tags(db: Session, profiles: list[dict]) -> None:
+    spbu_ids = sorted({profile["spbu_id"] for profile in profiles})
+    if not spbu_ids:
+        return
+    rows = db.execute(
+        select(BridgeSPBUTag.spbu_id, MasterTag.tag_value)
+        .join(MasterTag, MasterTag.tag_id == BridgeSPBUTag.tag_id)
+        .where(BridgeSPBUTag.spbu_id.in_(spbu_ids), MasterTag.active_status != "DELETED")
+        .order_by(BridgeSPBUTag.spbu_id, MasterTag.tag_value)
+    ).all()
+    tags_by_spbu: dict[str, list[str]] = defaultdict(list)
+    seen: set[tuple[str, str]] = set()
+    for spbu_id, tag_value in rows:
+        key = (spbu_id, tag_value)
+        if key in seen:
+            continue
+        seen.add(key)
+        tags_by_spbu[spbu_id].append(tag_value)
+    for profile in profiles:
+        profile["spbu_tags"] = tags_by_spbu.get(profile["spbu_id"], [])
+
+
+def filter_departure_profiles(profiles: list[dict], confidence_level: str | None, spbu_ids: list[str] | None, profile_search: str | None = None) -> list[dict]:
     filtered = profiles
     if confidence_level and confidence_level.upper() in {"HIGH", "MEDIUM", "LOW"}:
         target_level = confidence_level.upper()
@@ -456,6 +482,15 @@ def filter_departure_profiles(profiles: list[dict], confidence_level: str | None
     if spbu_ids is not None:
         allowed_spbu_ids = {spbu_id for spbu_id in spbu_ids if spbu_id}
         filtered = [profile for profile in filtered if profile.get("spbu_id") in allowed_spbu_ids]
+    if profile_search and profile_search.strip():
+        query = profile_search.strip().lower()
+        filtered = [
+            profile
+            for profile in filtered
+            if query in (profile.get("spbu_code") or "").lower()
+            or query in (profile.get("spbu_name") or "").lower()
+            or any(query in str(tag).lower() for tag in profile.get("spbu_tags", []))
+        ]
     return filtered
 
 

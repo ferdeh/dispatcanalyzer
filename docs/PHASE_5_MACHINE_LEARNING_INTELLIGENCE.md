@@ -43,9 +43,9 @@ Preparation is explicit and persisted as `MLTrainingRun` with status `DATASET_RE
 - Tag group: typed multi-hot tags; Vehicle Class is a separately bounded ordinal feature scaled by the maximum training value.
 - Shift group: Phase 2 `departure_datetime_used` and full shift distribution. The exact validated shift definition is snapshotted.
 - Pairing group: Phase 3 same-shipment membership and pair metrics. Symmetric graph weight is the mean of `P(B|A)` and `P(A|B)`.
-- Geographic snapshot: Master SPBU latitude/longitude is retained only for the Geographic Cluster Map. Coordinates do not enter feature fusion, UMAP, or HDBSCAN and therefore cannot influence cluster membership.
+- Geographic group: canonical Master SPBU coordinates are validated, then Haversine KNN produces nearest distance, average/median K-nearest distance, and local density. Coordinate state is `VALID`, `MISSING`, or `INVALID`; duplicate coordinates are flagged. Missing/invalid feature values use core-training medians plus an explicit missing indicator.
 
-SPBUs below the minimum shipment count no longer disappear from saved-model coverage. HDBSCAN, scaler, and behavioral features are fit only on sufficient-history SPBUs. After training, every remaining active master SPBU is projected through the saved preprocessing pipeline and assigned conservatively to the nearest non-noise cluster centroid with membership capped below 0.50. Each assignment stores `shipment_observation_count`, `coverage_source`, and `history_eligible`; no-history and insufficient-history counts remain separate in the dataset/model summary. Inactive historical SPBUs remain excluded.
+Every active SPBU receives a deterministic 0–100 sufficiency score from shipment count, operating days, period coverage, shift coverage, pairing evidence, and recency. Central defaults classify `SUFFICIENT >= 80`, `MARGINAL >= 50`, and the remainder `INSUFFICIENT`. Only SUFFICIENT SPBUs fit scalers, UMAP, and HDBSCAN. MARGINAL SPBUs may be transformed and projected after core training; low-confidence projection stays unassigned. INSUFFICIENT SPBUs remain unassigned and never appear as HDBSCAN noise. Inactive historical SPBUs remain excluded.
 
 ## Engine B training
 
@@ -54,15 +54,22 @@ The reproducible pipeline is:
 ```text
 weighted Phase 3 graph → seeded Node2Vec walks → PPMI → Truncated SVD
 typed tag vector ────────────────┐
-full shift distribution ─────────┼→ group scaling + sqrt(weight / dimension) → UMAP → HDBSCAN
-pairing embedding ────────────────┘
+full shift distribution ─────────┤
+pairing embedding ────────────────┼→ group scaling + sqrt(weight / dimension) → UMAP → HDBSCAN
+Haversine KNN proximity ──────────┘
 ```
+
+Default feature weights are Tag 0.30, Shift 0.20, Pairing 0.30, and Geographic 0.20. Geography can be disabled; its weight must then be zero and the remaining groups must sum to 1.00.
 
 Node2Vec transitions and UMAP receive explicit seeds. The second-order `p`/`q` walk semantics remain intact, while the walk contexts are converted to a positive-PMI matrix and reduced with deterministic `sklearn.decomposition.TruncatedSVD`. This removes the Gensim native Word2Vec extension that could terminate an ARM64 API process with `Illegal instruction`. The Docker runtime also targets Numba's generic CPU profile so UMAP/PyNNDescent does not JIT instructions unsupported by the container CPU. Isolated nodes receive a zero pairing vector. If the graph has no edges, every pairing vector is zero and training continues with a visible warning. The implementation uses the maintained `sklearn.cluster.HDBSCAN`; HDBSCAN noise is never reassigned.
 
-A separate seeded 2D UMAP creates visualization coordinates. The internal UMAP dimension may be higher. Cluster profiles report historical and cold-start member counts separately. Common tags (at least 50% membership), mean shift distribution, dominant shift, strongest internal Phase 3 pairings, average membership, and low-confidence count are calculated only from historical members so cold-start projection cannot rewrite behavioral evidence.
+A separate seeded 2D UMAP creates visualization coordinates. The internal UMAP dimension may be higher. Core profiles and behavioral statistics use `CORE_MEMBER` only and report projected marginal coverage separately. `CORE_NOISE` is a valid sufficient-data result. `MARGINAL_PROJECTED` is coverage, not core membership. `INSUFFICIENT_UNASSIGNED` has no embedding coordinate, cluster ID, or fake probability.
 
-The UI presents the UMAP behavioral-similarity map separately from an OpenStreetMap geographic view. A fresh training result uses its snapshotted Master SPBU latitude/longitude. When a saved registry model is reopened, the same stored cluster assignments are enriched with the current Master SPBU coordinates and Vehicle Class so master-data corrections are reflected without changing any cluster. A larger dark marker with a yellow outline shows the current Master Depot latitude/longitude and is included in automatic map bounds. Hovering a geographic node shows the SPBU name/code, cluster, dominant shift, Vehicle Class, and all other typed tags; hovering the depot marker shows its master name and coordinates. Records without complete coordinates remain in the model and membership table but are excluded from the geographic layer with a visible count.
+The maintained `sklearn.cluster.HDBSCAN` implementation does not expose approximate prediction. Phase 5 therefore uses the fitted UMAP transform followed by nearest core-cluster centroid distance in the internal embedding. Confidence is an exponential function of distance divided by the persisted cluster scale and multiplier. The method, scales, multiplier, and minimum confidence are part of the reproducibility package; projection below threshold becomes `MARGINAL_UNASSIGNED`.
+
+The UI presents the UMAP behavioral-similarity map separately from an OpenStreetMap geographic view. UMAP defaults to core points and can overlay marginal projections; insufficient records are never rendered as embedded members. A saved model reuses its immutable training-run SPBU coordinate snapshot, so later master edits cannot silently change the spatial feature interpretation. The geographic view can still show any valid physical SPBU position with sufficiency and assignment status. A larger dark marker with a yellow outline shows current Master Depot coordinates. Hover shows SPBU name/code, cluster, sufficiency, assignment type, dominant shift, Vehicle Class, and typed tags. Records without valid coordinates remain in the model/table with an explicit count and status.
+
+Geographic Proximity in Phase 5 is a clustering feature only. It uses coordinate relationships and Haversine distance; it does not represent road distance, large-vehicle feasibility, travel time, traffic, or route optimization.
 
 Training produces a review result, not a registry model. Saving requires a non-empty name.
 
@@ -83,7 +90,7 @@ The Behavioral Clustering workspace can list saved models for the selected depot
 
 ## Model comparison
 
-HDBSCAN labels are arbitrary. Comparison builds sufficient-history SPBU membership sets, excludes cold-start coverage, calculates every cross-model Jaccard similarity, and applies Hungarian optimal matching. It reports stable neighborhoods, changed matched clusters, new/returning noise, new/removed historical SPBUs, splits, and merges.
+HDBSCAN labels are arbitrary. Comparison builds SUFFICIENT core membership sets, excludes marginal projections and insufficient records, calculates cross-model Jaccard similarity, and applies Hungarian optimal matching. It also reports population/configuration/geographic differences, marginal projection rate/confidence, and per-SPBU data-maturity transitions independently from cluster matching.
 
 ## API
 

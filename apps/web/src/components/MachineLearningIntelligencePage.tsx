@@ -53,6 +53,7 @@ type Readiness = {
 type MTDistribution = {
   mt_id: string;
   mt_registration: string;
+  mt_tags: string[];
   shipment_count: number;
   historical_share: number;
   historically_used: boolean;
@@ -61,6 +62,7 @@ type ConcentrationProfile = {
   spbu_id: string;
   spbu_code: string;
   spbu_name: string | null;
+  spbu_tags: string[];
   shipment_observation_count: number;
   compatible_mt_count: number;
   historically_used_mt_count: number;
@@ -121,7 +123,25 @@ type DatasetSummary = {
   missing_coordinate_training_spbu_count: number;
   pairing_edge_count: number;
   isolated_spbu_count: number;
+  total_spbu: number;
+  sufficient_count: number;
+  marginal_count: number;
+  insufficient_count: number;
+  core_training_count: number;
+  valid_coordinate_count: number;
+  invalid_coordinate_count: number;
+  geographic_coverage_percentage: number;
+  geographic_proximity_enabled: boolean;
+  geography_configuration: Record<string, string | number | boolean>;
+  feature_weights: Record<string, number>;
 };
+type DataSufficiencyStatus = "SUFFICIENT" | "MARGINAL" | "INSUFFICIENT";
+type ClusterAssignmentType =
+  | "CORE_MEMBER"
+  | "CORE_NOISE"
+  | "MARGINAL_PROJECTED"
+  | "MARGINAL_UNASSIGNED"
+  | "INSUFFICIENT_UNASSIGNED";
 type Assignment = {
   spbu_id: string;
   spbu_code: string;
@@ -129,17 +149,42 @@ type Assignment = {
   latitude?: number | null;
   longitude?: number | null;
   shipment_observation_count?: number;
-  coverage_source?: "BEHAVIORAL_HISTORY" | "ACTIVE_MASTER_COLD_START";
+  coverage_source?:
+    | "BEHAVIORAL_HISTORY"
+    | "MARGINAL_HISTORY"
+    | "INSUFFICIENT_HISTORY"
+    | "ACTIVE_MASTER_COLD_START";
   history_eligible?: boolean;
+  data_sufficiency_score: number;
+  data_sufficiency_status: DataSufficiencyStatus;
+  data_sufficiency_components?: Record<string, number>;
+  operating_day_count?: number;
+  training_period_coverage?: number;
+  shift_observation_coverage?: number;
+  pairing_observation_count?: number;
+  pairing_observation_strength?: number;
+  last_operating_date?: string | null;
+  recency_age_days?: number | null;
   cluster_id: number | null;
   cluster_label: string;
-  membership_probability: number;
+  cluster_assignment_type: ClusterAssignmentType;
+  membership_probability: number | null;
+  projected_cluster_id?: number | null;
+  projection_confidence?: number | null;
+  projection_status?: string;
+  unassigned_reason?: string | null;
   is_noise: boolean;
   dominant_shift: string;
   vehicle_class?: number | null;
   key_tags: string[];
-  visualization_x: number;
-  visualization_y: number;
+  geographic_data_status: "VALID" | "MISSING" | "INVALID";
+  geographic_duplicate_coordinate?: boolean;
+  nearest_spbu_distance_km?: number | null;
+  average_k_nearest_distance_km?: number | null;
+  median_k_nearest_distance_km?: number | null;
+  local_spbu_density?: number | null;
+  visualization_x: number | null;
+  visualization_y: number | null;
 };
 type ClusterProfile = {
   cluster_id: number;
@@ -147,6 +192,7 @@ type ClusterProfile = {
   cluster_size: number;
   historical_member_count: number;
   cold_start_member_count: number;
+  projected_member_count?: number;
   no_history_member_count: number;
   training_spbu_percentage: number;
   common_tags: Array<{
@@ -182,6 +228,20 @@ type TrainingResult = {
     clustered_spbu_count: number;
     noise_spbu_count: number;
     average_membership_probability: number;
+    total_spbu_count: number;
+    sufficient_spbu_count: number;
+    marginal_spbu_count: number;
+    insufficient_spbu_count: number;
+    core_training_spbu_count: number;
+    core_cluster_member_count: number;
+    core_noise_count: number;
+    marginal_projected_count: number;
+    marginal_unassigned_count: number;
+    insufficient_unassigned_count: number;
+    average_projection_confidence: number;
+    valid_coordinate_count: number;
+    invalid_coordinate_count: number;
+    geographic_coverage_percentage: number;
   };
   assignments: Assignment[];
   cluster_profiles: ClusterProfile[];
@@ -221,12 +281,27 @@ type ModelSummary = {
   cluster_count: number;
   noise_spbu_count: number;
   average_membership_probability: number;
+  total_spbu_count: number;
+  sufficient_spbu_count: number;
+  marginal_spbu_count: number;
+  insufficient_spbu_count: number;
+  core_training_spbu_count: number;
+  core_cluster_member_count: number;
+  marginal_projected_count: number;
+  marginal_unassigned_count: number;
+  insufficient_unassigned_count: number;
+  average_projection_confidence: number;
+  geographic_proximity_enabled: boolean;
+  geographic_weight: number;
+  valid_coordinate_count: number;
+  invalid_coordinate_count: number;
+  geographic_coverage_percentage: number;
   model_status: string;
   algorithm_version: string;
   created_by: string;
   created_at: string | null;
 };
-type EvidenceFilter = "HISTORICAL" | "COLD_START" | "ALL";
+type EvidenceFilter = "CORE" | "MARGINAL" | "ALL";
 type ModelDetail = ModelSummary & {
   feature_weights: Record<string, number>;
   node2vec_parameters: Record<string, string | number>;
@@ -236,10 +311,21 @@ type ModelDetail = ModelSummary & {
   assignments: Assignment[];
   cluster_profiles: ClusterProfile[];
   library_versions: Record<string, string>;
+  data_sufficiency_configuration: Record<string, unknown>;
+  geographic_configuration: Record<string, unknown>;
+  projection_method: string;
+  projection_parameters: Record<string, unknown>;
+  minimum_projection_confidence: number;
 };
 type Comparison = {
-  model_a: ModelSummary & { feature_weights: Record<string, number> };
-  model_b: ModelSummary & { feature_weights: Record<string, number> };
+  model_a: ModelSummary & {
+    feature_weights: Record<string, number>;
+    geographic_configuration: Record<string, string | number | boolean>;
+  };
+  model_b: ModelSummary & {
+    feature_weights: Record<string, number>;
+    geographic_configuration: Record<string, string | number | boolean>;
+  };
   cluster_matches: Array<{
     model_a_cluster_id: number;
     model_b_cluster_id: number;
@@ -253,6 +339,11 @@ type Comparison = {
   cluster_splits: unknown[];
   cluster_merges: unknown[];
   methodology: string;
+  data_maturity_transitions: Array<{
+    transition: string;
+    count: number;
+    spbu_ids: string[];
+  }>;
 };
 
 const CLUSTER_COLORS = [
@@ -319,7 +410,26 @@ const defaultShifts: ShiftDefinition[] = [
   },
 ];
 const defaultConfig = {
-  feature_weights: { tag: 0.4, shift: 0.25, pairing: 0.35 },
+  feature_weights: { tag: 0.3, shift: 0.2, pairing: 0.3, geographic: 0.2 },
+  data_sufficiency_configuration: {
+    minimum_shipment_observations: 10,
+    minimum_operating_days: 5,
+    minimum_period_coverage: 0.25,
+    minimum_shift_coverage: 0.6,
+    minimum_pairing_evidence: 3,
+    recency_configuration: { maximum_age_days: 30 },
+    thresholds: { sufficient: 80, marginal: 50 },
+  },
+  geographic_configuration: {
+    enabled: true,
+    k_nearest_neighbors: 10,
+    maximum_proximity_distance_km: 30,
+  },
+  projection_configuration: {
+    method: "UMAP_NEAREST_CORE_CENTROID",
+    minimum_confidence: 0.55,
+    distance_scale_multiplier: 2,
+  },
   node2vec_parameters: {
     dimensions: 16,
     walk_length: 20,
@@ -361,21 +471,41 @@ function label(value: string) {
   return value.replace(/_/g, " ");
 }
 
+function formatTags(tags: string[] | null | undefined) {
+  return tags?.length ? tags.join(", ") : "-";
+}
+
+function escapeTooltip(value: string) {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 function hasHistoricalEvidence(assignment: Assignment) {
-  return assignment.history_eligible !== false;
+  return assignment.data_sufficiency_status === "SUFFICIENT";
 }
 
 function evidenceStatus(assignment: Assignment) {
-  if (hasHistoricalEvidence(assignment)) return "Historical Training Evidence";
-  return (assignment.shipment_observation_count ?? 0) === 0
-    ? "Cold Start · No Historical Data"
-    : "Cold Start · Insufficient History";
+  return `${assignment.data_sufficiency_status} · ${label(assignment.cluster_assignment_type)}`;
 }
 
 function confidenceLabel(assignment: Assignment) {
-  return hasHistoricalEvidence(assignment)
-    ? "Membership Probability"
-    : "Provisional Assignment Confidence";
+  return assignment.cluster_assignment_type.startsWith("MARGINAL")
+    ? "Projection Confidence"
+    : assignment.cluster_assignment_type.startsWith("CORE")
+      ? "Membership Probability"
+      : "Not applicable";
+}
+
+function assignmentConfidence(assignment: Assignment) {
+  return assignment.cluster_assignment_type.startsWith("MARGINAL")
+    ? assignment.projection_confidence
+    : assignment.cluster_assignment_type.startsWith("CORE")
+      ? assignment.membership_probability
+      : null;
 }
 
 function badgeClass(value: string) {
@@ -386,16 +516,31 @@ function badgeClass(value: string) {
       "NORMAL",
       "COMPLETED",
       "DATASET_READY",
+      "SUFFICIENT",
+      "CORE_MEMBER",
+      "PROJECTED",
     ].includes(value)
   )
     return "border-mint bg-mint/10 text-mint";
-  if (["MODERATE_CONCENTRATION", "SAVED", "ARCHIVED"].includes(value))
+  if (
+    [
+      "MODERATE_CONCENTRATION",
+      "SAVED",
+      "ARCHIVED",
+      "MARGINAL",
+      "MARGINAL_PROJECTED",
+      "MARGINAL_UNASSIGNED",
+    ].includes(value)
+  )
     return "border-amber bg-amber/10 text-amber";
   if (
     [
       "INSUFFICIENT_DATA",
       "NOISE",
       "Noise / Unique Behavioral Pattern",
+      "INSUFFICIENT",
+      "INSUFFICIENT_UNASSIGNED",
+      "CORE_NOISE",
     ].includes(value)
   )
     return "border-slate-300 bg-slate-50 text-slate-600";
@@ -582,8 +727,9 @@ function GeographicClusterMap({
             Geographic Cluster Map
           </h3>
           <p className="mt-1 text-xs text-slate-500">
-            Master SPBU and Master Depot latitude/longitude positions;
-            coordinates do not influence clustering.
+            Master SPBU and Master Depot coordinates. Haversine proximity is a
+            clustering feature when enabled; this is not road distance, travel
+            time, or route feasibility.
           </p>
         </div>
         <div className="text-xs text-slate-500">
@@ -655,19 +801,23 @@ function GeographicClusterMap({
                   center={[assignment.latitude, assignment.longitude]}
                   radius={assignment.is_noise ? 5 : 6}
                   pathOptions={{
-                    color: hasHistoricalEvidence(assignment)
-                      ? "#ffffff"
-                      : clusterColor(assignment.cluster_label, clusterLabels),
+                    color:
+                      assignment.data_sufficiency_status === "SUFFICIENT"
+                        ? "#ffffff"
+                        : assignment.data_sufficiency_status === "MARGINAL"
+                          ? "#f59e0b"
+                          : "#64748b",
                     fillColor:
                       (assignment.shipment_observation_count ?? 0) === 0 &&
                       !hasHistoricalEvidence(assignment)
                         ? "#e2e8f0"
                         : clusterColor(assignment.cluster_label, clusterLabels),
-                    fillOpacity: hasHistoricalEvidence(assignment)
-                      ? 0.88
-                      : (assignment.shipment_observation_count ?? 0) === 0
-                        ? 0.28
-                        : 0.18,
+                    fillOpacity:
+                      assignment.data_sufficiency_status === "SUFFICIENT"
+                        ? 0.88
+                        : assignment.data_sufficiency_status === "MARGINAL"
+                          ? 0.55
+                          : 0.25,
                     weight: hasHistoricalEvidence(assignment) ? 1.5 : 2.5,
                   }}
                 >
@@ -694,7 +844,7 @@ function GeographicClusterMap({
                         <span className="font-semibold">
                           {confidenceLabel(assignment)}:
                         </span>{" "}
-                        {pct(assignment.membership_probability)}
+                        {pct(assignmentConfidence(assignment))}
                       </div>
                       <div className="mt-2">
                         <span className="font-semibold">Shift:</span>{" "}
@@ -730,7 +880,7 @@ function GeographicClusterMap({
                       </div>
                       <div>
                         {confidenceLabel(assignment)}:{" "}
-                        {pct(assignment.membership_probability)}
+                        {pct(assignmentConfidence(assignment))}
                       </div>
                       <div>Dominant shift: {assignment.dominant_shift}</div>
                       <div>
@@ -801,11 +951,11 @@ function GeographicClusterMap({
             )}
             <div className="inline-flex items-center gap-1.5">
               <span className="h-3 w-3 rounded-full border border-white bg-petroblue" />
-              Historical evidence
+              Sufficient core evidence
             </div>
             <div className="inline-flex items-center gap-1.5">
               <span className="h-3 w-3 rounded-full border-2 border-petroblue bg-white" />
-              Cold-start coverage
+              Marginal / insufficient (outlined)
             </div>
             {clusterLabels.map((clusterLabel) => (
               <div
@@ -887,8 +1037,19 @@ export function MachineLearningIntelligencePage({
   const [clusterMembershipPage, setClusterMembershipPage] = useState(0);
   const [clusterMembershipPageSize, setClusterMembershipPageSize] =
     useState(10);
-  const [evidenceFilter, setEvidenceFilter] =
-    useState<EvidenceFilter>("HISTORICAL");
+  const [evidenceFilter, setEvidenceFilter] = useState<EvidenceFilter>("CORE");
+  const [sufficiencyFilter, setSufficiencyFilter] = useState("ALL");
+  const [assignmentTypeFilter, setAssignmentTypeFilter] = useState("ALL");
+  const [clusterFilter, setClusterFilter] = useState("ALL");
+  const [noiseFilter, setNoiseFilter] = useState("ALL");
+  const [minimumProjectionConfidence, setMinimumProjectionConfidence] =
+    useState("0");
+  const [minimumMembershipProbability, setMinimumMembershipProbability] =
+    useState("0");
+  const [geographicStatusFilter, setGeographicStatusFilter] = useState("ALL");
+  const [clusterSpbuSearch, setClusterSpbuSearch] = useState("");
+  const [selectedAssignment, setSelectedAssignment] =
+    useState<Assignment | null>(null);
   const [selectedCluster, setSelectedCluster] = useState<ClusterProfile | null>(
     null,
   );
@@ -1125,11 +1286,47 @@ export function MachineLearningIntelligencePage({
     [concentrationRun],
   );
 
-  function updateWeight(key: "tag" | "shift" | "pairing", value: string) {
+  function updateWeight(
+    key: "tag" | "shift" | "pairing" | "geographic",
+    value: string,
+  ) {
     setTrainingConfig((current) => ({
       ...current,
       feature_weights: { ...current.feature_weights, [key]: Number(value) },
     }));
+  }
+
+  function toggleGeography(enabled: boolean) {
+    setTrainingConfig((current) => {
+      if (enabled) {
+        return {
+          ...current,
+          geographic_configuration: {
+            ...current.geographic_configuration,
+            enabled: true,
+          },
+          feature_weights: {
+            tag: 0.3,
+            shift: 0.2,
+            pairing: 0.3,
+            geographic: 0.2,
+          },
+        };
+      }
+      return {
+        ...current,
+        geographic_configuration: {
+          ...current.geographic_configuration,
+          enabled: false,
+        },
+        feature_weights: {
+          tag: 0.375,
+          shift: 0.25,
+          pairing: 0.375,
+          geographic: 0,
+        },
+      };
+    });
   }
 
   const weightTotal = Object.values(trainingConfig.feature_weights).reduce(
@@ -1154,6 +1351,12 @@ export function MachineLearningIntelligencePage({
             training_end_date: trainingEnd,
             minimum_shipment_observation: Number(trainingMinimum),
             shift_definitions: shiftDefinitions,
+            data_sufficiency_configuration: {
+              ...trainingConfig.data_sufficiency_configuration,
+              minimum_shipment_observations: Number(trainingMinimum),
+            },
+            geographic_configuration: trainingConfig.geographic_configuration,
+            feature_weights: trainingConfig.feature_weights,
           },
         ),
       );
@@ -1308,6 +1511,9 @@ export function MachineLearningIntelligencePage({
         node2vec_parameters: typeof defaultConfig.node2vec_parameters;
         umap_parameters: typeof defaultConfig.umap_parameters;
         hdbscan_parameters: typeof defaultConfig.hdbscan_parameters;
+        data_sufficiency_configuration: typeof defaultConfig.data_sufficiency_configuration;
+        geographic_configuration: typeof defaultConfig.geographic_configuration;
+        projection_configuration: typeof defaultConfig.projection_configuration;
         random_seed: number;
       }>(`/api/v1/phase5/models/${modelId}/duplicate`, "POST");
       setDepotId(draft.depot_id);
@@ -1324,6 +1530,9 @@ export function MachineLearningIntelligencePage({
       );
       setTrainingConfig({
         feature_weights: draft.feature_weights,
+        data_sufficiency_configuration: draft.data_sufficiency_configuration,
+        geographic_configuration: draft.geographic_configuration,
+        projection_configuration: draft.projection_configuration,
         node2vec_parameters: draft.node2vec_parameters,
         umap_parameters: draft.umap_parameters,
         hdbscan_parameters: draft.hdbscan_parameters,
@@ -1398,6 +1607,30 @@ export function MachineLearningIntelligencePage({
               noise_spbu_count: displayedSavedModel.noise_spbu_count,
               average_membership_probability:
                 displayedSavedModel.average_membership_probability,
+              total_spbu_count: displayedSavedModel.total_spbu_count,
+              sufficient_spbu_count: displayedSavedModel.sufficient_spbu_count,
+              marginal_spbu_count: displayedSavedModel.marginal_spbu_count,
+              insufficient_spbu_count:
+                displayedSavedModel.insufficient_spbu_count,
+              core_training_spbu_count:
+                displayedSavedModel.core_training_spbu_count,
+              core_cluster_member_count:
+                displayedSavedModel.core_cluster_member_count,
+              core_noise_count: displayedSavedModel.noise_spbu_count,
+              marginal_projected_count:
+                displayedSavedModel.marginal_projected_count,
+              marginal_unassigned_count:
+                displayedSavedModel.marginal_unassigned_count,
+              insufficient_unassigned_count:
+                displayedSavedModel.insufficient_unassigned_count,
+              average_projection_confidence:
+                displayedSavedModel.average_projection_confidence,
+              valid_coordinate_count:
+                displayedSavedModel.valid_coordinate_count,
+              invalid_coordinate_count:
+                displayedSavedModel.invalid_coordinate_count,
+              geographic_coverage_percentage:
+                displayedSavedModel.geographic_coverage_percentage,
             },
             assignments: displayedSavedModel.assignments,
             cluster_profiles: displayedSavedModel.cluster_profiles,
@@ -1411,30 +1644,43 @@ export function MachineLearningIntelligencePage({
   const evidenceCounts = useMemo(() => {
     const assignments = displayedClusterResult?.assignments ?? [];
     const historical = assignments.filter(hasHistoricalEvidence).length;
-    const coldStart = assignments.length - historical;
-    const noHistory = assignments.filter(
-      (assignment) =>
-        !hasHistoricalEvidence(assignment) &&
-        (assignment.shipment_observation_count ?? 0) === 0,
+    const marginal = assignments.filter(
+      (assignment) => assignment.data_sufficiency_status === "MARGINAL",
+    ).length;
+    const insufficient = assignments.filter(
+      (assignment) => assignment.data_sufficiency_status === "INSUFFICIENT",
     ).length;
     return {
       historical,
-      coldStart,
-      noHistory,
-      insufficientHistory: coldStart - noHistory,
+      marginal,
+      insufficient,
+      marginalProjected: assignments.filter(
+        (assignment) =>
+          assignment.cluster_assignment_type === "MARGINAL_PROJECTED",
+      ).length,
+      coreNoise: assignments.filter(
+        (assignment) => assignment.cluster_assignment_type === "CORE_NOISE",
+      ).length,
       total: assignments.length,
     };
   }, [displayedClusterResult?.assignments]);
   const evidenceFilteredAssignments = useMemo(
     () =>
-      (displayedClusterResult?.assignments ?? []).filter(
-        (assignment) =>
-          evidenceFilter === "ALL" ||
-          (evidenceFilter === "HISTORICAL" &&
-            hasHistoricalEvidence(assignment)) ||
-          (evidenceFilter === "COLD_START" &&
-            !hasHistoricalEvidence(assignment)),
-      ),
+      (displayedClusterResult?.assignments ?? [])
+        .filter(
+          (assignment) =>
+            evidenceFilter === "ALL" ||
+            (evidenceFilter === "CORE" &&
+              assignment.data_sufficiency_status === "SUFFICIENT") ||
+            (evidenceFilter === "MARGINAL" &&
+              assignment.data_sufficiency_status === "MARGINAL"),
+        )
+        .filter(
+          (assignment) =>
+            assignment.data_sufficiency_status !== "INSUFFICIENT" &&
+            assignment.visualization_x !== null &&
+            assignment.visualization_y !== null,
+        ),
     [displayedClusterResult?.assignments, evidenceFilter],
   );
   const behavioralClusterLabels = useMemo(
@@ -1448,7 +1694,64 @@ export function MachineLearningIntelligencePage({
       ),
     [evidenceFilteredAssignments],
   );
-  const clusterMembershipAssignments = evidenceFilteredAssignments;
+  const clusterMembershipAssignments = useMemo(() => {
+    const minimumProjection = Number(minimumProjectionConfidence || 0);
+    const minimumMembership = Number(minimumMembershipProbability || 0);
+    const needle = clusterSpbuSearch.trim().toLowerCase();
+    return (displayedClusterResult?.assignments ?? [])
+      .filter(
+        (assignment) =>
+          sufficiencyFilter === "ALL" ||
+          assignment.data_sufficiency_status === sufficiencyFilter,
+      )
+      .filter(
+        (assignment) =>
+          assignmentTypeFilter === "ALL" ||
+          assignment.cluster_assignment_type === assignmentTypeFilter,
+      )
+      .filter(
+        (assignment) =>
+          clusterFilter === "ALL" ||
+          String(assignment.cluster_id ?? "UNASSIGNED") === clusterFilter,
+      )
+      .filter(
+        (assignment) =>
+          noiseFilter === "ALL" ||
+          (noiseFilter === "YES" ? assignment.is_noise : !assignment.is_noise),
+      )
+      .filter(
+        (assignment) =>
+          minimumProjection <= 0 ||
+          (assignment.projection_confidence ?? -1) >= minimumProjection,
+      )
+      .filter(
+        (assignment) =>
+          minimumMembership <= 0 ||
+          (assignment.membership_probability ?? -1) >= minimumMembership,
+      )
+      .filter(
+        (assignment) =>
+          geographicStatusFilter === "ALL" ||
+          assignment.geographic_data_status === geographicStatusFilter,
+      )
+      .filter(
+        (assignment) =>
+          !needle ||
+          `${assignment.spbu_code} ${assignment.spbu_name ?? ""}`
+            .toLowerCase()
+            .includes(needle),
+      );
+  }, [
+    assignmentTypeFilter,
+    clusterFilter,
+    clusterSpbuSearch,
+    displayedClusterResult?.assignments,
+    geographicStatusFilter,
+    minimumMembershipProbability,
+    minimumProjectionConfidence,
+    noiseFilter,
+    sufficiencyFilter,
+  ]);
   const clusterMembershipPageCount = Math.max(
     1,
     Math.ceil(clusterMembershipAssignments.length / clusterMembershipPageSize),
@@ -1488,13 +1791,20 @@ export function MachineLearningIntelligencePage({
     setClusterMembershipPage(0);
   }, [
     displayedSavedModel?.model_id,
-    evidenceFilter,
+    assignmentTypeFilter,
+    clusterFilter,
+    clusterSpbuSearch,
+    geographicStatusFilter,
+    minimumMembershipProbability,
+    minimumProjectionConfidence,
+    noiseFilter,
+    sufficiencyFilter,
     trainingRun?.training_run_id,
     displayedClusterResult?.assignments,
   ]);
 
   useEffect(() => {
-    setEvidenceFilter("HISTORICAL");
+    setEvidenceFilter("CORE");
   }, [displayedSavedModel?.model_id, trainingRun?.training_run_id]);
 
   return (
@@ -2136,8 +2446,9 @@ export function MachineLearningIntelligencePage({
               SPBU Behavioral Clustering
             </h2>
             <p className="mt-1 text-sm text-slate-500">
-              Tag + full shift distribution + Phase 3 co-shipment graph.
-              Clusters describe behavior and never override compatibility.
+              Tag + full shift distribution + Phase 3 co-shipment graph +
+              Haversine geographic proximity. Only SUFFICIENT SPBUs determine
+              core clusters; clusters never override compatibility.
             </p>
             <div className="mt-4 grid gap-3 md:grid-cols-2 lg:grid-cols-5">
               <label className="text-xs font-semibold uppercase tracking-wide text-slate-500">
@@ -2191,6 +2502,228 @@ export function MachineLearningIntelligencePage({
                   : "Prepare Training Dataset"}
               </button>
             </div>
+            <button
+              type="button"
+              className="mt-4 text-sm font-semibold text-petroblue"
+              onClick={() => setEngineBAdvanced((value) => !value)}
+            >
+              Advanced Settings {engineBAdvanced ? "▴" : "▾"}
+            </button>
+            {engineBAdvanced && !displayedSavedModel && (
+              <div className="mt-3 space-y-5 border border-line bg-slate-50 p-4">
+                <div>
+                  <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                    Data Sufficiency
+                  </div>
+                  <div className="mt-2 grid gap-3 md:grid-cols-3 lg:grid-cols-6">
+                    {(
+                      [
+                        ["minimum_operating_days", "Min Operating Days"],
+                        ["minimum_period_coverage", "Min Period Coverage"],
+                        ["minimum_shift_coverage", "Min Shift Coverage"],
+                        ["minimum_pairing_evidence", "Min Pair Evidence"],
+                      ] as const
+                    ).map(([key, title]) => (
+                      <label className="text-xs" key={key}>
+                        {title}
+                        <input
+                          className="mt-1 w-full border border-line p-2"
+                          type="number"
+                          min="0"
+                          step={key.includes("coverage") ? "0.05" : "1"}
+                          value={
+                            trainingConfig.data_sufficiency_configuration[key]
+                          }
+                          onChange={(event) =>
+                            setTrainingConfig((current) => ({
+                              ...current,
+                              data_sufficiency_configuration: {
+                                ...current.data_sufficiency_configuration,
+                                [key]: Number(event.target.value),
+                              },
+                            }))
+                          }
+                        />
+                      </label>
+                    ))}
+                    <label className="text-xs">
+                      Sufficient Score
+                      <input
+                        className="mt-1 w-full border border-line p-2"
+                        type="number"
+                        min="0"
+                        max="100"
+                        value={
+                          trainingConfig.data_sufficiency_configuration
+                            .thresholds.sufficient
+                        }
+                        onChange={(event) =>
+                          setTrainingConfig((current) => ({
+                            ...current,
+                            data_sufficiency_configuration: {
+                              ...current.data_sufficiency_configuration,
+                              thresholds: {
+                                ...current.data_sufficiency_configuration
+                                  .thresholds,
+                                sufficient: Number(event.target.value),
+                              },
+                            },
+                          }))
+                        }
+                      />
+                    </label>
+                    <label className="text-xs">
+                      Marginal Score
+                      <input
+                        className="mt-1 w-full border border-line p-2"
+                        type="number"
+                        min="0"
+                        max="100"
+                        value={
+                          trainingConfig.data_sufficiency_configuration
+                            .thresholds.marginal
+                        }
+                        onChange={(event) =>
+                          setTrainingConfig((current) => ({
+                            ...current,
+                            data_sufficiency_configuration: {
+                              ...current.data_sufficiency_configuration,
+                              thresholds: {
+                                ...current.data_sufficiency_configuration
+                                  .thresholds,
+                                marginal: Number(event.target.value),
+                              },
+                            },
+                          }))
+                        }
+                      />
+                    </label>
+                  </div>
+                </div>
+                <div>
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                      Geographic Proximity
+                    </div>
+                    <label className="inline-flex items-center gap-2 text-sm font-semibold">
+                      <input
+                        type="checkbox"
+                        checked={
+                          trainingConfig.geographic_configuration.enabled
+                        }
+                        onChange={(event) =>
+                          toggleGeography(event.target.checked)
+                        }
+                      />
+                      Use Geographic Proximity
+                    </label>
+                  </div>
+                  <div className="mt-2 grid gap-3 md:grid-cols-3">
+                    <label className="text-xs">
+                      K Nearest Neighbors
+                      <input
+                        className="mt-1 w-full border border-line p-2"
+                        type="number"
+                        min="1"
+                        value={
+                          trainingConfig.geographic_configuration
+                            .k_nearest_neighbors
+                        }
+                        onChange={(event) =>
+                          setTrainingConfig((current) => ({
+                            ...current,
+                            geographic_configuration: {
+                              ...current.geographic_configuration,
+                              k_nearest_neighbors: Number(event.target.value),
+                            },
+                          }))
+                        }
+                      />
+                    </label>
+                    <label className="text-xs">
+                      Maximum Proximity Distance (km)
+                      <input
+                        className="mt-1 w-full border border-line p-2"
+                        type="number"
+                        min="0.1"
+                        value={
+                          trainingConfig.geographic_configuration
+                            .maximum_proximity_distance_km
+                        }
+                        onChange={(event) =>
+                          setTrainingConfig((current) => ({
+                            ...current,
+                            geographic_configuration: {
+                              ...current.geographic_configuration,
+                              maximum_proximity_distance_km: Number(
+                                event.target.value,
+                              ),
+                            },
+                          }))
+                        }
+                      />
+                    </label>
+                    <label className="text-xs">
+                      Minimum Projection Confidence
+                      <input
+                        className="mt-1 w-full border border-line p-2"
+                        type="number"
+                        min="0"
+                        max="1"
+                        step="0.05"
+                        value={
+                          trainingConfig.projection_configuration
+                            .minimum_confidence
+                        }
+                        onChange={(event) =>
+                          setTrainingConfig((current) => ({
+                            ...current,
+                            projection_configuration: {
+                              ...current.projection_configuration,
+                              minimum_confidence: Number(event.target.value),
+                            },
+                          }))
+                        }
+                      />
+                    </label>
+                  </div>
+                </div>
+                <div>
+                  <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                    Feature Weights · total {(weightTotal * 100).toFixed(0)}%
+                  </div>
+                  <div className="mt-2 grid gap-3 md:grid-cols-4">
+                    {(["tag", "shift", "pairing", "geographic"] as const).map(
+                      (key) => (
+                        <label className="text-sm capitalize" key={key}>
+                          {key}
+                          <input
+                            className="mt-1 w-full border border-line px-3 py-2"
+                            type="number"
+                            min="0"
+                            max="1"
+                            step="0.05"
+                            disabled={
+                              key === "geographic" &&
+                              !trainingConfig.geographic_configuration.enabled
+                            }
+                            value={trainingConfig.feature_weights[key]}
+                            onChange={(event) =>
+                              updateWeight(key, event.target.value)
+                            }
+                          />
+                        </label>
+                      ),
+                    )}
+                  </div>
+                  {Math.abs(weightTotal - 1) > 0.000001 && (
+                    <div className="mt-2 text-xs font-semibold text-rust">
+                      Weights must equal exactly 1.00.
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
             <div className="mt-4 flex flex-col gap-3 border border-line bg-petrocloud/40 p-4 lg:flex-row lg:items-end">
               <label className="min-w-0 flex-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
                 Saved Behavioral Model
@@ -2321,60 +2854,67 @@ export function MachineLearningIntelligencePage({
                   {label(trainingRun.status)}
                 </span>
               </div>
-              <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-7">
+              <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-8">
                 <Metric
-                  title="Shipments"
-                  value={trainingRun.dataset_summary.shipment_count ?? 0}
+                  title="Total SPBU"
+                  value={trainingRun.dataset_summary.total_spbu ?? 0}
                 />
                 <Metric
-                  title="Historical Training SPBU"
-                  value={
-                    trainingRun.dataset_summary.sufficient_history_spbu_count ??
-                    0
-                  }
-                  hint="SPBUs meeting the minimum historical observation threshold and used to fit UMAP/HDBSCAN."
+                  title="Sufficient"
+                  value={trainingRun.dataset_summary.sufficient_count ?? 0}
+                  hint="Only these SPBUs determine UMAP geometry and HDBSCAN core boundaries."
                 />
                 <Metric
-                  title="Cold-Start Covered"
-                  value={
-                    trainingRun.dataset_summary.cold_start_active_spbu_count ??
-                    0
-                  }
-                  hint="Active SPBUs excluded from model fitting and assigned provisionally after training."
+                  title="Marginal"
+                  value={trainingRun.dataset_summary.marginal_count ?? 0}
+                  hint="Excluded from core fitting; eligible only for post-training projection."
                 />
                 <Metric
-                  title="No Historical Data"
-                  value={
-                    trainingRun.dataset_summary.no_history_active_spbu_count ??
-                    0
-                  }
+                  title="Insufficient"
+                  value={trainingRun.dataset_summary.insufficient_count ?? 0}
+                  hint="Not clustered and not HDBSCAN noise."
                 />
                 <Metric
-                  title="Insufficient History"
-                  value={
-                    trainingRun.dataset_summary
-                      .insufficient_history_active_spbu_count ?? 0
-                  }
-                  hint="SPBUs with observations below the selected minimum."
+                  title="Core Training"
+                  value={trainingRun.dataset_summary.core_training_count ?? 0}
                 />
                 <Metric
-                  title="Total Covered"
+                  title="Valid Coordinates"
                   value={
-                    trainingRun.dataset_summary.active_master_spbu_count ??
-                    trainingRun.dataset_summary.sufficient_history_spbu_count ??
-                    0
+                    trainingRun.dataset_summary.valid_coordinate_count ?? 0
                   }
                 />
                 <Metric
-                  title="Pairing Edges"
-                  value={trainingRun.dataset_summary.pairing_edge_count ?? 0}
+                  title="Missing / Invalid"
+                  value={
+                    trainingRun.dataset_summary.invalid_coordinate_count ?? 0
+                  }
                 />
+                <Metric
+                  title="Geographic Coverage"
+                  value={`${(trainingRun.dataset_summary.geographic_coverage_percentage ?? 0).toFixed(1)}%`}
+                />
+              </div>
+              <div className="mt-3 border border-petroblue bg-petrocloud/40 px-4 py-3 text-sm text-petroink">
+                Geographic Proximity:{" "}
+                <strong>
+                  {trainingRun.dataset_summary.geographic_proximity_enabled
+                    ? "Enabled"
+                    : "Disabled"}
+                </strong>
+                {" · "}Weights: Tag{" "}
+                {pct(trainingRun.dataset_summary.feature_weights?.tag)} · Shift{" "}
+                {pct(trainingRun.dataset_summary.feature_weights?.shift)} ·
+                Pairing{" "}
+                {pct(trainingRun.dataset_summary.feature_weights?.pairing)} ·
+                Geography{" "}
+                {pct(trainingRun.dataset_summary.feature_weights?.geographic)}
               </div>
               <button
                 className="mt-4 text-sm font-semibold text-petroblue"
                 onClick={() => setEngineBAdvanced((value) => !value)}
               >
-                Advanced Model Settings {engineBAdvanced ? "▴" : "▾"}
+                Advanced Algorithm Settings {engineBAdvanced ? "▴" : "▾"}
               </button>
               {engineBAdvanced && (
                 <div className="mt-3 space-y-4 border border-line bg-slate-50 p-4">
@@ -2382,23 +2922,25 @@ export function MachineLearningIntelligencePage({
                     <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">
                       Feature Weights · total {(weightTotal * 100).toFixed(0)}%
                     </div>
-                    <div className="mt-2 grid gap-3 md:grid-cols-3">
-                      {(["tag", "shift", "pairing"] as const).map((key) => (
-                        <label className="text-sm capitalize" key={key}>
-                          {key}
-                          <input
-                            className="mt-1 w-full border border-line px-3 py-2"
-                            type="number"
-                            min="0"
-                            max="1"
-                            step="0.05"
-                            value={trainingConfig.feature_weights[key]}
-                            onChange={(event) =>
-                              updateWeight(key, event.target.value)
-                            }
-                          />
-                        </label>
-                      ))}
+                    <div className="mt-2 grid gap-3 md:grid-cols-4">
+                      {(["tag", "shift", "pairing", "geographic"] as const).map(
+                        (key) => (
+                          <label className="text-sm capitalize" key={key}>
+                            {key}
+                            <input
+                              className="mt-1 w-full border border-line px-3 py-2"
+                              type="number"
+                              min="0"
+                              max="1"
+                              step="0.05"
+                              value={trainingConfig.feature_weights[key]}
+                              onChange={(event) =>
+                                updateWeight(key, event.target.value)
+                              }
+                            />
+                          </label>
+                        ),
+                      )}
                     </div>
                     {Math.abs(weightTotal - 1) > 0.000001 && (
                       <div className="mt-2 text-xs font-semibold text-rust">
@@ -2540,38 +3082,59 @@ export function MachineLearningIntelligencePage({
               )}
               <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-6">
                 <Metric
-                  title="Historical Training SPBU"
+                  title="Core Training SPBU"
                   value={evidenceCounts.historical}
                   hint="SPBUs used to fit UMAP/HDBSCAN."
                 />
                 <Metric
-                  title="Cold-Start Covered"
-                  value={evidenceCounts.coldStart}
-                  hint="Active SPBUs assigned provisionally after training and excluded from behavioral statistics."
+                  title="Marginal SPBU"
+                  value={evidenceCounts.marginal}
+                  hint="Excluded from core fitting and considered only for projection."
                 />
                 <Metric
-                  title="No Historical Data"
-                  value={evidenceCounts.noHistory}
+                  title="Insufficient SPBU"
+                  value={evidenceCounts.insufficient}
+                />
+                <Metric title="Core Noise" value={evidenceCounts.coreNoise} />
+                <Metric
+                  title="Marginal Projected"
+                  value={evidenceCounts.marginalProjected}
                 />
                 <Metric
-                  title="Insufficient History"
-                  value={evidenceCounts.insufficientHistory}
+                  title="Marginal Unassigned"
+                  value={
+                    evidenceCounts.marginal - evidenceCounts.marginalProjected
+                  }
                 />
                 <Metric
-                  title="Total Covered SPBU"
-                  value={evidenceCounts.total}
+                  title="Average Core Membership"
+                  value={pct(
+                    displayedClusterResult.summary
+                      .average_membership_probability,
+                  )}
                 />
                 <Metric
-                  title="Clusters"
-                  value={displayedClusterResult.summary.cluster_count}
+                  title="Average Projection Confidence"
+                  value={pct(
+                    displayedClusterResult.summary
+                      .average_projection_confidence,
+                  )}
+                />
+                <Metric
+                  title="Valid Coordinates"
+                  value={displayedClusterResult.summary.valid_coordinate_count}
+                />
+                <Metric
+                  title="Geographic Coverage"
+                  value={`${displayedClusterResult.summary.geographic_coverage_percentage.toFixed(1)}%`}
                 />
               </section>
               <div className="border border-amber bg-amber/5 px-4 py-3 text-sm text-amber">
                 Model behavior was learned from{" "}
-                {evidenceCounts.historical.toLocaleString()} sufficient-history
-                SPBUs. {evidenceCounts.coldStart.toLocaleString()} additional
-                active SPBUs receive provisional cold-start coverage and do not
-                influence cluster profiles or historical model comparison.
+                {evidenceCounts.historical.toLocaleString()} SUFFICIENT SPBUs.
+                Marginal projection never changes core boundaries, and{" "}
+                {evidenceCounts.insufficient.toLocaleString()} INSUFFICIENT
+                SPBUs remain unassigned—not HDBSCAN noise.
               </div>
               {displayedClusterResult.warnings.map((warning) => (
                 <div
@@ -2599,16 +3162,16 @@ export function MachineLearningIntelligencePage({
                     {(
                       [
                         [
-                          "HISTORICAL",
-                          `Historical Only (${evidenceCounts.historical.toLocaleString()})`,
+                          "CORE",
+                          `Core Only (${evidenceCounts.historical.toLocaleString()})`,
                         ],
                         [
-                          "COLD_START",
-                          `Cold Start (${evidenceCounts.coldStart.toLocaleString()})`,
+                          "MARGINAL",
+                          `Marginal Overlay (${evidenceCounts.marginal.toLocaleString()})`,
                         ],
                         [
                           "ALL",
-                          `All Covered (${evidenceCounts.total.toLocaleString()})`,
+                          `Core + Marginal (${(evidenceCounts.historical + evidenceCounts.marginal).toLocaleString()})`,
                         ],
                       ] as Array<[EvidenceFilter, string]>
                     ).map(([value, textValue]) => (
@@ -2643,7 +3206,7 @@ export function MachineLearningIntelligencePage({
                             detail: Assignment;
                           };
                         }) =>
-                          `${params.data.name}<br/>${params.data.detail.cluster_label}<br/>${evidenceStatus(params.data.detail)}<br/>Historical observations: ${params.data.detail.shipment_observation_count ?? 0}<br/>${confidenceLabel(params.data.detail)}: ${pct(params.data.detail.membership_probability)}<br/>${params.data.detail.dominant_shift}<br/>${params.data.detail.key_tags.slice(0, 3).join(", ")}`,
+                          `${params.data.name}<br/>${params.data.detail.cluster_label}<br/>Data Sufficiency: ${params.data.detail.data_sufficiency_status} (${score(params.data.detail.data_sufficiency_score)})<br/>Assignment: ${label(params.data.detail.cluster_assignment_type)}<br/>Historical observations: ${params.data.detail.shipment_observation_count ?? 0}<br/>${confidenceLabel(params.data.detail)}: ${pct(assignmentConfidence(params.data.detail))}<br/>${params.data.detail.dominant_shift}<br/>${params.data.detail.key_tags.slice(0, 3).join(", ")}`,
                       },
                       xAxis: { show: false },
                       yAxis: { show: false },
@@ -2655,7 +3218,10 @@ export function MachineLearningIntelligencePage({
                           .filter((row) => row.cluster_label === clusterLabel)
                           .map((row) => ({
                             name: row.spbu_code,
-                            value: [row.visualization_x, row.visualization_y],
+                            value: [
+                              row.visualization_x as number,
+                              row.visualization_y as number,
+                            ],
                             detail: row,
                             symbol: hasHistoricalEvidence(row)
                               ? "circle"
@@ -2699,8 +3265,8 @@ export function MachineLearningIntelligencePage({
                             {profile.cluster_label}
                           </span>
                           <span className="text-right text-sm">
-                            {profile.historical_member_count} historical ·{" "}
-                            {profile.cold_start_member_count} cold-start
+                            {profile.historical_member_count} core ·{" "}
+                            {profile.projected_member_count ?? 0} projected
                           </span>
                         </div>
                         <div className="mt-2 text-sm text-slate-600">
@@ -2724,7 +3290,7 @@ export function MachineLearningIntelligencePage({
                   </div>
                 </div>
                 <GeographicClusterMap
-                  assignments={evidenceFilteredAssignments}
+                  assignments={displayedClusterResult.assignments}
                   depot={geographicDepot}
                 />
               </section>
@@ -2732,61 +3298,168 @@ export function MachineLearningIntelligencePage({
                 <h3 className="text-sm font-semibold uppercase tracking-wide text-slate-600">
                   Cluster Membership
                 </h3>
+                <div className="mt-3 grid gap-2 md:grid-cols-4 xl:grid-cols-8">
+                  <select
+                    className="border border-line p-2 text-xs"
+                    value={sufficiencyFilter}
+                    onChange={(event) =>
+                      setSufficiencyFilter(event.target.value)
+                    }
+                  >
+                    <option value="ALL">All sufficiency</option>
+                    <option value="SUFFICIENT">Sufficient</option>
+                    <option value="MARGINAL">Marginal</option>
+                    <option value="INSUFFICIENT">Insufficient</option>
+                  </select>
+                  <select
+                    className="border border-line p-2 text-xs"
+                    value={assignmentTypeFilter}
+                    onChange={(event) =>
+                      setAssignmentTypeFilter(event.target.value)
+                    }
+                  >
+                    <option value="ALL">All assignment types</option>
+                    {[
+                      "CORE_MEMBER",
+                      "CORE_NOISE",
+                      "MARGINAL_PROJECTED",
+                      "MARGINAL_UNASSIGNED",
+                      "INSUFFICIENT_UNASSIGNED",
+                    ].map((value) => (
+                      <option value={value} key={value}>
+                        {label(value)}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    className="border border-line p-2 text-xs"
+                    value={clusterFilter}
+                    onChange={(event) => setClusterFilter(event.target.value)}
+                  >
+                    <option value="ALL">All clusters</option>
+                    <option value="UNASSIGNED">Not Assigned</option>
+                    {Array.from(
+                      new Set(
+                        displayedClusterResult.assignments
+                          .filter((row) => row.cluster_id !== null)
+                          .map((row) => row.cluster_id as number),
+                      ),
+                    )
+                      .sort((a, b) => a - b)
+                      .map((value) => (
+                        <option value={String(value)} key={value}>
+                          Cluster {value + 1}
+                        </option>
+                      ))}
+                  </select>
+                  <select
+                    className="border border-line p-2 text-xs"
+                    value={noiseFilter}
+                    onChange={(event) => setNoiseFilter(event.target.value)}
+                  >
+                    <option value="ALL">All noise states</option>
+                    <option value="YES">Core noise only</option>
+                    <option value="NO">Exclude core noise</option>
+                  </select>
+                  <input
+                    className="border border-line p-2 text-xs"
+                    type="number"
+                    min="0"
+                    max="1"
+                    step="0.05"
+                    placeholder="Min projection confidence"
+                    value={minimumProjectionConfidence}
+                    onChange={(event) =>
+                      setMinimumProjectionConfidence(event.target.value)
+                    }
+                  />
+                  <input
+                    className="border border-line p-2 text-xs"
+                    type="number"
+                    min="0"
+                    max="1"
+                    step="0.05"
+                    placeholder="Min membership probability"
+                    value={minimumMembershipProbability}
+                    onChange={(event) =>
+                      setMinimumMembershipProbability(event.target.value)
+                    }
+                  />
+                  <select
+                    className="border border-line p-2 text-xs"
+                    value={geographicStatusFilter}
+                    onChange={(event) =>
+                      setGeographicStatusFilter(event.target.value)
+                    }
+                  >
+                    <option value="ALL">All geographic status</option>
+                    <option value="VALID">Valid coordinate</option>
+                    <option value="MISSING">Missing coordinate</option>
+                    <option value="INVALID">Invalid coordinate</option>
+                  </select>
+                  <input
+                    className="border border-line p-2 text-xs"
+                    placeholder="Search SPBU"
+                    value={clusterSpbuSearch}
+                    onChange={(event) =>
+                      setClusterSpbuSearch(event.target.value)
+                    }
+                  />
+                </div>
                 <div className="mt-3 overflow-x-auto">
                   <table className="w-full text-sm">
                     <thead>
                       <tr className="border-b border-line bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
                         <th className="px-3 py-2">SPBU</th>
+                        <th className="px-3 py-2">Sufficiency</th>
                         <th className="px-3 py-2">Cluster</th>
-                        <th className="px-3 py-2">Evidence Status</th>
-                        <th className="px-3 py-2">Historical Observations</th>
-                        <th className="px-3 py-2">Confidence</th>
-                        <th
-                          className="px-3 py-2"
-                          title="Not an error; may represent a unique operational pattern."
-                        >
-                          Noise / Outlier
-                        </th>
+                        <th className="px-3 py-2">Assignment Type</th>
+                        <th className="px-3 py-2">Membership Probability</th>
+                        <th className="px-3 py-2">Projection Confidence</th>
                         <th className="px-3 py-2">Dominant Shift</th>
                         <th className="px-3 py-2">Key Tags</th>
+                        <th className="px-3 py-2">Geographic Status</th>
                       </tr>
                     </thead>
                     <tbody>
                       {clusterMembershipPageRows.map((row) => (
-                        <tr className="border-b border-line" key={row.spbu_id}>
+                        <tr
+                          className="cursor-pointer border-b border-line hover:bg-petrocloud/40"
+                          key={row.spbu_id}
+                          onClick={() => setSelectedAssignment(row)}
+                        >
                           <td className="px-3 py-2">
                             <div className="font-semibold">{row.spbu_code}</div>
                             <div className="text-xs text-slate-500">
                               {row.spbu_name}
                             </div>
                           </td>
-                          <td className="px-3 py-2">{row.cluster_label}</td>
-                          <td className="min-w-52 px-3 py-2">
+                          <td className="px-3 py-2">
                             <span
-                              className={`border px-2 py-1 text-xs font-semibold ${hasHistoricalEvidence(row) ? "border-mint bg-mint/10 text-mint" : "border-amber bg-amber/10 text-amber"}`}
+                              className={`border px-2 py-1 text-xs font-semibold ${badgeClass(row.data_sufficiency_status)}`}
                             >
-                              {evidenceStatus(row)}
+                              {row.data_sufficiency_status}
                             </span>
-                          </td>
-                          <td className="px-3 py-2">
-                            {(
-                              row.shipment_observation_count ?? 0
-                            ).toLocaleString()}
-                          </td>
-                          <td className="px-3 py-2">
-                            <div className="font-semibold">
-                              {pct(row.membership_probability)}
-                            </div>
-                            <div className="mt-1 text-xs text-slate-500">
-                              {confidenceLabel(row)}
+                            <div className="mt-1 text-xs">
+                              {score(row.data_sufficiency_score)}/100
                             </div>
                           </td>
+                          <td className="px-3 py-2">{row.cluster_label}</td>
                           <td className="px-3 py-2">
-                            {row.is_noise ? "Yes" : "No"}
+                            {label(row.cluster_assignment_type)}
+                          </td>
+                          <td className="px-3 py-2">
+                            {pct(row.membership_probability)}
+                          </td>
+                          <td className="px-3 py-2">
+                            {pct(row.projection_confidence)}
                           </td>
                           <td className="px-3 py-2">{row.dominant_shift}</td>
                           <td className="max-w-72 px-3 py-2 text-xs">
                             {row.key_tags.slice(0, 4).join(", ") || "-"}
+                          </td>
+                          <td className="px-3 py-2">
+                            {row.geographic_data_status}
                           </td>
                         </tr>
                       ))}
@@ -2934,13 +3607,14 @@ export function MachineLearningIntelligencePage({
                     <th className="px-3 py-2">Version</th>
                     <th className="px-3 py-2">Depot</th>
                     <th className="px-3 py-2">Training Period</th>
-                    <th className="px-3 py-2">Historical SPBU</th>
-                    <th className="px-3 py-2">Cold Start</th>
-                    <th className="px-3 py-2">Total Covered</th>
+                    <th className="px-3 py-2">Total SPBU</th>
+                    <th className="px-3 py-2">Core Training</th>
+                    <th className="px-3 py-2">
+                      Sufficient / Marginal / Insufficient
+                    </th>
+                    <th className="px-3 py-2">Geography</th>
                     <th className="px-3 py-2">Clusters</th>
                     <th className="px-3 py-2">Noise</th>
-                    <th className="px-3 py-2">Created</th>
-                    <th className="px-3 py-2">Created By</th>
                     <th className="px-3 py-2">Status</th>
                     <th className="px-3 py-2">Actions</th>
                   </tr>
@@ -2956,23 +3630,34 @@ export function MachineLearningIntelligencePage({
                       <td className="whitespace-nowrap px-3 py-2">
                         {model.training_start_date} – {model.training_end_date}
                       </td>
+                      <td className="px-3 py-2">{model.total_spbu_count}</td>
                       <td className="px-3 py-2">
-                        {model.historical_training_spbu_count}
+                        {model.core_training_spbu_count}
                       </td>
                       <td className="px-3 py-2">
-                        {model.cold_start_covered_spbu_count}
+                        {pct(
+                          model.sufficient_spbu_count /
+                            Math.max(1, model.total_spbu_count),
+                        )}{" "}
+                        /{" "}
+                        {pct(
+                          model.marginal_spbu_count /
+                            Math.max(1, model.total_spbu_count),
+                        )}{" "}
+                        /{" "}
+                        {pct(
+                          model.insufficient_spbu_count /
+                            Math.max(1, model.total_spbu_count),
+                        )}
                       </td>
                       <td className="px-3 py-2">
-                        {model.total_covered_spbu_count}
+                        {model.geographic_proximity_enabled
+                          ? "Enabled"
+                          : "Disabled"}{" "}
+                        · {pct(model.geographic_weight)}
                       </td>
                       <td className="px-3 py-2">{model.cluster_count}</td>
                       <td className="px-3 py-2">{model.noise_spbu_count}</td>
-                      <td className="whitespace-nowrap px-3 py-2">
-                        {model.created_at
-                          ? new Date(model.created_at).toLocaleString()
-                          : "-"}
-                      </td>
-                      <td className="px-3 py-2">{model.created_by}</td>
                       <td className="px-3 py-2">
                         <span
                           className={`border px-2 py-1 text-xs ${badgeClass(model.model_status)}`}
@@ -3029,7 +3714,7 @@ export function MachineLearningIntelligencePage({
                   {models.length === 0 && (
                     <tr>
                       <td
-                        colSpan={13}
+                        colSpan={12}
                         className="px-3 py-8 text-center text-slate-500"
                       >
                         No saved models for this depot.
@@ -3112,6 +3797,96 @@ export function MachineLearningIntelligencePage({
                     value={`${comparison.cluster_splits.length} / ${comparison.cluster_merges.length}`}
                   />
                 </div>
+                <div className="grid gap-4 lg:grid-cols-2">
+                  {(
+                    [
+                      ["Model A", comparison.model_a],
+                      ["Model B", comparison.model_b],
+                    ] as const
+                  ).map(([title, model]) => (
+                    <div className="border border-line p-4" key={title}>
+                      <h3 className="font-semibold">
+                        {title} · {model.model_name} v{model.model_version}
+                      </h3>
+                      <div className="mt-3 grid grid-cols-2 gap-2 text-sm">
+                        <div>Total / Core</div>
+                        <div>
+                          {model.total_spbu_count} /{" "}
+                          {model.core_training_spbu_count}
+                        </div>
+                        <div>Sufficient / Marginal / Insufficient</div>
+                        <div>
+                          {model.sufficient_spbu_count} /{" "}
+                          {model.marginal_spbu_count} /{" "}
+                          {model.insufficient_spbu_count}
+                        </div>
+                        <div>Weights T / S / P / G</div>
+                        <div>
+                          {pct(model.feature_weights.tag)} /{" "}
+                          {pct(model.feature_weights.shift)} /{" "}
+                          {pct(model.feature_weights.pairing)} /{" "}
+                          {pct(model.feature_weights.geographic)}
+                        </div>
+                        <div>Geography</div>
+                        <div>
+                          {model.geographic_proximity_enabled
+                            ? "Enabled"
+                            : "Disabled"}{" "}
+                          · K{" "}
+                          {String(
+                            model.geographic_configuration
+                              .k_nearest_neighbors ?? "-",
+                          )}{" "}
+                          · max{" "}
+                          {String(
+                            model.geographic_configuration
+                              .maximum_proximity_distance_km ?? "-",
+                          )}{" "}
+                          km
+                        </div>
+                        <div>Coverage</div>
+                        <div>
+                          {model.geographic_coverage_percentage.toFixed(1)}%
+                        </div>
+                        <div>Clusters / Core Noise</div>
+                        <div>
+                          {model.cluster_count} / {model.noise_spbu_count}
+                        </div>
+                        <div>Avg Core / Projection</div>
+                        <div>
+                          {pct(model.average_membership_probability)} /{" "}
+                          {pct(model.average_projection_confidence)}
+                        </div>
+                        <div>Marginal Projection Rate</div>
+                        <div>
+                          {pct(
+                            model.marginal_projected_count /
+                              Math.max(1, model.marginal_spbu_count),
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div className="border border-line p-4">
+                  <h3 className="font-semibold">Data Maturity Changes</h3>
+                  <div className="mt-2 flex flex-wrap gap-2 text-sm">
+                    {comparison.data_maturity_transitions.map((transition) => (
+                      <span
+                        className="border border-line px-3 py-2"
+                        key={transition.transition}
+                        title={transition.spbu_ids.join(", ")}
+                      >
+                        {transition.transition} · {transition.count}
+                      </span>
+                    ))}
+                    {comparison.data_maturity_transitions.length === 0 && (
+                      <span className="text-slate-500">
+                        No sufficiency-status transitions among shared SPBUs.
+                      </span>
+                    )}
+                  </div>
+                </div>
                 <div className="overflow-x-auto">
                   <table className="w-full text-sm">
                     <thead>
@@ -3167,6 +3942,23 @@ export function MachineLearningIntelligencePage({
                   Baseline {concentrationRun?.baseline_start_date} –{" "}
                   {concentrationRun?.baseline_end_date}
                 </p>
+                <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+                  <span className="font-semibold uppercase tracking-wide text-slate-500">
+                    SPBU Tag
+                  </span>
+                  {selectedConcentration.spbu_tags?.length ? (
+                    selectedConcentration.spbu_tags.map((tag) => (
+                      <span
+                        className="border border-petroblue/30 bg-petrocloud px-2 py-1 font-semibold text-petroink"
+                        key={tag}
+                      >
+                        {tag}
+                      </span>
+                    ))
+                  ) : (
+                    <span className="text-slate-500">-</span>
+                  )}
+                </div>
               </div>
               <button
                 className="border border-line p-2"
@@ -3222,7 +4014,18 @@ export function MachineLearningIntelligencePage({
                     axisLabel: { rotate: 45 },
                   },
                   yAxis: { type: "value", name: "Shipment count" },
-                  tooltip: { trigger: "axis" },
+                  tooltip: {
+                    trigger: "axis",
+                    axisPointer: { type: "shadow" },
+                    formatter: (params: Array<{ dataIndex: number }>) => {
+                      const row = selectedConcentration.mt_distribution.filter(
+                        (distribution) => distribution.historically_used,
+                      )[params[0]?.dataIndex ?? -1];
+                      return row
+                        ? `<b>${escapeTooltip(row.mt_registration)}</b><br/>MT Tag: ${escapeTooltip(formatTags(row.mt_tags))}<br/>Shipment count: ${row.shipment_count}<br/>Historical share: ${pct(row.historical_share)}`
+                        : "";
+                    },
+                  },
                   series: [
                     {
                       type: "bar",
@@ -3277,6 +4080,133 @@ export function MachineLearningIntelligencePage({
         </div>
       )}
 
+      {selectedAssignment && (
+        <div className="fixed inset-0 z-50 flex justify-end bg-slate-900/35">
+          <div className="h-full w-full max-w-3xl overflow-y-auto bg-white p-5 shadow-xl">
+            <div className="flex items-start justify-between">
+              <div>
+                <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                  SPBU Behavioral Detail
+                </div>
+                <h2 className="mt-1 text-xl font-semibold">
+                  {selectedAssignment.spbu_code} ·{" "}
+                  {selectedAssignment.spbu_name}
+                </h2>
+              </div>
+              <button
+                className="border border-line p-2"
+                onClick={() => setSelectedAssignment(null)}
+              >
+                <X size={17} />
+              </button>
+            </div>
+            <h3 className="mt-5 text-sm font-semibold uppercase tracking-wide text-slate-600">
+              Data Sufficiency
+            </h3>
+            <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              <Metric
+                title="Score"
+                value={`${score(selectedAssignment.data_sufficiency_score)}/100`}
+              />
+              <Metric
+                title="Status"
+                value={selectedAssignment.data_sufficiency_status}
+              />
+              <Metric
+                title="Shipment Observations"
+                value={selectedAssignment.shipment_observation_count ?? 0}
+              />
+              <Metric
+                title="Operating Days"
+                value={selectedAssignment.operating_day_count ?? 0}
+              />
+              <Metric
+                title="Period Coverage"
+                value={pct(selectedAssignment.training_period_coverage)}
+              />
+              <Metric
+                title="Shift Coverage"
+                value={pct(selectedAssignment.shift_observation_coverage)}
+              />
+              <Metric
+                title="Pairing Evidence"
+                value={selectedAssignment.pairing_observation_count ?? 0}
+              />
+              <Metric
+                title="Recency"
+                value={
+                  selectedAssignment.recency_age_days === null ||
+                  selectedAssignment.recency_age_days === undefined
+                    ? "No history"
+                    : `${selectedAssignment.recency_age_days} days`
+                }
+              />
+            </div>
+            <h3 className="mt-5 text-sm font-semibold uppercase tracking-wide text-slate-600">
+              Cluster Result
+            </h3>
+            <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              <Metric
+                title="Assignment Type"
+                value={label(selectedAssignment.cluster_assignment_type)}
+              />
+              <Metric
+                title="Cluster"
+                value={selectedAssignment.cluster_label}
+              />
+              <Metric
+                title="Membership Probability"
+                value={pct(selectedAssignment.membership_probability)}
+              />
+              <Metric
+                title="Projection Confidence"
+                value={pct(selectedAssignment.projection_confidence)}
+              />
+            </div>
+            {selectedAssignment.unassigned_reason && (
+              <div className="mt-3 border border-amber bg-amber/5 px-4 py-3 text-sm text-amber">
+                {selectedAssignment.unassigned_reason}
+              </div>
+            )}
+            <h3 className="mt-5 text-sm font-semibold uppercase tracking-wide text-slate-600">
+              Geographic Data
+            </h3>
+            <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+              <Metric
+                title="Status"
+                value={selectedAssignment.geographic_data_status}
+              />
+              <Metric
+                title="Latitude"
+                value={selectedAssignment.latitude ?? "-"}
+              />
+              <Metric
+                title="Longitude"
+                value={selectedAssignment.longitude ?? "-"}
+              />
+              <Metric
+                title="Nearest SPBU"
+                value={
+                  selectedAssignment.nearest_spbu_distance_km === null ||
+                  selectedAssignment.nearest_spbu_distance_km === undefined
+                    ? "-"
+                    : `${score(selectedAssignment.nearest_spbu_distance_km)} km`
+                }
+              />
+              <Metric
+                title="Average K-Nearest"
+                value={
+                  selectedAssignment.average_k_nearest_distance_km === null ||
+                  selectedAssignment.average_k_nearest_distance_km === undefined
+                    ? "-"
+                    : `${score(selectedAssignment.average_k_nearest_distance_km)} km`
+                }
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
       {selectedCluster && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/35 p-4">
           <div className="max-h-[90vh] w-full max-w-3xl overflow-y-auto bg-white p-5 shadow-xl">
@@ -3298,12 +4228,12 @@ export function MachineLearningIntelligencePage({
             </div>
             <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
               <Metric
-                title="Historical Members"
+                title="Core Members"
                 value={selectedCluster.historical_member_count}
               />
               <Metric
-                title="Cold-Start Covered"
-                value={selectedCluster.cold_start_member_count}
+                title="Marginal Projected"
+                value={selectedCluster.projected_member_count ?? 0}
               />
               <Metric
                 title="Historical Avg Membership"
@@ -3315,9 +4245,9 @@ export function MachineLearningIntelligencePage({
               />
             </div>
             <div className="mt-4 border border-petroblue bg-petrocloud/40 px-4 py-3 text-sm text-petroink">
-              Tag, shift, pairing, and membership statistics below use
-              historical members only. Cold-start SPBUs are coverage records and
-              are listed separately.
+              Tag, shift, pairing, geography, and membership statistics below
+              use CORE_MEMBER SPBUs only. Projected marginal SPBUs are listed
+              separately and never define the cluster.
             </div>
             <div className="mt-4 grid gap-4 lg:grid-cols-2">
               <div className="border border-line p-4">
@@ -3464,21 +4394,18 @@ export function MachineLearningIntelligencePage({
             </div>
             <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
               <Metric
-                title="Historical Training SPBU"
-                value={openedModel.historical_training_spbu_count}
+                title="Core Training SPBU"
+                value={openedModel.core_training_spbu_count}
               />
               <Metric
-                title="Cold-Start Covered"
-                value={openedModel.cold_start_covered_spbu_count}
+                title="Marginal"
+                value={openedModel.marginal_spbu_count}
               />
               <Metric
-                title="No Historical Data"
-                value={openedModel.no_history_spbu_count}
+                title="Insufficient"
+                value={openedModel.insufficient_spbu_count}
               />
-              <Metric
-                title="Total Covered"
-                value={openedModel.total_covered_spbu_count}
-              />
+              <Metric title="Total SPBU" value={openedModel.total_spbu_count} />
               <Metric title="Clusters" value={openedModel.cluster_count} />
               <Metric
                 title="Historical Noise"
@@ -3498,6 +4425,13 @@ export function MachineLearningIntelligencePage({
                     node2vec: openedModel.node2vec_parameters,
                     umap: openedModel.umap_parameters,
                     hdbscan: openedModel.hdbscan_parameters,
+                    data_sufficiency:
+                      openedModel.data_sufficiency_configuration,
+                    geography: openedModel.geographic_configuration,
+                    projection: {
+                      method: openedModel.projection_method,
+                      parameters: openedModel.projection_parameters,
+                    },
                     libraries: openedModel.library_versions,
                   },
                   null,
@@ -3511,7 +4445,8 @@ export function MachineLearningIntelligencePage({
                   <tr className="border-b border-line bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
                     <th className="px-3 py-2">SPBU</th>
                     <th className="px-3 py-2">Cluster</th>
-                    <th className="px-3 py-2">Evidence</th>
+                    <th className="px-3 py-2">Sufficiency</th>
+                    <th className="px-3 py-2">Assignment Type</th>
                     <th className="px-3 py-2">Observations</th>
                     <th className="px-3 py-2">Confidence</th>
                     <th className="px-3 py-2">Dominant Shift</th>
@@ -3531,10 +4466,13 @@ export function MachineLearningIntelligencePage({
                         {evidenceStatus(assignment)}
                       </td>
                       <td className="px-3 py-2">
+                        {label(assignment.cluster_assignment_type)}
+                      </td>
+                      <td className="px-3 py-2">
                         {assignment.shipment_observation_count ?? 0}
                       </td>
                       <td className="px-3 py-2">
-                        <div>{pct(assignment.membership_probability)}</div>
+                        <div>{pct(assignmentConfidence(assignment))}</div>
                         <div className="mt-1 text-xs text-slate-500">
                           {confidenceLabel(assignment)}
                         </div>

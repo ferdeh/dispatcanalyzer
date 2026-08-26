@@ -45,18 +45,61 @@ from .pairing_intelligence import (
 from .phase5_constants import (
     BEHAVIORAL_ALGORITHM_VERSION,
     DEFAULT_FEATURE_WEIGHTS,
+    DEFAULT_GEOGRAPHIC_CONFIGURATION,
     DEFAULT_HDBSCAN_PARAMETERS,
     DEFAULT_NODE2VEC_PARAMETERS,
+    DEFAULT_PROJECTION_CONFIGURATION,
     DEFAULT_SHIFT_DEFINITIONS,
     DEFAULT_UMAP_PARAMETERS,
 )
 from .phase5_readiness import require_phase5_readiness
+from .phase5_sufficiency import (
+    build_geographic_features,
+    calculate_data_sufficiency,
+    validate_data_sufficiency_configuration,
+    validate_geographic_configuration,
+)
 
 
 logger = logging.getLogger(__name__)
 
 NODE2VEC_IMPLEMENTATION_VERSION = "portable_walk_ppmi_svd.v1"
 INTERRUPTED_TRAINING_STATUSES = ("PREPARING_DATA", "TRAINING", "CALCULATING_PROFILES")
+
+
+def projection_confidence_from_distance(distance: float, cluster_scale: float, multiplier: float = 2.0) -> float:
+    if distance < 0 or cluster_scale <= 0 or multiplier <= 0:
+        raise ValueError("Projection distance must be non-negative and scale values must be positive.")
+    return max(0.0, min(1.0, math.exp(-distance / (cluster_scale * multiplier))))
+
+
+def project_to_core_clusters(
+    vector: np.ndarray,
+    cluster_centroids: dict[int, np.ndarray],
+    cluster_scales: dict[int, float],
+    *,
+    minimum_confidence: float,
+    distance_scale_multiplier: float,
+) -> dict[str, Any]:
+    if not cluster_centroids:
+        return {"projected_cluster_id": None, "projection_confidence": None, "projection_status": "UNASSIGNED"}
+    label, distance = min(
+        (
+            (label, float(np.linalg.norm(vector - centroid)))
+            for label, centroid in cluster_centroids.items()
+        ),
+        key=lambda item: (item[1], item[0]),
+    )
+    confidence = projection_confidence_from_distance(
+        distance,
+        cluster_scales[label],
+        distance_scale_multiplier,
+    )
+    return {
+        "projected_cluster_id": label if confidence >= minimum_confidence else None,
+        "projection_confidence": confidence,
+        "projection_status": "PROJECTED" if confidence >= minimum_confidence else "LOW_CONFIDENCE",
+    }
 
 
 def library_versions() -> dict[str, str]:
@@ -90,14 +133,30 @@ def recover_interrupted_behavioral_training_runs(db: Session) -> int:
     return len(runs)
 
 
-def validate_feature_weights(weights: dict[str, Any] | None) -> dict[str, float]:
-    merged = {**DEFAULT_FEATURE_WEIGHTS, **(weights or {})}
+def validate_feature_weights(
+    weights: dict[str, Any] | None,
+    *,
+    geography_enabled: bool = True,
+) -> dict[str, float]:
+    if not geography_enabled and weights is None:
+        non_geographic_total = sum(DEFAULT_FEATURE_WEIGHTS[key] for key in ("tag", "shift", "pairing"))
+        merged = {
+            key: DEFAULT_FEATURE_WEIGHTS[key] / non_geographic_total
+            for key in ("tag", "shift", "pairing")
+        } | {"geographic": 0.0}
+    else:
+        merged = {**DEFAULT_FEATURE_WEIGHTS, **(weights or {})}
     try:
-        result = {key: float(merged[key]) for key in ("tag", "shift", "pairing")}
+        result = {key: float(merged[key]) for key in ("tag", "shift", "pairing", "geographic")}
     except (KeyError, TypeError, ValueError) as exc:
-        raise HTTPException(status_code=400, detail="Feature weights must include numeric tag, shift, and pairing values.") from exc
+        raise HTTPException(
+            status_code=400,
+            detail="Feature weights must include numeric tag, shift, pairing, and geographic values.",
+        ) from exc
     if any(value < 0 or value > 1 for value in result.values()) or not math.isclose(sum(result.values()), 1.0, abs_tol=1e-6):
         raise HTTPException(status_code=400, detail="Feature weights must be within 0-1 and sum to exactly 1.00.")
+    if not geography_enabled and not math.isclose(result["geographic"], 0.0, abs_tol=1e-9):
+        raise HTTPException(status_code=400, detail="Geographic weight must be 0 when Geographic Proximity is disabled.")
     return result
 
 
@@ -326,6 +385,7 @@ def _feature_fusion(
     weights: dict[str, float],
     *,
     fit_indices: list[int] | None = None,
+    geography_enabled: bool = True,
 ) -> tuple[np.ndarray, dict]:
     try:
         from sklearn.preprocessing import StandardScaler
@@ -334,10 +394,41 @@ def _feature_fusion(
     tag_matrix = np.asarray([record["tag_vector"] for record in records], dtype=float)
     shift_matrix = np.asarray([record["shift_vector"] for record in records], dtype=float)
     pairing_matrix = np.asarray([embeddings[record["spbu_id"]] for record in records], dtype=float)
+    geographic_raw = [record.get("geographic_vector") or [None, None, None, None] for record in records]
     scalers = {}
     weighted_groups = []
     scaler_indices = fit_indices or list(range(len(records)))
-    for name, matrix in (("tag", tag_matrix), ("shift", shift_matrix), ("pairing", pairing_matrix)):
+    matrices: list[tuple[str, np.ndarray]] = [("tag", tag_matrix), ("shift", shift_matrix), ("pairing", pairing_matrix)]
+    geographic_imputation = None
+    if geography_enabled:
+        valid_geo_rows = [
+            index
+            for index in scaler_indices
+            if records[index].get("geographic_data_status") == "VALID"
+            and all(value is not None for value in geographic_raw[index])
+        ]
+        if valid_geo_rows:
+            medians = np.median(np.asarray([geographic_raw[index] for index in valid_geo_rows], dtype=float), axis=0)
+        else:
+            medians = np.zeros(4, dtype=float)
+        geographic_matrix = np.asarray(
+            [
+                [
+                    float(value) if value is not None else float(medians[column])
+                    for column, value in enumerate(row)
+                ]
+                + [0.0 if records[index].get("geographic_data_status") == "VALID" else 1.0]
+                for index, row in enumerate(geographic_raw)
+            ],
+            dtype=float,
+        )
+        matrices.append(("geographic", geographic_matrix))
+        geographic_imputation = {
+            "method": "core-training median per geographic feature plus explicit missing indicator",
+            "median_values": medians.tolist(),
+            "valid_core_coordinate_count": len(valid_geo_rows),
+        }
+    for name, matrix in matrices:
         scaler = StandardScaler()
         scaler.fit(matrix[scaler_indices])
         transformed = scaler.transform(matrix)
@@ -352,7 +443,8 @@ def _feature_fusion(
         "weight_application": "Each independently standardized group is multiplied by sqrt(group_weight / group_dimension) before concatenation.",
         "scaler_fit_spbu_count": len(scaler_indices),
         "scalers": scalers,
-        "group_dimensions": {"tag": tag_matrix.shape[1], "shift": shift_matrix.shape[1], "pairing": pairing_matrix.shape[1]},
+        "group_dimensions": {name: matrix.shape[1] for name, matrix in matrices},
+        "geographic_imputation": geographic_imputation,
     }
 
 
@@ -365,6 +457,9 @@ def prepare_training_dataset(
     minimum_shipment_observation: int,
     shift_definitions: list[dict] | None,
     created_by: str,
+    data_sufficiency_configuration: dict[str, Any] | None = None,
+    geographic_configuration: dict[str, Any] | None = None,
+    feature_weights: dict[str, Any] | None = None,
 ) -> dict:
     if training_end_date < training_start_date:
         raise HTTPException(status_code=400, detail="training_end_date must be greater than or equal to training_start_date.")
@@ -372,6 +467,15 @@ def prepare_training_dataset(
         raise HTTPException(status_code=400, detail="minimum_shipment_observation must be at least 1.")
     readiness = require_phase5_readiness(db, depot_id)
     shift_snapshot = _clean_shift_snapshot(validate_shift_config(shift_definitions or DEFAULT_SHIFT_DEFINITIONS))
+    sufficiency_config = validate_data_sufficiency_configuration(
+        data_sufficiency_configuration,
+        minimum_shipment_observations=minimum_shipment_observation,
+    )
+    geography_config = validate_geographic_configuration(geographic_configuration)
+    prepared_feature_weights = validate_feature_weights(
+        feature_weights,
+        geography_enabled=geography_config["enabled"],
+    )
     training_run_id = uuid.uuid4().hex
     run = MLTrainingRun(
         training_run_id=training_run_id,
@@ -380,7 +484,11 @@ def prepare_training_dataset(
         training_end_date=training_end_date,
         minimum_shipment_observation=minimum_shipment_observation,
         status="PREPARING_DATA",
-        training_configuration={},
+        training_configuration={
+            "data_sufficiency_configuration": sufficiency_config,
+            "geographic_configuration": geography_config,
+            "feature_weights": prepared_feature_weights,
+        },
         dataset_summary={},
         dataset_payload={},
         result_payload={},
@@ -410,12 +518,6 @@ def prepare_training_dataset(
         if not spbus:
             raise HTTPException(status_code=422, detail="No active SPBU exists for the selected depot.")
         active_ids = {spbu.spbu_id for spbu in spbus}
-        eligible_ids = sorted(
-            spbu_id
-            for spbu_id, count in observation_counts.items()
-            if spbu_id in active_ids and count >= minimum_shipment_observation
-        )
-        cold_start_ids = sorted(active_ids - set(eligible_ids))
         inactive_history_ids = sorted(set(observation_counts) - active_ids)
 
         tag_feature_names, tag_vectors, key_tags, tag_configuration = _load_tag_features(db, spbus)
@@ -434,13 +536,38 @@ def prepare_training_dataset(
             shift_counts[observation["spbu_id"]][shift["shift_id"]] += 1
             shift_valid_counts[observation["spbu_id"]] += 1
 
-        pair_rows = build_pair_metrics(memberships, spbu_lookup, depot_id, training_start_date, training_end_date)
-        pair_rows = [row for row in pair_rows if row["spbu_a_id"] in set(eligible_ids) and row["spbu_b_id"] in set(eligible_ids)]
+        all_pair_rows = build_pair_metrics(memberships, spbu_lookup, depot_id, training_start_date, training_end_date)
+        shipment_dates = {
+            shipment.shipment_id: shipment.operating_date
+            for shipment in source_shipments
+            if shipment.shipment_id and shipment.operating_date
+        }
+        operating_dates_by_spbu: dict[str, set[date]] = defaultdict(set)
+        paired_shipment_counts: Counter[str] = Counter()
+        for shipment_id, member_ids in memberships.items():
+            operating_date = shipment_dates.get(shipment_id)
+            for spbu_id in member_ids:
+                if operating_date:
+                    operating_dates_by_spbu[spbu_id].add(operating_date)
+                if len(member_ids) > 1:
+                    paired_shipment_counts[spbu_id] += 1
+        training_period_days = (training_end_date - training_start_date).days + 1
         records = []
         for spbu in spbus:
             total_shift = shift_valid_counts[spbu.spbu_id]
             shift_vector = [shift_counts[spbu.spbu_id][shift["shift_id"]] / total_shift if total_shift else 0.0 for shift in shift_snapshot]
             dominant_index = max(range(len(shift_vector)), key=lambda index: shift_vector[index]) if total_shift else None
+            operating_dates = operating_dates_by_spbu[spbu.spbu_id]
+            sufficiency = calculate_data_sufficiency(
+                shipment_observation_count=observation_counts[spbu.spbu_id],
+                operating_day_count=len(operating_dates),
+                training_period_days=training_period_days,
+                valid_shift_observation_count=total_shift,
+                pairing_observation_count=paired_shipment_counts[spbu.spbu_id],
+                last_operating_date=max(operating_dates) if operating_dates else None,
+                training_end_date=training_end_date,
+                configuration=sufficiency_config,
+            )
             records.append(
                 {
                     "spbu_id": spbu.spbu_id,
@@ -449,8 +576,15 @@ def prepare_training_dataset(
                     "latitude": float(spbu.latitude) if spbu.latitude is not None else None,
                     "longitude": float(spbu.longitude) if spbu.longitude is not None else None,
                     "shipment_observation_count": observation_counts[spbu.spbu_id],
-                    "history_eligible": spbu.spbu_id in set(eligible_ids),
-                    "coverage_source": "BEHAVIORAL_HISTORY" if spbu.spbu_id in set(eligible_ids) else "ACTIVE_MASTER_COLD_START",
+                    **sufficiency,
+                    "history_eligible": sufficiency["data_sufficiency_status"] == "SUFFICIENT",
+                    "coverage_source": (
+                        "BEHAVIORAL_HISTORY"
+                        if sufficiency["data_sufficiency_status"] == "SUFFICIENT"
+                        else "MARGINAL_HISTORY"
+                        if sufficiency["data_sufficiency_status"] == "MARGINAL"
+                        else "INSUFFICIENT_HISTORY"
+                    ),
                     "vehicle_class": spbu.vehicle_type_tag,
                     "tag_vector": tag_vectors[spbu.spbu_id],
                     "key_tags": key_tags.get(spbu.spbu_id, []),
@@ -463,6 +597,22 @@ def prepare_training_dataset(
                     "valid_shift_observation_count": total_shift,
                 }
             )
+        geographic_metadata = build_geographic_features(records, geography_config)
+        sufficient_ids = sorted(
+            record["spbu_id"] for record in records if record["data_sufficiency_status"] == "SUFFICIENT"
+        )
+        marginal_ids = sorted(
+            record["spbu_id"] for record in records if record["data_sufficiency_status"] == "MARGINAL"
+        )
+        insufficient_ids = sorted(
+            record["spbu_id"] for record in records if record["data_sufficiency_status"] == "INSUFFICIENT"
+        )
+        graph_population_ids = set(sufficient_ids) | set(marginal_ids)
+        pair_rows = [
+            row
+            for row in all_pair_rows
+            if row["spbu_a_id"] in graph_population_ids and row["spbu_b_id"] in graph_population_ids
+        ]
         depot = db.get(MasterDepot, depot_id)
         summary = {
             "depot_id": depot_id,
@@ -476,16 +626,29 @@ def prepare_training_dataset(
             "active_spbu_with_any_history_count": sum(observation_counts[spbu.spbu_id] > 0 for spbu in spbus),
             "mt_count": len({shipment.mt_id for shipment in source_shipments if shipment.mt_id}),
             "master_compatibility_pass_percentage": readiness["master_compatibility_pass_percentage"],
-            "sufficient_history_spbu_count": len(eligible_ids),
-            "cold_start_active_spbu_count": len(cold_start_ids),
-            "no_history_active_spbu_count": sum(observation_counts[spbu_id] == 0 for spbu_id in cold_start_ids),
-            "insufficient_history_active_spbu_count": sum(observation_counts[spbu_id] > 0 for spbu_id in cold_start_ids),
-            "excluded_insufficient_data_spbu_count": 0,
+            "total_spbu": len(records),
+            "sufficient_count": len(sufficient_ids),
+            "marginal_count": len(marginal_ids),
+            "insufficient_count": len(insufficient_ids),
+            "core_training_count": len(sufficient_ids),
+            "sufficient_history_spbu_count": len(sufficient_ids),
+            "cold_start_active_spbu_count": len(marginal_ids) + len(insufficient_ids),
+            "no_history_active_spbu_count": sum(observation_counts[spbu_id] == 0 for spbu_id in insufficient_ids),
+            "insufficient_history_active_spbu_count": sum(observation_counts[spbu_id] > 0 for spbu_id in insufficient_ids),
+            "excluded_insufficient_data_spbu_count": len(insufficient_ids),
             "excluded_inactive_history_spbu_count": len(inactive_history_ids),
-            "geocoded_training_spbu_count": sum(record["latitude"] is not None and record["longitude"] is not None for record in records),
-            "missing_coordinate_training_spbu_count": sum(record["latitude"] is None or record["longitude"] is None for record in records),
+            "geocoded_training_spbu_count": geographic_metadata["valid_coordinate_count"],
+            "missing_coordinate_training_spbu_count": geographic_metadata["invalid_coordinate_count"],
+            "valid_coordinate_count": geographic_metadata["valid_coordinate_count"],
+            "invalid_coordinate_count": geographic_metadata["invalid_coordinate_count"],
+            "geographic_coverage_percentage": geographic_metadata["geographic_coverage_percentage"],
+            "geographic_proximity_enabled": geography_config["enabled"],
+            "geography_configuration": geography_config,
+            "feature_weights": prepared_feature_weights,
+            "data_sufficiency_configuration": sufficiency_config,
             "pairing_edge_count": len(pair_rows),
-            "isolated_spbu_count": len(set(eligible_ids) - {row[side] for row in pair_rows for side in ("spbu_a_id", "spbu_b_id")}),
+            "isolated_spbu_count": len(set(sufficient_ids) - {row[side] for row in pair_rows for side in ("spbu_a_id", "spbu_b_id")}),
+            "geographic_data_quality": geographic_metadata,
             "data_quality": data_quality,
         }
         run.dataset_summary = summary
@@ -495,7 +658,14 @@ def prepare_training_dataset(
             "shift_feature_names": [f"shift:{shift['shift_id']}" for shift in shift_snapshot],
             "tag_feature_configuration": tag_configuration,
             "pair_rows": pair_rows,
-            "cold_start_spbu_ids": cold_start_ids,
+            "sufficient_spbu_ids": sufficient_ids,
+            "marginal_spbu_ids": marginal_ids,
+            "insufficient_spbu_ids": insufficient_ids,
+            "cold_start_spbu_ids": [*marginal_ids, *insufficient_ids],
+            "data_sufficiency_configuration": sufficiency_config,
+            "geographic_configuration": geography_config,
+            "geographic_metadata": geographic_metadata,
+            "prepared_feature_weights": prepared_feature_weights,
             "excluded_inactive_history_spbu_ids": inactive_history_ids,
             "dependency_metadata": {
                 "master_compatibility_rule_source": readiness["rule_source"],
@@ -503,8 +673,8 @@ def prepare_training_dataset(
                 "departure_algorithm_version": DEPARTURE_ALGORITHM_VERSION,
                 "shift_assignment_algorithm_version": SHIFT_ASSIGNMENT_ALGORITHM_VERSION,
                 "pairing_algorithm_version": PAIRING_ALGORITHM_VERSION,
-                "active_spbu_coverage_policy": "All ACTIVE SPBU for the depot are retained. HDBSCAN is fitted only on sufficient-history SPBU; remaining active SPBU receive conservative nearest-cluster cold-start coverage.",
-                "geographic_coordinate_source": "MasterSPBU latitude/longitude snapshot; visualization only and excluded from model features",
+                "active_spbu_coverage_policy": "All ACTIVE SPBU are assessed. Only SUFFICIENT SPBU fit UMAP/HDBSCAN; MARGINAL SPBU may be projected after training and INSUFFICIENT SPBU remain unassigned.",
+                "geographic_coordinate_source": "Canonical MasterSPBU latitude/longitude snapshot; Haversine KNN proximity features, never routing distance/time.",
                 "source_observation_key": ["shipment_id", "spbu_id"],
             },
         }
@@ -532,9 +702,22 @@ def prepare_training_dataset(
         raise HTTPException(status_code=500, detail="Training dataset preparation failed. Review the retained training run.") from exc
 
 
-def _validated_training_configuration(configuration: dict[str, Any] | None) -> dict:
-    source = configuration or {}
-    weights = validate_feature_weights(source.get("feature_weights"))
+def _validated_training_configuration(
+    configuration: dict[str, Any] | None,
+    prepared_configuration: dict[str, Any] | None = None,
+) -> dict:
+    source = {**(prepared_configuration or {}), **(configuration or {})}
+    geography = validate_geographic_configuration(source.get("geographic_configuration"))
+    weights = validate_feature_weights(source.get("feature_weights"), geography_enabled=geography["enabled"])
+    sufficiency = validate_data_sufficiency_configuration(source.get("data_sufficiency_configuration"))
+    projection = {**DEFAULT_PROJECTION_CONFIGURATION, **(source.get("projection_configuration") or {})}
+    projection["minimum_confidence"] = float(projection["minimum_confidence"])
+    projection["distance_scale_multiplier"] = float(projection["distance_scale_multiplier"])
+    projection["method"] = "UMAP_NEAREST_CORE_CENTROID"
+    if not 0 <= projection["minimum_confidence"] <= 1:
+        raise HTTPException(status_code=400, detail="Minimum projection confidence must be within 0-1.")
+    if projection["distance_scale_multiplier"] <= 0:
+        raise HTTPException(status_code=400, detail="Projection distance scale multiplier must be greater than 0.")
     node2vec = {**DEFAULT_NODE2VEC_PARAMETERS, **(source.get("node2vec_parameters") or {})}
     umap_parameters = {**DEFAULT_UMAP_PARAMETERS, **(source.get("umap_parameters") or {})}
     hdbscan_parameters = {**DEFAULT_HDBSCAN_PARAMETERS, **(source.get("hdbscan_parameters") or {})}
@@ -548,6 +731,9 @@ def _validated_training_configuration(configuration: dict[str, Any] | None) -> d
         raise HTTPException(status_code=400, detail="UMAP n_neighbors and n_components must be at least 2.")
     return {
         "feature_weights": weights,
+        "data_sufficiency_configuration": sufficiency,
+        "geographic_configuration": geography,
+        "projection_configuration": projection,
         "node2vec_parameters": node2vec,
         "umap_parameters": umap_parameters,
         "hdbscan_parameters": hdbscan_parameters,
@@ -557,15 +743,17 @@ def _validated_training_configuration(configuration: dict[str, Any] | None) -> d
 
 def _cluster_profiles(assignments: list[dict], records: list[dict], pair_rows: list[dict], shift_snapshot: list[dict]) -> list[dict]:
     record_lookup = {record["spbu_id"]: record for record in records}
-    historical_assignment_count = sum(bool(assignment.get("history_eligible", True)) for assignment in assignments)
+    historical_assignment_count = sum(
+        assignment.get("cluster_assignment_type") == "CORE_MEMBER" for assignment in assignments
+    )
     by_cluster: dict[int, list[dict]] = defaultdict(list)
     for assignment in assignments:
-        if not assignment["is_noise"]:
+        if not assignment["is_noise"] and assignment.get("cluster_id") is not None:
             by_cluster[int(assignment["cluster_id"])].append(assignment)
     profiles = []
     for cluster_id, members in sorted(by_cluster.items()):
-        historical_members = [member for member in members if member.get("history_eligible", True)]
-        cold_start_members = [member for member in members if not member.get("history_eligible", True)]
+        historical_members = [member for member in members if member.get("cluster_assignment_type") == "CORE_MEMBER"]
+        cold_start_members = [member for member in members if member.get("cluster_assignment_type") == "MARGINAL_PROJECTED"]
         member_ids = {member["spbu_id"] for member in historical_members}
         all_member_ids = {member["spbu_id"] for member in members}
         tag_counts = Counter(tag for member in historical_members for tag in record_lookup[member["spbu_id"]]["key_tags"])
@@ -603,6 +791,7 @@ def _cluster_profiles(assignments: list[dict], records: list[dict], pair_rows: l
                 "cluster_size": len(members),
                 "historical_member_count": len(historical_members),
                 "cold_start_member_count": len(cold_start_members),
+                "projected_member_count": len(cold_start_members),
                 "no_history_member_count": sum(member.get("shipment_observation_count", 0) == 0 for member in cold_start_members),
                 "training_spbu_percentage": round(100 * len(historical_members) / historical_assignment_count, 2) if historical_assignment_count else 0.0,
                 "common_tags": common_tags,
@@ -617,7 +806,7 @@ def _cluster_profiles(assignments: list[dict], records: list[dict], pair_rows: l
                 "low_confidence_member_count": sum(member["membership_probability"] < 0.5 for member in historical_members),
                 "member_spbu_ids": sorted(member_ids),
                 "covered_member_spbu_ids": sorted(all_member_ids),
-                "evidence_scope": "Historical members only; cold-start coverage is reported separately and excluded from behavioral statistics.",
+                "evidence_scope": "CORE_MEMBER SPBUs determine behavioral statistics; MARGINAL_PROJECTED SPBUs are reported separately and never alter core boundaries.",
             }
         )
     return profiles
@@ -631,9 +820,14 @@ def train_behavioral_model(db: Session, training_run_id: str, configuration: dic
     if run.status not in {"DATASET_READY", "COMPLETED"} and not retrying_failed_dataset:
         raise HTTPException(status_code=409, detail="Prepare and validate the dataset before training.")
     require_phase5_readiness(db, run.depot_id)
-    config = _validated_training_configuration(configuration)
+    config = _validated_training_configuration(configuration, run.training_configuration)
     records = run.dataset_payload.get("records", [])
-    history_indices = [index for index, record in enumerate(records) if record.get("history_eligible", True)]
+    history_indices = [
+        index for index, record in enumerate(records) if record.get("data_sufficiency_status") == "SUFFICIENT"
+    ]
+    marginal_indices = [
+        index for index, record in enumerate(records) if record.get("data_sufficiency_status") == "MARGINAL"
+    ]
     minimum_cluster_size = int(config["hdbscan_parameters"]["min_cluster_size"])
     if len(history_indices) < max(3, minimum_cluster_size):
         raise HTTPException(status_code=422, detail=f"Too few SPBUs for clustering. Need at least {max(3, minimum_cluster_size)} sufficient-history SPBUs.")
@@ -646,13 +840,22 @@ def train_behavioral_model(db: Session, training_run_id: str, configuration: dic
     db.commit()
     try:
         pair_rows = run.dataset_payload.get("pair_rows", [])
-        graph = create_pairing_graph([record["spbu_id"] for record in records], pair_rows)
+        graph_population = [
+            record["spbu_id"]
+            for record in records
+            if record.get("data_sufficiency_status") in {"SUFFICIENT", "MARGINAL"}
+        ]
+        graph = create_pairing_graph(graph_population, pair_rows)
         embeddings, node2vec_metadata = generate_node2vec_embeddings(graph, config["node2vec_parameters"])
+        embedding_dimensions = int(config["node2vec_parameters"].get("dimensions", 16))
+        for record in records:
+            embeddings.setdefault(record["spbu_id"], [0.0] * embedding_dimensions)
         fused, fusion_metadata = _feature_fusion(
             records,
             embeddings,
             config["feature_weights"],
             fit_indices=history_indices,
+            geography_enabled=config["geographic_configuration"]["enabled"],
         )
         try:
             import joblib
@@ -674,8 +877,10 @@ def train_behavioral_model(db: Session, training_run_id: str, configuration: dic
             transform_seed=int(config["random_seed"]),
         )
         reduced_history = internal_umap.fit_transform(history_fused)
-        reduced = internal_umap.transform(fused)
+        reduced = np.full((len(records), components), np.nan, dtype=float)
         reduced[history_indices] = reduced_history
+        if marginal_indices:
+            reduced[marginal_indices] = internal_umap.transform(fused[marginal_indices])
         cluster_config = config["hdbscan_parameters"]
         clusterer = HDBSCAN(
             min_cluster_size=minimum_cluster_size,
@@ -696,18 +901,24 @@ def train_behavioral_model(db: Session, training_run_id: str, configuration: dic
             transform_seed=int(config["random_seed"]),
         )
         visualization_history = visualization_umap.fit_transform(history_fused)
-        visualization = visualization_umap.transform(fused)
+        visualization = np.full((len(records), 2), np.nan, dtype=float)
         visualization[history_indices] = visualization_history
+        if marginal_indices:
+            visualization[marginal_indices] = visualization_umap.transform(fused[marginal_indices])
 
-        labels = np.full(len(records), -1, dtype=int)
-        probabilities = np.zeros(len(records), dtype=float)
-        labels[history_indices] = history_labels
-        probabilities[history_indices] = history_probabilities
+        labels: list[int | None] = [None] * len(records)
+        membership_probabilities: list[float | None] = [None] * len(records)
+        projection_confidences: list[float | None] = [None] * len(records)
+        projection_statuses: list[str] = ["NOT_APPLICABLE"] * len(records)
+        for index, label, probability in zip(history_indices, history_labels, history_probabilities, strict=True):
+            labels[index] = int(label)
+            membership_probabilities[index] = float(probability)
 
-        # SPBU aktif tanpa histori cukup tidak boleh mengubah density model utama.
-        # Mereka dipetakan sesudah training ke centroid cluster terdekat dengan
-        # confidence konservatif sehingga inference dapat membedakan cold-start
-        # coverage dari evidence historis tanpa menandainya sebagai UNSEEN_SPBU.
+        # sklearn.cluster.HDBSCAN does not expose approximate_predict. Marginal
+        # records are therefore transformed by the fitted UMAP and compared with
+        # core-cluster centroids in that immutable embedding. The distance-based
+        # confidence and threshold are persisted and low-confidence cases stay
+        # unassigned rather than being forced into a cluster.
         clustered_history_labels = sorted({int(label) for label in history_labels if int(label) >= 0})
         cluster_centroids: dict[int, np.ndarray] = {}
         cluster_scales: dict[int, float] = {}
@@ -716,26 +927,37 @@ def train_behavioral_model(db: Session, training_run_id: str, configuration: dic
             centroid = np.mean(member_vectors, axis=0)
             distances = np.linalg.norm(member_vectors - centroid, axis=1)
             cluster_centroids[label] = centroid
-            cluster_scales[label] = max(1e-6, float(np.percentile(distances, 90)) if len(distances) else 1.0)
-        for index, record in enumerate(records):
-            if record.get("history_eligible", True) or not cluster_centroids:
-                continue
-            label, distance = min(
-                (
-                    (label, float(np.linalg.norm(reduced[index] - centroid)))
-                    for label, centroid in cluster_centroids.items()
-                ),
-                key=lambda item: (item[1], item[0]),
+            global_scale = float(np.median(np.linalg.norm(reduced_history - np.mean(reduced_history, axis=0), axis=1)))
+            cluster_scales[label] = max(1e-3, global_scale * 0.10, float(np.percentile(distances, 90)) if len(distances) else 1.0)
+        projection_config = config["projection_configuration"]
+        for index in marginal_indices:
+            projection = project_to_core_clusters(
+                reduced[index],
+                cluster_centroids,
+                cluster_scales,
+                minimum_confidence=float(projection_config["minimum_confidence"]),
+                distance_scale_multiplier=float(projection_config["distance_scale_multiplier"]),
             )
-            labels[index] = label
-            probabilities[index] = max(
-                0.10,
-                min(0.49, 0.49 * math.exp(-distance / (3.0 * cluster_scales[label]))),
-            )
+            projection_confidences[index] = projection["projection_confidence"]
+            labels[index] = projection["projected_cluster_id"]
+            projection_statuses[index] = projection["projection_status"]
         assignments = []
         for index, record in enumerate(records):
-            label = int(labels[index])
-            is_noise = label == -1
+            sufficiency_status = record["data_sufficiency_status"]
+            label = labels[index]
+            is_core_noise = sufficiency_status == "SUFFICIENT" and label == -1
+            if sufficiency_status == "SUFFICIENT":
+                assignment_type = "CORE_NOISE" if is_core_noise else "CORE_MEMBER"
+            elif sufficiency_status == "MARGINAL":
+                assignment_type = "MARGINAL_PROJECTED" if projection_statuses[index] == "PROJECTED" else "MARGINAL_UNASSIGNED"
+            else:
+                assignment_type = "INSUFFICIENT_UNASSIGNED"
+                projection_statuses[index] = "UNASSIGNED"
+            assigned_cluster_id = int(label) if label is not None and label >= 0 else None
+            projection_confidence = projection_confidences[index]
+            membership_probability = membership_probabilities[index]
+            visualization_x = None if not math.isfinite(float(visualization[index, 0])) else round(float(visualization[index, 0]), 6)
+            visualization_y = None if not math.isfinite(float(visualization[index, 1])) else round(float(visualization[index, 1]), 6)
             assignments.append(
                 {
                     "spbu_id": record["spbu_id"],
@@ -744,55 +966,122 @@ def train_behavioral_model(db: Session, training_run_id: str, configuration: dic
                     "latitude": record.get("latitude"),
                     "longitude": record.get("longitude"),
                     "shipment_observation_count": record["shipment_observation_count"],
+                    "operating_day_count": record["operating_day_count"],
+                    "training_period_coverage": record["training_period_coverage"],
+                    "shift_observation_coverage": record["shift_observation_coverage"],
+                    "pairing_observation_count": record["pairing_observation_count"],
+                    "pairing_observation_strength": record["pairing_observation_strength"],
+                    "last_operating_date": record["last_operating_date"],
+                    "recency_age_days": record["recency_age_days"],
+                    "data_sufficiency_score": record["data_sufficiency_score"],
+                    "data_sufficiency_status": sufficiency_status,
+                    "data_sufficiency_components": record["data_sufficiency_components"],
                     "coverage_source": record.get("coverage_source", "BEHAVIORAL_HISTORY"),
-                    "history_eligible": bool(record.get("history_eligible", True)),
-                    "cluster_id": None if is_noise else label,
-                    "cluster_label": "Noise / Unique Behavioral Pattern" if is_noise else f"Cluster {label + 1}",
-                    "membership_probability": round(float(probabilities[index]), 6),
-                    "is_noise": is_noise,
+                    "history_eligible": sufficiency_status == "SUFFICIENT",
+                    "cluster_id": assigned_cluster_id,
+                    "cluster_label": (
+                        "Noise / Unique Behavioral Pattern"
+                        if is_core_noise
+                        else f"Cluster {assigned_cluster_id + 1}"
+                        if assigned_cluster_id is not None
+                        else "Not Assigned"
+                    ),
+                    "cluster_assignment_type": assignment_type,
+                    "membership_probability": round(membership_probability, 6) if membership_probability is not None else None,
+                    "projected_cluster_id": assigned_cluster_id if assignment_type == "MARGINAL_PROJECTED" else None,
+                    "projection_confidence": round(projection_confidence, 6) if projection_confidence is not None else None,
+                    "projection_status": projection_statuses[index],
+                    "unassigned_reason": (
+                        "Projection confidence below configured threshold"
+                        if assignment_type == "MARGINAL_UNASSIGNED" and projection_statuses[index] == "LOW_CONFIDENCE"
+                        else "No core cluster is available for projection"
+                        if assignment_type == "MARGINAL_UNASSIGNED"
+                        else "Insufficient historical evidence"
+                        if assignment_type == "INSUFFICIENT_UNASSIGNED"
+                        else None
+                    ),
+                    "is_noise": is_core_noise,
                     "dominant_shift": record["dominant_shift"],
                     "vehicle_class": record.get("vehicle_class"),
                     "key_tags": record["key_tags"],
-                    "visualization_x": round(float(visualization[index, 0]), 6),
-                    "visualization_y": round(float(visualization[index, 1]), 6),
+                    "geographic_data_status": record["geographic_data_status"],
+                    "geographic_duplicate_coordinate": record["geographic_duplicate_coordinate"],
+                    "nearest_spbu_distance_km": record["nearest_spbu_distance_km"],
+                    "average_k_nearest_distance_km": record["average_k_nearest_distance_km"],
+                    "median_k_nearest_distance_km": record["median_k_nearest_distance_km"],
+                    "local_spbu_density": record["local_spbu_density"],
+                    "visualization_x": visualization_x,
+                    "visualization_y": visualization_y,
                 }
             )
         run.status = "CALCULATING_PROFILES"
         profiles = _cluster_profiles(assignments, records, pair_rows, run.shift_definition_snapshot)
-        historical_assignments = [assignment for assignment in assignments if assignment["history_eligible"]]
-        cold_start_assignments = [assignment for assignment in assignments if not assignment["history_eligible"]]
+        historical_assignments = [assignment for assignment in assignments if assignment["data_sufficiency_status"] == "SUFFICIENT"]
+        marginal_assignments = [assignment for assignment in assignments if assignment["data_sufficiency_status"] == "MARGINAL"]
+        insufficient_assignments = [assignment for assignment in assignments if assignment["data_sufficiency_status"] == "INSUFFICIENT"]
+        marginal_projected = [assignment for assignment in marginal_assignments if assignment["cluster_assignment_type"] == "MARGINAL_PROJECTED"]
         cluster_count = len({assignment["cluster_id"] for assignment in historical_assignments if not assignment["is_noise"]})
         noise_count = sum(assignment["is_noise"] for assignment in historical_assignments)
         average_membership = float(np.mean([assignment["membership_probability"] for assignment in historical_assignments]))
+        average_projection_confidence = (
+            float(np.mean([assignment["projection_confidence"] for assignment in marginal_projected]))
+            if marginal_projected
+            else 0.0
+        )
         warnings = []
         if graph.number_of_edges() == 0:
             warnings.append("No pairing edges were available; every SPBU received the documented zero pairing embedding.")
-        if noise_count == len(assignments):
+        if noise_count == len(historical_assignments):
             warnings.append("HDBSCAN marked every SPBU as noise. Review feature weights or density parameters before saving.")
-        cold_start_count = len(cold_start_assignments)
-        if cold_start_count:
+        if marginal_assignments:
             warnings.append(
-                f"{cold_start_count} active SPBU lacked the minimum historical observations and received conservative nearest-cluster cold-start coverage."
+                f"{len(marginal_assignments)} MARGINAL SPBU were excluded from core fitting; {len(marginal_projected)} passed post-training projection confidence."
             )
+        if insufficient_assignments:
+            warnings.append(f"{len(insufficient_assignments)} INSUFFICIENT SPBU remain unassigned and are not HDBSCAN noise.")
+        if config["feature_weights"]["pairing"] >= 0.4 and config["feature_weights"]["geographic"] >= 0.3:
+            warnings.append("Pairing and Geographic weights are both high; correlated proximity behavior may have strong combined influence.")
+        geographic_metadata = run.dataset_payload.get("geographic_metadata", {})
         result = {
             "summary": {
                 "training_spbu_count": len(historical_assignments),
                 "behavioral_history_spbu_count": len(history_indices),
                 "historical_training_spbu_count": len(historical_assignments),
                 "total_covered_spbu_count": len(assignments),
-                "cold_start_covered_spbu_count": cold_start_count,
-                "no_history_spbu_count": sum(assignment["shipment_observation_count"] == 0 for assignment in cold_start_assignments),
-                "insufficient_history_spbu_count": sum(assignment["shipment_observation_count"] > 0 for assignment in cold_start_assignments),
+                "total_spbu_count": len(assignments),
+                "sufficient_spbu_count": len(historical_assignments),
+                "marginal_spbu_count": len(marginal_assignments),
+                "insufficient_spbu_count": len(insufficient_assignments),
+                "core_training_spbu_count": len(historical_assignments),
+                "core_cluster_member_count": len(historical_assignments) - noise_count,
+                "core_noise_count": noise_count,
+                "marginal_projected_count": len(marginal_projected),
+                "marginal_unassigned_count": len(marginal_assignments) - len(marginal_projected),
+                "insufficient_unassigned_count": len(insufficient_assignments),
+                "cold_start_covered_spbu_count": len(marginal_assignments),
+                "no_history_spbu_count": sum(assignment["shipment_observation_count"] == 0 for assignment in insufficient_assignments),
+                "insufficient_history_spbu_count": len(insufficient_assignments),
                 "cluster_count": cluster_count,
                 "clustered_spbu_count": len(historical_assignments) - noise_count,
                 "noise_spbu_count": noise_count,
                 "average_membership_probability": round(average_membership, 6),
+                "average_projection_confidence": round(average_projection_confidence, 6),
+                "valid_coordinate_count": int(geographic_metadata.get("valid_coordinate_count", 0)),
+                "invalid_coordinate_count": int(geographic_metadata.get("invalid_coordinate_count", 0)),
+                "geographic_coverage_percentage": float(geographic_metadata.get("geographic_coverage_percentage", 0.0)),
             },
             "assignments": assignments,
             "cluster_profiles": profiles,
             "configuration": config,
             "node2vec_metadata": node2vec_metadata,
             "fusion_metadata": fusion_metadata,
+            "projection_metadata": {
+                "method": projection_config["method"],
+                "minimum_confidence": projection_config["minimum_confidence"],
+                "distance_scale_multiplier": projection_config["distance_scale_multiplier"],
+                "reference_space": "fitted internal UMAP",
+                "core_cluster_reference_count": len(cluster_centroids),
+            },
             "warnings": warnings,
             "review_required": True,
             "saved": False,
@@ -811,6 +1100,15 @@ def train_behavioral_model(db: Session, training_run_id: str, configuration: dic
             "tag_feature_configuration": run.dataset_payload.get("tag_feature_configuration", {}),
             "shift_definition_snapshot": run.shift_definition_snapshot,
             "dependency_metadata": run.dataset_payload.get("dependency_metadata", {}),
+            "data_sufficiency_configuration": config["data_sufficiency_configuration"],
+            "geographic_configuration": config["geographic_configuration"],
+            "geographic_metadata": run.dataset_payload.get("geographic_metadata", {}),
+            "projection_configuration": config["projection_configuration"],
+            "projection_reference": {
+                "cluster_centroids": {label: centroid.tolist() for label, centroid in cluster_centroids.items()},
+                "cluster_scales": cluster_scales,
+                "reference_space": "fitted internal UMAP",
+            },
             "node2vec_embeddings": embeddings,
             "feature_fusion_metadata": fusion_metadata,
             "feature_vectors": fused,
@@ -874,6 +1172,18 @@ def get_training_run(db: Session, training_run_id: str) -> dict:
                     "latitude",
                     "longitude",
                     "shipment_observation_count",
+                    "data_sufficiency_score",
+                    "data_sufficiency_status",
+                    "operating_day_count",
+                    "training_period_coverage",
+                    "shift_observation_coverage",
+                    "pairing_observation_count",
+                    "pairing_observation_strength",
+                    "last_operating_date",
+                    "recency_age_days",
+                    "geographic_data_status",
+                    "nearest_spbu_distance_km",
+                    "average_k_nearest_distance_km",
                     "dominant_shift",
                     "key_tags",
                     "shift_distribution",

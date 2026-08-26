@@ -103,6 +103,8 @@ def load_model_inference_evidence(db: Session, model: MLBehavioralModel) -> dict
                 "spbu_id": row.spbu_id,
                 "cluster_id": row.cluster_id,
                 "membership_probability": row.membership_probability,
+                "projection_confidence": row.projection_confidence,
+                "cluster_assignment_type": row.cluster_assignment_type,
                 "is_noise": row.is_noise,
                 "dominant_shift": row.dominant_shift,
             }
@@ -121,6 +123,18 @@ def confidence_level(score: float, parameters: dict) -> str:
     if score >= float(parameters["medium_confidence_threshold"]):
         return "MEDIUM"
     return "LOW"
+
+
+def _phase5_assignment_confidence(assignment: dict | None) -> float:
+    if not assignment:
+        return 0.0
+    membership = assignment.get("membership_probability")
+    if membership is not None:
+        return max(0.0, float(membership))
+    projection = assignment.get("projection_confidence")
+    if assignment.get("cluster_assignment_type") == "MARGINAL_PROJECTED" and projection is not None:
+        return max(0.0, float(projection))
+    return 0.0
 
 
 def _haversine_km(first: tuple[float, float], second: tuple[float, float]) -> float:
@@ -352,7 +366,9 @@ def predict_shipments(
     for profile in evidence.get("cluster_profiles", []):
         for pair in profile.get("inference_internal_pairings") or profile.get("top_internal_pairings", []):
             pairing_by_codes[frozenset((str(pair["spbu_a_code"]), str(pair["spbu_b_code"])))] = float(pair["pairing_strength"])
-    weights = {**{"tag": 0.4, "shift": 0.25, "pairing": 0.35}, **(model.feature_weights or {})}
+    raw_weights = {**{"tag": 0.4, "shift": 0.25, "pairing": 0.35}, **(model.feature_weights or {})}
+    behavioral_total = sum(float(raw_weights[key]) for key in ("tag", "shift", "pairing")) or 1.0
+    weights = {key: float(raw_weights[key]) / behavioral_total for key in ("tag", "shift", "pairing")}
     by_shift: dict[str, list[dict]] = defaultdict(list)
     for row in loading_orders:
         by_shift[row["shift_id"]].append(row)
@@ -375,7 +391,7 @@ def predict_shipments(
                 first, second = assignments.get(rows[left]["spbu_id"]), assignments.get(rows[right]["spbu_id"])
                 if not first or not second or first.get("is_noise") or second.get("is_noise") or first.get("cluster_id") != second.get("cluster_id"):
                     continue
-                cluster_match = math.sqrt(max(0.0, float(first.get("membership_probability", 0))) * max(0.0, float(second.get("membership_probability", 0))))
+                cluster_match = math.sqrt(_phase5_assignment_confidence(first) * _phase5_assignment_confidence(second))
                 shift_match = (
                     float((first.get("dominant_shift") == rows[left]["shift"]) + (second.get("dominant_shift") == rows[right]["shift"])) / 2.0
                 )
@@ -431,7 +447,7 @@ def predict_shipments(
                 }
             else:
                 assignment = assignments.get(selected_rows[0]["spbu_id"])
-                score = round(float(assignment.get("membership_probability", 0.0)), 6) if assignment else 0.0
+                score = round(_phase5_assignment_confidence(assignment), 6)
                 if not assignment:
                     model_coverage = "UNSEEN_SPBU"
                 elif assignment.get("is_noise"):

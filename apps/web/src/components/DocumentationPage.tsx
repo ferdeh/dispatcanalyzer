@@ -335,6 +335,27 @@ const guides: GuidePage[] = [
         ],
       },
       {
+        id: "doc-phase4-perbandingan",
+        title: "Perbedaan grafik dan ranking SPBU",
+        paragraphs: [
+          "SPBU Consistency Scatter Plot dan Historical Pattern Matrix sama-sama menampilkan satu titik untuk setiap SPBU eligible dalam scope filter aktif, tetapi menjawab pertanyaan berbeda. Scatter Plot mengukur konsentrasi seluruh distribusi penggunaan MT, sedangkan Pattern Matrix membuat klasifikasi operasional dari jumlah MT unik dan affinity MT nomor satu.",
+          "Dua SPBU dapat berada dalam quadrant Pattern Matrix yang sama tetapi mempunyai Consistency Score berbeda karena Matrix hanya memakai dominant affinity dan jumlah MT unik, sementara Consistency memakai seluruh probability distribution MT melalui normalized HHI.",
+          "Tiga ranking card tidak memilih SPBU terbaik dan bukan rekomendasi assignment. Ranking hanya mengurutkan perilaku historis menurut concentration, distribution breadth, atau perubahan antarperiode dalam scope yang sudah di-Apply.",
+        ],
+        cards: [
+          { name: "SPBU Consistency Scatter Plot", meaning: "X = Unique MT, Y = Consistency Score seluruh distribusi, ukuran = shipment, warna = confidence.", reading: "Semakin tinggi titik, semakin terkonsentrasi penggunaan pada sedikit MT; kanan bawah menunjukkan footprint luas dengan distribusi tersebar." },
+          { name: "Historical Pattern Matrix", meaning: "X = Unique MT, Y = Dominant MT Affinity; garis 60% dan median Unique MT membentuk empat quadrant.", reading: "Kiri atas Dedicated-like, kanan atas Preferred-fleet, kiri bawah Limited-balanced, dan kanan bawah Highly-flexible." },
+          { name: "Most Historically Consistent SPBU", meaning: "Urutan Consistency Score tertinggi, lalu shipment terbanyak dan kode SPBU.", reading: "Posisi atas berarti penggunaan MT paling terkonsentrasi; baca bersama Unique MT, Dominant %, Top-3 Share, shipment, dan confidence." },
+          { name: "Most Historically Variable SPBU", meaning: "Urutan Variability Score atau normalized entropy tertinggi, lalu shipment terbanyak dan kode SPBU.", reading: "Posisi atas berarti shipment lebih merata tersebar ke berbagai MT; ini tidak otomatis berarti pola sering berubah antarperiode." },
+          { name: "Highest Historical Pattern Change", meaning: "Urutan Temporal Stability terendah, lalu Pattern Shift Distance terbesar dan shipment terbanyak.", reading: "Posisi atas berarti distribusi MT paling berubah antar-bucket waktu; gunakan Previous MT, Recent MT, dan shift level untuk membaca arah perubahan." },
+        ],
+        examples: [
+          { title: "Variable bukan selalu berubah", text: "SPBU dapat memakai banyak MT secara merata setiap minggu. Variability-nya tinggi karena distribusi tersebar, tetapi Temporal Stability tetap tinggi karena pola mingguannya konsisten." },
+          { title: "Pattern change bukan selalu banyak MT", text: "SPBU dapat hanya memakai dua MT, tetapi dominant MT berganti tajam antara periode sebelumnya dan terbaru. Unique MT tetap rendah, sementara Pattern Change dapat tinggi." },
+        ],
+        note: "Selalu baca ranking bersama shipment count dan confidence agar SPBU dengan evidence kecil tidak disamakan dengan SPBU ber-evidence kuat.",
+      },
+      {
         id: "doc-phase4-hitung",
         title: "Probability, HHI, entropy, confidence, dan stability",
         formulas: [

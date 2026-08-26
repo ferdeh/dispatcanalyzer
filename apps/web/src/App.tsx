@@ -264,6 +264,7 @@ type DepartureProfile = {
   spbu_id: string;
   spbu_code: string;
   spbu_name: string | null;
+  spbu_tags: string[];
   depot_name: string;
   observation_count: number;
   shipment_count: number;
@@ -399,8 +400,10 @@ type PairingPair = {
   spbu_b_id: string;
   spbu_a_code: string;
   spbu_a_name: string | null;
+  spbu_a_tags: string[];
   spbu_b_code: string;
   spbu_b_name: string | null;
+  spbu_b_tags: string[];
   pair_count: number;
   shipment_a_count: number;
   shipment_b_count: number;
@@ -437,18 +440,19 @@ type PairingAnalysis = {
   total: number;
   limit: number;
   offset: number;
-  matrix: { spbu_ids: string[]; x_axis: string[]; y_axis: string[]; data: Array<[number, number, number, number, number, number, number, number, string]>; selected_spbu_id: string | null };
-  network: { nodes: Array<{ id: string; name: string; value: number; symbolSize: number }>; edges: Array<{ source: string; target: string; value: number; label: string; metrics: PairingPair }> };
+  matrix: { spbu_ids: string[]; x_axis: string[]; y_axis: string[]; data: Array<[number, number, number, number, number, number, number, number, string, string[], string[]]>; selected_spbu_id: string | null };
+  network: { nodes: Array<{ id: string; name: string; tags: string[]; value: number; symbolSize: number }>; edges: Array<{ source: string; target: string; value: number; label: string; metrics: PairingPair }> };
   detail: {
     spbu_id: string;
     spbu_code: string;
     spbu_name: string | null;
+    spbu_tags: string[];
     depot_name: string;
     historical_shipments: number;
-    top_pairs: Array<PairingPair & { candidate_spbu_id: string; candidate_spbu_code: string; pair_probability: number; reverse_probability: number }>;
+    top_pairs: Array<PairingPair & { candidate_spbu_id: string; candidate_spbu_code: string; candidate_spbu_tags: string[]; pair_probability: number; reverse_probability: number }>;
   } | null;
   evidence: {
-    pair: { spbu_a_id: string; spbu_a_code: string; spbu_b_id: string; spbu_b_code: string } | null;
+    pair: { spbu_a_id: string; spbu_a_code: string; spbu_a_tags: string[]; spbu_b_id: string; spbu_b_code: string; spbu_b_tags: string[] } | null;
     distinct_shipment_count: number;
     rows: Array<{
       shipment_id: string;
@@ -457,6 +461,7 @@ type PairingAnalysis = {
       vehicle_registration: string | null;
       gate_out: string | null;
       spbu_in_shipment: string[];
+      spbu_tags: Array<{ spbu_id: string; spbu_code: string; tags: string[] }>;
       products: string[];
       quantity: number;
     }>;
@@ -468,6 +473,7 @@ type PairingAnalysis = {
 type DepartureProfileFilterOptions = {
   confidenceLevel?: DepartureConfidenceFilter;
   shiftSummaryFilter?: ShiftSummaryFilter;
+  profileSearch?: string;
 };
 
 const kpiLabels: Record<string, string> = {
@@ -711,6 +717,11 @@ function formatPercent(value: number | null | undefined): string {
 function formatMetric(value: number | null | undefined, maximumFractionDigits = 2): string {
   if (value === null || value === undefined || Number.isNaN(value)) return "-";
   return value.toLocaleString(undefined, { maximumFractionDigits });
+}
+
+function formatTags(tags: string[] | null | undefined): string {
+  if (!tags || tags.length === 0) return "-";
+  return tags.join(", ");
 }
 
 function minuteAxisLabel(value: number): string {
@@ -1115,6 +1126,7 @@ function App() {
   const [departureSortColumn, setDepartureSortColumn] = useState<DepartureSortColumn>("observation_count");
   const [departureSortDirection, setDepartureSortDirection] = useState<CrudSortDirection>("desc");
   const [selectedDepartureSpbuId, setSelectedDepartureSpbuId] = useState<string | null>(null);
+  const [departureProfileSearch, setDepartureProfileSearch] = useState("");
   const [shiftConfigs, setShiftConfigs] = useState<OperationalShiftConfig[]>(defaultShiftConfig);
   const [shiftMethod, setShiftMethod] = useState<ShiftAssignmentMethod>("DOMINANT_SHIFT");
   const [shiftAnalysis, setShiftAnalysis] = useState<ShiftAnalysis | null>(null);
@@ -1251,6 +1263,7 @@ function App() {
     }
     const effectiveConfidenceFilter = profileFilters.confidenceLevel ?? departureConfidenceFilter;
     const effectiveShiftSummaryFilter = profileFilters.shiftSummaryFilter ?? shiftSummaryFilter;
+    const effectiveProfileSearch = profileFilters.profileSearch ?? departureProfileSearch;
     const filteredSpbuIds = spbuIdsForShiftSummaryFilter(effectiveShiftSummaryFilter);
     const requestId = departureRequestRef.current + 1;
     departureRequestRef.current = requestId;
@@ -1268,6 +1281,7 @@ function App() {
         sort_direction: departureSortDirection
       });
       if (filters.search.trim()) params.set("search", filters.search.trim());
+      if (effectiveProfileSearch.trim()) params.set("profile_search", effectiveProfileSearch.trim());
       if (effectiveConfidenceFilter !== "ALL") params.set("confidence_level", effectiveConfidenceFilter);
       if (filteredSpbuIds !== null) params.set("spbu_ids", filteredSpbuIds.length > 0 ? filteredSpbuIds.join(",") : "__NO_MATCH__");
       const payload = await apiGet<DepartureAnalysis>(`/api/v1/departure-intelligence/analysis?${params.toString()}`);
@@ -1459,7 +1473,7 @@ function App() {
     if (currentPage === "departure-intelligence" && departureAnalysis && appliedDepartureFilters) {
       fetchDepartureAnalysis(departureOffset, appliedDepartureFilters);
     }
-  }, [currentPage, departureOffset, departureLimit, departureSortColumn, departureSortDirection, departureConfidenceFilter, shiftSummaryFilter, shiftAnalysis]);
+  }, [currentPage, departureOffset, departureLimit, departureSortColumn, departureSortDirection, departureConfidenceFilter, shiftSummaryFilter, departureProfileSearch, shiftAnalysis]);
 
   useEffect(() => {
     if (currentPage === "departure-intelligence") {
@@ -1565,9 +1579,9 @@ function App() {
     return {
       tooltip: {
         position: "top",
-        formatter: (params: { data: [number, number, number, number, number, number, number, number, string] }) => {
-          const [x, y, probability, pairCount, reverseProbability, support, lift, observationCount, confidence] = params.data;
-          return `${matrix.y_axis[y]} -> ${matrix.x_axis[x]}<br />Pair Count: ${pairCount}<br />P(candidate|anchor): ${formatPercent(probability)}<br />Reverse Probability: ${formatPercent(reverseProbability)}<br />Support: ${formatPercent(support)}<br />Lift: ${formatMetric(lift)}<br />Observation Count: ${observationCount}<br />Confidence: ${confidence}`;
+        formatter: (params: { data: [number, number, number, number, number, number, number, number, string, string[], string[]] }) => {
+          const [x, y, probability, pairCount, reverseProbability, support, lift, observationCount, confidence, anchorTags, candidateTags] = params.data;
+          return `${matrix.y_axis[y]} -> ${matrix.x_axis[x]}<br />Anchor SPBU Tag: ${formatTags(anchorTags)}<br />Candidate SPBU Tag: ${formatTags(candidateTags)}<br />Pair Count: ${pairCount}<br />P(candidate|anchor): ${formatPercent(probability)}<br />Reverse Probability: ${formatPercent(reverseProbability)}<br />Support: ${formatPercent(support)}<br />Lift: ${formatMetric(lift)}<br />Observation Count: ${observationCount}<br />Confidence: ${confidence}`;
         }
       },
       grid: { top: 20, right: 24, bottom: 84, left: 96 },
@@ -1582,12 +1596,12 @@ function App() {
     if (!network || network.nodes.length === 0) return null;
     return {
       tooltip: {
-        formatter: (params: { dataType?: string; data?: { name?: string; value?: number; metrics?: PairingPair; label?: string } }) => {
+        formatter: (params: { dataType?: string; data?: { name?: string; tags?: string[]; value?: number; metrics?: PairingPair; label?: string } }) => {
           if (params.dataType === "edge" && params.data?.metrics) {
             const row = params.data.metrics;
-            return `${params.data.label}<br />Pair Count: ${row.pair_count}<br />P(B|A): ${formatPercent(row.probability_b_given_a)}<br />P(A|B): ${formatPercent(row.probability_a_given_b)}<br />Support: ${formatPercent(row.support)}<br />Lift: ${formatMetric(row.lift)}<br />Confidence: ${row.confidence_level}`;
+            return `${params.data.label}<br />SPBU A Tag: ${formatTags(row.spbu_a_tags)}<br />SPBU B Tag: ${formatTags(row.spbu_b_tags)}<br />Pair Count: ${row.pair_count}<br />P(B|A): ${formatPercent(row.probability_b_given_a)}<br />P(A|B): ${formatPercent(row.probability_a_given_b)}<br />Support: ${formatPercent(row.support)}<br />Lift: ${formatMetric(row.lift)}<br />Confidence: ${row.confidence_level}`;
           }
-          return `${params.data?.name ?? ""}<br />Shipments: ${params.data?.value ?? 0}`;
+          return `${params.data?.name ?? ""}<br />SPBU Tag: ${formatTags(params.data?.tags)}<br />Shipments: ${params.data?.value ?? 0}`;
         }
       },
       series: [
@@ -2022,7 +2036,8 @@ function App() {
     setShiftAnalysis(null);
     setDepartureConfidenceFilter("ALL");
     setShiftSummaryFilter("ALL");
-    const payload = await fetchDepartureAnalysis(0, departureFilters, { confidenceLevel: "ALL", shiftSummaryFilter: "ALL" });
+    setDepartureProfileSearch("");
+    const payload = await fetchDepartureAnalysis(0, departureFilters, { confidenceLevel: "ALL", shiftSummaryFilter: "ALL", profileSearch: "" });
     if (payload) {
       await fetchShiftAnalysis(departureFilters);
     }
@@ -2041,6 +2056,12 @@ function App() {
   function clearDepartureProfileFilters() {
     setDepartureConfidenceFilter("ALL");
     setShiftSummaryFilter("ALL");
+    setDepartureProfileSearch("");
+    setDepartureOffset(0);
+  }
+
+  function updateDepartureProfileSearch(value: string) {
+    setDepartureProfileSearch(value);
     setDepartureOffset(0);
   }
 
@@ -2480,7 +2501,9 @@ function App() {
                 <tr className="border-b border-line bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
                   {[
                     ["spbu_a_code", "SPBU A"],
+                    ["spbu_a_tags", "SPBU A Tag"],
                     ["spbu_b_code", "SPBU B"],
+                    ["spbu_b_tags", "SPBU B Tag"],
                     ["pair_count", "Pair Count"],
                     ["probability_b_given_a", "P(B|A)"],
                     ["probability_a_given_b", "P(A|B)"],
@@ -2489,10 +2512,14 @@ function App() {
                     ["confidence_score", "Confidence"]
                   ].map(([column, label]) => (
                     <th key={column} className="whitespace-nowrap px-3 py-2">
-                      <button className="inline-flex items-center gap-1 uppercase tracking-wide" onClick={() => handlePairingSort(column as PairingSortColumn)} title={`Sort by ${label}`}>
+                      {column.endsWith("_tags") ? (
                         <span>{label}</span>
-                        {pairingSortColumn === column ? (pairingSortDirection === "asc" ? <ArrowUp size={14} /> : <ArrowDown size={14} />) : <ArrowUpDown size={14} className="text-slate-300" />}
-                      </button>
+                      ) : (
+                        <button className="inline-flex items-center gap-1 uppercase tracking-wide" onClick={() => handlePairingSort(column as PairingSortColumn)} title={`Sort by ${label}`}>
+                          <span>{label}</span>
+                          {pairingSortColumn === column ? (pairingSortDirection === "asc" ? <ArrowUp size={14} /> : <ArrowDown size={14} />) : <ArrowUpDown size={14} className="text-slate-300" />}
+                        </button>
+                      )}
                     </th>
                   ))}
                   <th className="whitespace-nowrap px-3 py-2">Evidence Count</th>
@@ -2502,7 +2529,9 @@ function App() {
                 {pairingRows.map((row) => (
                   <tr key={`${row.spbu_a_id}-${row.spbu_b_id}`} className="cursor-pointer border-b border-line hover:bg-petrocloud/40" onClick={() => selectPairingPair(row)}>
                     <td className="whitespace-nowrap px-3 py-2"><div className="font-medium">{row.spbu_a_code}</div><div className="text-xs text-slate-500">{row.spbu_a_name ?? "-"}</div></td>
+                    <td className="min-w-48 px-3 py-2 text-xs text-slate-600">{formatTags(row.spbu_a_tags)}</td>
                     <td className="whitespace-nowrap px-3 py-2"><div className="font-medium">{row.spbu_b_code}</div><div className="text-xs text-slate-500">{row.spbu_b_name ?? "-"}</div></td>
+                    <td className="min-w-48 px-3 py-2 text-xs text-slate-600">{formatTags(row.spbu_b_tags)}</td>
                     <td className="whitespace-nowrap px-3 py-2 font-semibold">{row.pair_count.toLocaleString()}</td>
                     <td className="whitespace-nowrap px-3 py-2">{formatPercent(row.probability_b_given_a)}</td>
                     <td className="whitespace-nowrap px-3 py-2">{formatPercent(row.probability_a_given_b)}</td>
@@ -2513,7 +2542,7 @@ function App() {
                   </tr>
                 ))}
                 {pairingRows.length === 0 && (
-                  <tr><td className="px-3 py-8 text-center text-sm text-slate-500" colSpan={9}>No SPBU pairs match the active filter.</td></tr>
+                  <tr><td className="px-3 py-8 text-center text-sm text-slate-500" colSpan={11}>No SPBU pairs match the active filter.</td></tr>
                 )}
               </tbody>
             </table>
@@ -2589,6 +2618,7 @@ function App() {
                     <th className="whitespace-nowrap px-3 py-2">Vehicle</th>
                     <th className="whitespace-nowrap px-3 py-2">Gate Out</th>
                     <th className="whitespace-nowrap px-3 py-2">SPBU in Shipment</th>
+                    <th className="whitespace-nowrap px-3 py-2">SPBU Tag</th>
                     <th className="whitespace-nowrap px-3 py-2">Products</th>
                     <th className="whitespace-nowrap px-3 py-2">Quantity</th>
                   </tr>
@@ -2601,12 +2631,15 @@ function App() {
                       <td className="whitespace-nowrap px-3 py-2">{row.vehicle_registration ?? "-"}</td>
                       <td className="whitespace-nowrap px-3 py-2">{formatDateTime(row.gate_out)}</td>
                       <td className="min-w-56 px-3 py-2">{row.spbu_in_shipment.join(", ")}</td>
+                      <td className="min-w-72 px-3 py-2 text-xs text-slate-600">
+                        {(row.spbu_tags ?? []).length > 0 ? row.spbu_tags.map((item) => `${item.spbu_code}: ${formatTags(item.tags)}`).join(" | ") : "-"}
+                      </td>
                       <td className="min-w-44 px-3 py-2">{row.products.join(", ") || "-"}</td>
                       <td className="whitespace-nowrap px-3 py-2">{formatMetric(row.quantity)}</td>
                     </tr>
                   ))}
                   {pairingAnalysis.evidence.rows.length === 0 && (
-                    <tr><td className="px-3 py-8 text-center text-sm text-slate-500" colSpan={7}>No historical evidence for the selected pair.</td></tr>
+                    <tr><td className="px-3 py-8 text-center text-sm text-slate-500" colSpan={8}>No historical evidence for the selected pair.</td></tr>
                   )}
                 </tbody>
               </table>
@@ -2908,12 +2941,13 @@ function App() {
               <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">SPBU Departure Profiles</div>
               <div className="mt-1 text-xs text-slate-500">
                 Showing {departureShowingStart}-{departureShowingEnd} of {departureTotal.toLocaleString()} profiles
+                {departureProfileSearch.trim() ? ` | Table filter: ${departureProfileSearch.trim()}` : ""}
                 {departureConfidenceFilter !== "ALL" ? ` | Confidence: ${departureConfidenceFilter}` : ""}
                 {shiftSummaryFilter !== "ALL" ? " | Shift summary filter active" : ""}
               </div>
             </div>
             <div className="flex flex-wrap gap-2">
-              {(departureConfidenceFilter !== "ALL" || shiftSummaryFilter !== "ALL") && (
+              {(departureProfileSearch.trim() || departureConfidenceFilter !== "ALL" || shiftSummaryFilter !== "ALL") && (
                 <button className="border border-line px-3 py-2 text-sm" onClick={clearDepartureProfileFilters} title="Clear profile filters">Clear Filters</button>
               )}
               <select className="border border-line bg-white px-3 py-2 text-sm" value={departureLimit} onChange={(event) => { setDepartureOffset(0); setDepartureLimit(Number(event.target.value)); }} title="Rows per page">
@@ -2923,6 +2957,18 @@ function App() {
                 <option value={100}>100 rows</option>
               </select>
             </div>
+          </div>
+          <div className="mb-3 grid gap-2 lg:grid-cols-[minmax(280px,520px)_1fr]">
+            <label className="relative block">
+              <Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
+              <input
+                className="w-full border border-line py-2 pl-9 pr-3 text-sm"
+                value={departureProfileSearch}
+                onChange={(event) => updateDepartureProfileSearch(event.target.value)}
+                placeholder="Filter table by SPBU name/code or tag value"
+                title="Filter table by SPBU name/code or tag value"
+              />
+            </label>
           </div>
           <div className="overflow-x-auto border border-line">
             <table className="w-full border-collapse text-sm">
@@ -2959,6 +3005,7 @@ function App() {
                       </th>
                     );
                   })}
+                  <th className="whitespace-nowrap px-3 py-2">SPBU Tag</th>
                   <th className="whitespace-nowrap px-3 py-2">Primary Shift</th>
                   <th className="whitespace-nowrap px-3 py-2">Secondary Shift</th>
                   <th className="whitespace-nowrap px-3 py-2">Shift Gap</th>
@@ -2990,6 +3037,17 @@ function App() {
                       <td className="px-3 py-2">
                         <span className={`inline-flex border px-2 py-1 text-xs font-semibold ${confidenceClass(profile.confidence_level)}`}>{profile.confidence_level} {profile.confidence_score}</span>
                       </td>
+                      <td className="min-w-[220px] px-3 py-2">
+                        {profile.spbu_tags.length > 0 ? (
+                          <div className="flex flex-wrap gap-1">
+                            {profile.spbu_tags.map((tag) => (
+                              <span key={tag} className="border border-line bg-slate-50 px-2 py-1 text-xs text-slate-600">{tag}</span>
+                            ))}
+                          </div>
+                        ) : (
+                          <span className="text-slate-400">-</span>
+                        )}
+                      </td>
                       <td className="whitespace-nowrap px-3 py-2 font-semibold" title={shiftRow?.primary_shift_score !== null && shiftRow?.primary_shift_score !== undefined ? `Assignment score ${shiftRow.primary_shift_score}` : undefined}>
                         {shiftRow?.primary_shift_name ?? "-"} {shiftRow ? <span className="text-xs text-slate-500">{shiftRow.primary_shift_share}%</span> : null}
                       </td>
@@ -3017,7 +3075,7 @@ function App() {
                   );
                 })}
                 {departureProfiles.length === 0 && (
-                  <tr><td className="px-3 py-8 text-center text-sm text-slate-500" colSpan={15}>No departure profiles match the selected depot and period.</td></tr>
+                  <tr><td className="px-3 py-8 text-center text-sm text-slate-500" colSpan={16}>No departure profiles match the selected depot and period.</td></tr>
                 )}
               </tbody>
             </table>

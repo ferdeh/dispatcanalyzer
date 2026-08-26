@@ -12,7 +12,7 @@ from fastapi import HTTPException
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-from .affinity_intelligence import _load_observation_rows, _prepare_observations
+from .affinity_intelligence import _enrich_entity_tags, _load_observation_rows, _prepare_observations
 from .models import (
     FactShipment,
     MLConcentrationAnalysisRun,
@@ -350,6 +350,36 @@ def _profile_dict(profile: MLSPBUConcentrationProfile, spbu: MasterSPBU | None, 
     }
 
 
+def _enrich_profile_tags(db: Session, rows: list[dict]) -> None:
+    """Attach current canonical master tags to persisted Engine A evidence.
+
+    Concentration observations stay immutable. Tags are display metadata from
+    the master bridges, so batching them at read time also makes older saved
+    analysis runs reflect the current canonical tag labels without recompute.
+    """
+    spbu_lookup = {
+        row["spbu_id"]: {"spbu_tags": []}
+        for row in rows
+    }
+    mt_ids = {
+        distribution["mt_id"]
+        for row in rows
+        for distribution in row.get("mt_distribution", [])
+        if distribution.get("mt_id")
+    }
+    mt_lookup = {mt_id: {"mt_tags": []} for mt_id in mt_ids}
+    _enrich_entity_tags(db, spbu_lookup, mt_lookup)
+    for row in rows:
+        row["spbu_tags"] = list(spbu_lookup.get(row["spbu_id"], {}).get("spbu_tags", []))
+        row["mt_distribution"] = [
+            {
+                **distribution,
+                "mt_tags": list(mt_lookup.get(distribution.get("mt_id"), {}).get("mt_tags", [])),
+            }
+            for distribution in row.get("mt_distribution", [])
+        ]
+
+
 def get_concentration_run(db: Session, analysis_run_id: str) -> dict:
     run = db.get(MLConcentrationAnalysisRun, analysis_run_id)
     if not run:
@@ -365,6 +395,7 @@ def get_concentration_run(db: Session, analysis_run_id: str) -> dict:
     spbus = {row.spbu_id: row for row in (db.scalars(select(MasterSPBU).where(MasterSPBU.spbu_id.in_(spbu_ids))).all() if spbu_ids else [])}
     mts = {row.mt_id: row for row in (db.scalars(select(MasterMT).where(MasterMT.mt_id.in_(mt_ids))).all() if mt_ids else [])}
     rows = [_profile_dict(profile, spbus.get(profile.spbu_id), mts.get(profile.dominant_mt_id)) for profile in profiles]
+    _enrich_profile_tags(db, rows)
     sufficient = [row for row in rows if row["data_sufficiency_status"] == "SUFFICIENT_DATA"]
     return {
         "analysis_run_id": run.analysis_run_id,
@@ -408,12 +439,14 @@ def get_concentration_profile(db: Session, analysis_run_id: str, spbu_id: str) -
     if not profile:
         raise HTTPException(status_code=404, detail="SPBU concentration profile not found.")
     run = db.get(MLConcentrationAnalysisRun, analysis_run_id)
-    return {
+    row = {
         **_profile_dict(profile, db.get(MasterSPBU, spbu_id), db.get(MasterMT, profile.dominant_mt_id) if profile.dominant_mt_id else None),
         "analysis_run_id": analysis_run_id,
         "baseline_start_date": run.baseline_start_date.isoformat() if run else None,
         "baseline_end_date": run.baseline_end_date.isoformat() if run else None,
     }
+    _enrich_profile_tags(db, [row])
+    return row
 
 
 def list_concentration_runs(db: Session, depot_id: str | None = None) -> list[dict]:

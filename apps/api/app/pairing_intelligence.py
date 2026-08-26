@@ -9,7 +9,7 @@ from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .models import FactLoadingOrderLine, FactShipment, FactShipmentSPBU, FactShipmentStop, MasterDepot, MasterMT, MasterProduct, MasterSPBU
+from .models import BridgeSPBUTag, FactLoadingOrderLine, FactShipment, FactShipmentSPBU, FactShipmentStop, MasterDepot, MasterMT, MasterProduct, MasterSPBU, MasterTag
 
 
 ALGORITHM_VERSION = "pairing_v1"
@@ -85,8 +85,10 @@ def build_pair_metrics(memberships_by_shipment: dict[str, set[str]], spbu_lookup
                 "spbu_b_id": spbu_b_id,
                 "spbu_a_code": spbu_lookup.get(spbu_a_id, {}).get("spbu_code", spbu_a_id),
                 "spbu_a_name": spbu_lookup.get(spbu_a_id, {}).get("spbu_name"),
+                "spbu_a_tags": spbu_lookup.get(spbu_a_id, {}).get("tags", []),
                 "spbu_b_code": spbu_lookup.get(spbu_b_id, {}).get("spbu_code", spbu_b_id),
                 "spbu_b_name": spbu_lookup.get(spbu_b_id, {}).get("spbu_name"),
+                "spbu_b_tags": spbu_lookup.get(spbu_b_id, {}).get("tags", []),
                 "pair_count": pair_count,
                 "shipment_a_count": shipment_a_count,
                 "shipment_b_count": shipment_b_count,
@@ -189,6 +191,7 @@ def build_pairing_intelligence_payload(
     source_shipment_ids = {shipment.shipment_id for shipment in source_shipments if shipment.shipment_id}
     raw_memberships, product_duplicate_count = load_membership_rows(db, depot_id, start_date, end_date, product_id)
     memberships_by_shipment, spbu_lookup, data_quality = prepare_memberships(source_shipments, raw_memberships, product_duplicate_count)
+    enrich_spbu_tags(db, spbu_lookup)
     pair_rows = build_pair_metrics(memberships_by_shipment, spbu_lookup, depot_id, start_date, end_date)
     filtered_pairs = filter_pair_rows(pair_rows, search)
     sorted_pairs = sort_pair_rows(filtered_pairs, sort_column, sort_direction)
@@ -325,6 +328,23 @@ def prepare_memberships(source_shipments: list[FactShipment], raw_memberships: l
     )
 
 
+def enrich_spbu_tags(db: Session, spbu_lookup: dict[str, dict]) -> None:
+    for spbu in spbu_lookup.values():
+        spbu["tags"] = []
+    spbu_ids = list(spbu_lookup)
+    if not spbu_ids:
+        return
+    rows = db.execute(
+        select(BridgeSPBUTag.spbu_id, MasterTag.tag_value)
+        .join(MasterTag, MasterTag.tag_id == BridgeSPBUTag.tag_id)
+        .where(BridgeSPBUTag.spbu_id.in_(spbu_ids), MasterTag.active_status != "DELETED")
+        .order_by(BridgeSPBUTag.spbu_id, MasterTag.tag_value)
+    ).all()
+    for spbu_id, tag_value in rows:
+        if spbu_id in spbu_lookup and tag_value:
+            spbu_lookup[spbu_id]["tags"].append(tag_value)
+
+
 def build_summary(source_shipment_ids: set[str], memberships_by_shipment: dict[str, set[str]], pair_rows: list[dict]) -> dict:
     spbu_ids = {spbu_id for spbus in memberships_by_shipment.values() for spbu_id in spbus}
     spbu_per_shipment = [len(spbus) for spbus in memberships_by_shipment.values()]
@@ -348,8 +368,10 @@ def filter_pair_rows(pair_rows: list[dict], search: str | None) -> list[dict]:
         for row in pair_rows
         if needle in str(row["spbu_a_code"]).lower()
         or needle in str(row.get("spbu_a_name") or "").lower()
+        or needle in " ".join(row.get("spbu_a_tags", [])).lower()
         or needle in str(row["spbu_b_code"]).lower()
         or needle in str(row.get("spbu_b_name") or "").lower()
+        or needle in " ".join(row.get("spbu_b_tags", [])).lower()
     ]
 
 
@@ -427,6 +449,8 @@ def build_matrix(pair_rows: list[dict], memberships_by_shipment: dict[str, set[s
                 continue
             probability = pair["probability_b_given_a"] if pair["spbu_a_id"] == anchor_id else pair["probability_a_given_b"]
             reverse_probability = pair["probability_a_given_b"] if pair["spbu_a_id"] == anchor_id else pair["probability_b_given_a"]
+            anchor_tags = pair["spbu_a_tags"] if pair["spbu_a_id"] == anchor_id else pair["spbu_b_tags"]
+            candidate_tags = pair["spbu_b_tags"] if pair["spbu_a_id"] == anchor_id else pair["spbu_a_tags"]
             data.append(
                 [
                     col_index,
@@ -438,6 +462,8 @@ def build_matrix(pair_rows: list[dict], memberships_by_shipment: dict[str, set[s
                     pair["lift"],
                     pair["observation_count"],
                     pair["confidence_level"],
+                    anchor_tags,
+                    candidate_tags,
                 ]
             )
     return {"spbu_ids": spbu_ids, "x_axis": labels, "y_axis": labels, "data": data, "selected_spbu_id": selected_spbu_id}
@@ -454,6 +480,7 @@ def build_network(pair_rows: list[dict], memberships_by_shipment: dict[str, set[
         {
             "id": spbu_id,
             "name": spbu_lookup.get(spbu_id, {}).get("spbu_code", spbu_id),
+            "tags": spbu_lookup.get(spbu_id, {}).get("tags", []),
             "value": shipment_counts[spbu_id],
             "symbolSize": max(18, min(54, 14 + shipment_counts[spbu_id] * 2)),
         }
@@ -482,13 +509,14 @@ def build_spbu_detail(selected_spbu_id: str | None, memberships_by_shipment: dic
     top_pairs = []
     for row in pair_rows:
         if row["spbu_a_id"] == selected_spbu_id:
-            top_pairs.append({**row, "candidate_spbu_id": row["spbu_b_id"], "candidate_spbu_code": row["spbu_b_code"], "pair_probability": row["probability_b_given_a"], "reverse_probability": row["probability_a_given_b"]})
+            top_pairs.append({**row, "candidate_spbu_id": row["spbu_b_id"], "candidate_spbu_code": row["spbu_b_code"], "candidate_spbu_tags": row["spbu_b_tags"], "pair_probability": row["probability_b_given_a"], "reverse_probability": row["probability_a_given_b"]})
         elif row["spbu_b_id"] == selected_spbu_id:
-            top_pairs.append({**row, "candidate_spbu_id": row["spbu_a_id"], "candidate_spbu_code": row["spbu_a_code"], "pair_probability": row["probability_a_given_b"], "reverse_probability": row["probability_b_given_a"]})
+            top_pairs.append({**row, "candidate_spbu_id": row["spbu_a_id"], "candidate_spbu_code": row["spbu_a_code"], "candidate_spbu_tags": row["spbu_a_tags"], "pair_probability": row["probability_a_given_b"], "reverse_probability": row["probability_b_given_a"]})
     return {
         "spbu_id": selected_spbu_id,
         "spbu_code": spbu_lookup.get(selected_spbu_id, {}).get("spbu_code", selected_spbu_id),
         "spbu_name": spbu_lookup.get(selected_spbu_id, {}).get("spbu_name"),
+        "spbu_tags": spbu_lookup.get(selected_spbu_id, {}).get("tags", []),
         "depot_name": depot_name,
         "historical_shipments": shipment_count,
         "top_pairs": top_pairs[:10],
@@ -535,6 +563,14 @@ def build_evidence_rows(db: Session, memberships_by_shipment: dict[str, set[str]
                 "vehicle_registration": shipment.vehicle_registration or (mt.vehicle_registration if mt else None),
                 "gate_out": shipment.gate_out_datetime.isoformat() if shipment.gate_out_datetime else None,
                 "spbu_in_shipment": [spbu_lookup.get(spbu_id, {}).get("spbu_code", spbu_id) for spbu_id in shipment_spbus],
+                "spbu_tags": [
+                    {
+                        "spbu_id": spbu_id,
+                        "spbu_code": spbu_lookup.get(spbu_id, {}).get("spbu_code", spbu_id),
+                        "tags": spbu_lookup.get(spbu_id, {}).get("tags", []),
+                    }
+                    for spbu_id in shipment_spbus
+                ],
                 "products": sorted({line.source_product_name or line.product_id or "UNKNOWN" for line in shipment_lines}),
                 "quantity": round(sum(float(line.quantity or 0) for line in shipment_lines), 2),
             }
@@ -543,8 +579,10 @@ def build_evidence_rows(db: Session, memberships_by_shipment: dict[str, set[str]
         "pair": {
             "spbu_a_id": spbu_a_id,
             "spbu_a_code": spbu_lookup.get(spbu_a_id, {}).get("spbu_code", spbu_a_id),
+            "spbu_a_tags": spbu_lookup.get(spbu_a_id, {}).get("tags", []),
             "spbu_b_id": spbu_b_id,
             "spbu_b_code": spbu_lookup.get(spbu_b_id, {}).get("spbu_code", spbu_b_id),
+            "spbu_b_tags": spbu_lookup.get(spbu_b_id, {}).get("tags", []),
         },
         "rows": rows,
         "distinct_shipment_count": len(evidence_shipment_ids),

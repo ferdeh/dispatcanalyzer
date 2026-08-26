@@ -9,7 +9,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .models import FactLoadingOrderLine, FactShipment, FactShipmentSPBU, MasterDepot, MasterMT, MasterProduct, MasterSPBU
+from .models import BridgeMTTag, BridgeSPBUTag, FactLoadingOrderLine, FactShipment, FactShipmentSPBU, MasterDepot, MasterMT, MasterProduct, MasterSPBU, MasterTag
 
 
 ALGORITHM_VERSION = "spbu_mt_affinity.jsd_v1"
@@ -231,6 +231,7 @@ def build_affinity_intelligence_payload(
     observations = prepared["observations"]
     spbu_lookup = prepared["spbu_lookup"]
     mt_lookup = prepared["mt_lookup"]
+    _enrich_entity_tags(db, spbu_lookup, mt_lookup)
 
     profile_data = _build_profiles(observations, spbu_lookup, mt_lookup, start_date, end_date, bucket, recent_days)
     all_profiles = profile_data["profiles"]
@@ -284,6 +285,7 @@ def build_affinity_intelligence_payload(
                 "spbu_id": row["spbu_id"],
                 "spbu_code": row["spbu_code"],
                 "spbu_name": row.get("spbu_name"),
+                "spbu_tags": row.get("spbu_tags", []),
                 "value": [row["unique_mt_count"], row["consistency_score"], row["shipment_count"]],
                 **{key: row[key] for key in ["shipment_count", "dominant_mt_label", "dominant_mt_probability", "consistency_score", "variability_score", "temporal_stability_score", "confidence_level"]},
             }
@@ -365,12 +367,13 @@ def _prepare_observations(source_shipments: list[FactShipment], raw_rows: list[t
             "spbu_id": spbu_id,
             "mt_id": shipment.mt_id,
         }
-        spbu_lookup[spbu_id] = {"spbu_id": spbu_id, "spbu_code": spbu.spbu_code, "spbu_name": spbu.spbu_name}
+        spbu_lookup[spbu_id] = {"spbu_id": spbu_id, "spbu_code": spbu.spbu_code, "spbu_name": spbu.spbu_name, "spbu_tags": []}
         mt_lookup[shipment.mt_id] = {
             "mt_id": shipment.mt_id,
             "vehicle_registration": mt.vehicle_registration,
             "vehicle_name": mt.vehicle_name_raw,
             "mt_label": mt.vehicle_registration or mt.vehicle_name_raw or shipment.mt_id,
+            "mt_tags": [],
         }
     observations = list(observations_by_key.values())
     source_ids = {shipment.shipment_id for shipment in source_shipments if shipment.shipment_id}
@@ -397,6 +400,32 @@ def _prepare_observations(source_shipments: list[FactShipment], raw_rows: list[t
             "exclusion_reasons": reasons,
         },
     }
+
+
+def _enrich_entity_tags(db: Session, spbu_lookup: dict[str, dict], mt_lookup: dict[str, dict]) -> None:
+    spbu_ids = list(spbu_lookup)
+    if spbu_ids:
+        rows = db.execute(
+            select(BridgeSPBUTag.spbu_id, MasterTag.tag_value)
+            .join(MasterTag, MasterTag.tag_id == BridgeSPBUTag.tag_id)
+            .where(BridgeSPBUTag.spbu_id.in_(spbu_ids), MasterTag.active_status != "DELETED")
+            .order_by(BridgeSPBUTag.spbu_id, MasterTag.tag_value)
+        ).all()
+        for spbu_id, tag_value in rows:
+            if spbu_id in spbu_lookup and tag_value and tag_value not in spbu_lookup[spbu_id]["spbu_tags"]:
+                spbu_lookup[spbu_id]["spbu_tags"].append(tag_value)
+
+    mt_ids = list(mt_lookup)
+    if mt_ids:
+        rows = db.execute(
+            select(BridgeMTTag.mt_id, MasterTag.tag_value)
+            .join(MasterTag, MasterTag.tag_id == BridgeMTTag.tag_id)
+            .where(BridgeMTTag.mt_id.in_(mt_ids), MasterTag.active_status != "DELETED")
+            .order_by(BridgeMTTag.mt_id, MasterTag.tag_value)
+        ).all()
+        for mt_id, tag_value in rows:
+            if mt_id in mt_lookup and tag_value and tag_value not in mt_lookup[mt_id]["mt_tags"]:
+                mt_lookup[mt_id]["mt_tags"].append(tag_value)
 
 
 def _build_profiles(observations: list[dict], spbu_lookup: dict, mt_lookup: dict, start_date: date, end_date: date, bucket: str, recent_days: int) -> dict:
@@ -557,7 +586,7 @@ def _build_pattern_matrix(profiles: list[dict]) -> dict:
         high_unique = row["unique_mt_count"] > median_unique
         high_affinity = row["dominant_mt_probability"] >= 0.60
         quadrant = "PREFERRED-FLEET" if high_unique and high_affinity else "DEDICATED-LIKE" if high_affinity else "HIGHLY FLEXIBLE" if high_unique else "LIMITED BALANCED"
-        points.append({"spbu_id": row["spbu_id"], "spbu_code": row["spbu_code"], "value": [row["unique_mt_count"], row["dominant_mt_probability"]], "quadrant": quadrant, "shipment_count": row["shipment_count"]})
+        points.append({"spbu_id": row["spbu_id"], "spbu_code": row["spbu_code"], "spbu_tags": row.get("spbu_tags", []), "value": [row["unique_mt_count"], row["dominant_mt_probability"]], "quadrant": quadrant, "shipment_count": row["shipment_count"]})
     return {"unique_mt_split": median_unique, "affinity_split": 0.60, "points": points}
 
 
@@ -626,10 +655,10 @@ def _build_network(pair_rows: list[dict], profiles: list[dict], spbu_lookup: dic
     mt_ids = {row["mt_id"] for row in sorted_edges}
     profile_lookup = {row["spbu_id"]: row for row in profiles}
     nodes = [
-        {"id": f"spbu:{spbu_id}", "entity_id": spbu_id, "entity_type": "SPBU", "name": spbu_lookup[spbu_id]["spbu_code"], "category": 0, "symbolSize": 18 + min(24, math.sqrt(profile_lookup[spbu_id]["shipment_count"]) * 2), "selected": spbu_id == selected_spbu_id}
+        {"id": f"spbu:{spbu_id}", "entity_id": spbu_id, "entity_type": "SPBU", "name": spbu_lookup[spbu_id]["spbu_code"], "tags": spbu_lookup[spbu_id].get("spbu_tags", []), "category": 0, "symbolSize": 18 + min(24, math.sqrt(profile_lookup[spbu_id]["shipment_count"]) * 2), "selected": spbu_id == selected_spbu_id}
         for spbu_id in spbu_ids
     ] + [
-        {"id": f"mt:{mt_id}", "entity_id": mt_id, "entity_type": "MT", "name": mt_lookup[mt_id]["mt_label"], "category": 1, "symbolSize": 20, "selected": mt_id == selected_mt_id}
+        {"id": f"mt:{mt_id}", "entity_id": mt_id, "entity_type": "MT", "name": mt_lookup[mt_id]["mt_label"], "tags": mt_lookup[mt_id].get("mt_tags", []), "category": 1, "symbolSize": 20, "selected": mt_id == selected_mt_id}
         for mt_id in mt_ids
     ]
     metric = edge_metric.upper()
@@ -639,6 +668,8 @@ def _build_network(pair_rows: list[dict], profiles: list[dict], spbu_lookup: dic
             "target": f"mt:{row['mt_id']}",
             "value": row["probability_mt_given_spbu"] if metric == "AFFINITY_PROBABILITY" else row["shipment_count"],
             **{key: row[key] for key in ["spbu_id", "spbu_code", "mt_id", "mt_label", "shipment_count", "probability_mt_given_spbu", "probability_spbu_given_mt", "first_observed", "last_observed", "operating_day_count", "confidence_level"]},
+            "spbu_tags": row.get("spbu_tags", []),
+            "mt_tags": row.get("mt_tags", []),
             "highlighted": row["spbu_id"] == selected_spbu_id or row["mt_id"] == selected_mt_id,
         }
         for row in sorted_edges

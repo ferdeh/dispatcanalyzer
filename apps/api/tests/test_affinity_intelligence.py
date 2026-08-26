@@ -13,7 +13,7 @@ from app.affinity_intelligence import (
 )
 from app.database import get_db
 from app.main import app
-from app.models import Base, FactLoadingOrderLine, FactShipment, FactShipmentSPBU, MasterDepot, MasterMT, MasterProduct, MasterSPBU
+from app.models import Base, BridgeMTTag, BridgeSPBUTag, FactLoadingOrderLine, FactShipment, FactShipmentSPBU, MasterDepot, MasterMT, MasterProduct, MasterSPBU, MasterTag
 
 
 def make_session():
@@ -63,6 +63,10 @@ def test_historical_affinity_acceptance_and_reverse_probability() -> None:
     Session = make_session()
     with Session() as session:
         seed_master(session, ["T01", "T02"], ["A", "B"])
+        session.add(MasterTag(tag_id="TAG_SPBU", tag_value="Urban", normalized_tag="URBAN"))
+        session.add(MasterTag(tag_id="TAG_MT", tag_value="Project Alpha", normalized_tag="PROJECT_ALPHA"))
+        session.add(BridgeSPBUTag(spbu_id="A", tag_id="TAG_SPBU"))
+        session.add(BridgeMTTag(mt_id="T01", tag_id="TAG_MT"))
         for index, mt_id in enumerate(["T01", "T01", "T01", "T02", "T01"], 1):
             add_observation(session, f"S{index}", "A", mt_id, date(2026, 1, index))
         add_observation(session, "S1", "B", "T01", date(2026, 1, 1))
@@ -82,6 +86,16 @@ def test_historical_affinity_acceptance_and_reverse_probability() -> None:
     assert payload["evidence"]["distinct_shipment_count"] == 4
     assert payload["scatter"][0]["consistency_score"] >= 0
     assert "spbu_name" in payload["scatter"][0]
+    assert profile["spbu_tags"] == ["Urban"]
+    assert t01["spbu_tags"] == ["Urban"]
+    assert t01["mt_tags"] == ["Project Alpha"]
+    assert next(row for row in payload["scatter"] if row["spbu_id"] == "A")["spbu_tags"] == ["Urban"]
+    assert next(row for row in payload["pattern_matrix"]["points"] if row["spbu_id"] == "A")["spbu_tags"] == ["Urban"]
+    assert next(row for row in payload["network"]["nodes"] if row["entity_type"] == "SPBU" and row["entity_id"] == "A")["tags"] == ["Urban"]
+    assert next(row for row in payload["network"]["nodes"] if row["entity_type"] == "MT" and row["entity_id"] == "T01")["tags"] == ["Project Alpha"]
+    network_edge = next(row for row in payload["network"]["edges"] if row["spbu_id"] == "A" and row["mt_id"] == "T01")
+    assert network_edge["spbu_tags"] == ["Urban"]
+    assert network_edge["mt_tags"] == ["Project Alpha"]
 
 
 def test_high_variability_and_high_consistency_math() -> None:

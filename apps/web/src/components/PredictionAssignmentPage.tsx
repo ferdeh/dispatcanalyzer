@@ -307,6 +307,25 @@ function Badge({ value }: { value: string }) {
   return <span className={`inline-flex border px-2 py-1 text-[11px] font-semibold uppercase tracking-wide ${badgeClass(value)}`}>{value.replace(/_/g, " ")}</span>;
 }
 
+function ExcludedCandidateDropdown({ candidates }: { candidates: Candidate[] }) {
+  const excludedCandidates = candidates.filter((candidate) => candidate.compatibility_status === "FAIL");
+  if (excludedCandidates.length === 0) return null;
+  return (
+    <details className="group mt-4 border border-rust/30 bg-rust/5">
+      <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-2 text-xs font-semibold uppercase tracking-wide text-rust [&::-webkit-details-marker]:hidden">
+        <span>Excluded Candidate</span>
+        <span className="flex items-center gap-2">
+          <span className="border border-rust/30 bg-white px-2 py-1 text-[11px] tabular-nums">{excludedCandidates.length}</span>
+          <ChevronDown className="transition-transform group-open:rotate-180" size={15} aria-hidden="true" />
+        </span>
+      </summary>
+      <div className="max-h-72 space-y-2 overflow-y-auto border-t border-rust/20 p-3">
+        {excludedCandidates.map((candidate) => <div key={candidate.id} className="border border-rust/30 bg-white p-2 text-xs"><span className="font-medium">{candidate.vehicle_registration_no}</span> · {candidate.exclusion_reason}</div>)}
+      </div>
+    </details>
+  );
+}
+
 function Metric({ label, value }: { label: string; value: string | number }) {
   return (
     <div className="border border-line bg-white p-4">
@@ -1401,7 +1420,7 @@ export function PredictionAssignmentPage({ depots }: { depots: Depot[] }) {
                             <input className="mt-2 w-full border border-line bg-white px-3 py-2 text-sm" placeholder="Optional override reason" value={overrideReason[shipment.id] ?? ""} onChange={(event) => setOverrideReason((current) => ({ ...current, [shipment.id]: event.target.value }))} />
                             {candidateLoadingShipment === shipment.id && <div className="mt-2 flex items-center gap-2 border border-petroblue/30 bg-petroblue/5 p-3 text-xs text-petroblue" role="status"><RefreshCw className="animate-spin" size={14} /> Memuat kandidat MT saat detail dibuka…</div>}
                             <div className="mt-2 overflow-x-auto"><table className="min-w-full bg-white text-left text-xs"><thead><tr className="border-b border-line text-slate-500"><th className="p-2">Rank</th><th className="p-2">MT</th><th className="p-2">Capacity</th><th className="p-2">Score</th><th className="p-2">Compatibility</th><th className="p-2">Action</th></tr></thead><tbody>{shipment.candidates.filter((candidate) => candidate.compatibility_status === "PASS").map((candidate) => <tr key={candidate.id} className="border-b border-line"><td className="p-2">{candidate.candidate_rank}</td><td className="p-2">{candidate.vehicle_registration_no}</td><td className="p-2">{candidate.capacity_kl ?? "—"} KL · {candidate.number_of_compartments ?? "—"} compartment</td><td className="p-2">{pct(candidate.prediction_score)}</td><td className="p-2"><Badge value="PASS" /></td><td className="p-2"><button className="border border-petroblue px-2 py-1 text-petroblue disabled:opacity-40" disabled={candidate.vehicle_id === shipment.assignment.assigned_vehicle_id || loading} onClick={() => void applyAssignmentOverride(shipment, candidate.vehicle_id)}>Change MT</button></td></tr>)}</tbody></table></div>
-                            {shipment.candidates.some((candidate) => candidate.compatibility_status === "FAIL") && <div className="mt-4"><div className="text-xs font-semibold uppercase tracking-wide text-rust">Excluded Candidate</div>{shipment.candidates.filter((candidate) => candidate.compatibility_status === "FAIL").map((candidate) => <div key={candidate.id} className="mt-2 border border-rust/30 bg-rust/5 p-2 text-xs"><span className="font-medium">{candidate.vehicle_registration_no}</span> · {candidate.exclusion_reason}</div>)}</div>}
+                            <ExcludedCandidateDropdown candidates={shipment.candidates} />
                           </div>
                         </div>
                       </td></tr>

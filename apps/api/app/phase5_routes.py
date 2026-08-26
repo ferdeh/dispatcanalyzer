@@ -47,6 +47,9 @@ class PrepareDatasetRequest(BaseModel):
     training_end_date: date
     minimum_shipment_observation: int = Field(default=10, ge=1)
     shift_definitions: list[dict[str, Any]] = Field(default_factory=list)
+    data_sufficiency_configuration: dict[str, Any] = Field(default_factory=dict)
+    geographic_configuration: dict[str, Any] = Field(default_factory=dict)
+    feature_weights: dict[str, Any] = Field(default_factory=dict)
 
 
 class TrainModelRequest(BaseModel):
@@ -135,6 +138,9 @@ def prepare_dataset(
         minimum_shipment_observation=request.minimum_shipment_observation,
         shift_definitions=request.shift_definitions or None,
         created_by=actor.user_id,
+        data_sufficiency_configuration=request.data_sufficiency_configuration or None,
+        geographic_configuration=request.geographic_configuration or None,
+        feature_weights=request.feature_weights or None,
     )
 
 

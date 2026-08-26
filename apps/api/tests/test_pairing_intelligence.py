@@ -7,7 +7,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.database import get_db
 from app.main import app
-from app.models import Base, FactLoadingOrderLine, FactShipment, FactShipmentSPBU, FactShipmentStop, MasterDepot, MasterProduct, MasterSPBU
+from app.models import Base, BridgeSPBUTag, FactLoadingOrderLine, FactShipment, FactShipmentSPBU, FactShipmentStop, MasterDepot, MasterProduct, MasterSPBU, MasterTag
 from app.pairing_intelligence import build_pairing_intelligence_payload, calculate_confidence, generate_canonical_pairs
 
 
@@ -38,6 +38,13 @@ def seed_pairing_acceptance(session) -> None:
         session.add(MasterSPBU(spbu_id=spbu_id, spbu_code=spbu_id, spbu_name=f"SPBU {spbu_id}", primary_depot_id="D1"))
     session.add(MasterProduct(product_id="P1", product_name="Pertalite", normalized_product="PERTALITE"))
     session.add(MasterProduct(product_id="P2", product_name="Biosolar", normalized_product="BIOSOLAR"))
+    for tag_id, tag_value, spbu_id in [
+        ("TAG_A", "Urban", "A"),
+        ("TAG_B", "High Volume", "B"),
+        ("TAG_C", "Rural", "C"),
+    ]:
+        session.add(MasterTag(tag_id=tag_id, tag_value=tag_value, normalized_tag=tag_value.upper().replace(" ", "_")))
+        session.add(BridgeSPBUTag(spbu_id=spbu_id, tag_id=tag_id))
     memberships = {
         "S1": ["A", "B"],
         "S2": ["A", "B"],
@@ -97,8 +104,13 @@ def test_pairing_acceptance_metrics_and_evidence_reconciliation() -> None:
     assert ab["support"] == 0.5
     assert ab["lift"] == 1.2
     assert ab["confidence_level"] == "INSUFFICIENT_DATA"
+    assert ab["spbu_a_tags"] == ["Urban"]
+    assert ab["spbu_b_tags"] == ["High Volume"]
+    assert payload["matrix"]["data"][0][9]
+    assert any(node["tags"] for node in payload["network"]["nodes"])
     assert payload["evidence"]["distinct_shipment_count"] == ab["pair_count"]
     assert len({row["shipment_id"] for row in payload["evidence"]["rows"]}) == ab["pair_count"]
+    assert payload["evidence"]["rows"][0]["spbu_tags"][0]["tags"]
 
     assert pair_by_ids(payload, "A", "C")["pair_count"] == 1
     assert pair_by_ids(payload, "C", "D")["pair_count"] == 1
