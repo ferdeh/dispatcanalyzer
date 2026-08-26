@@ -14,7 +14,9 @@ Phase 5: operational cluster intelligence.
 
 Phase 6: time-aware shipment prediction, rolling multi-trip MT assignment, and estimated availability.
 
-The repository includes read-only Phase 2–4 intelligence, persisted Phase 5 ML workflows, and Phase 6 inference/assignment/availability estimation. Phase 6 may estimate a preliminary small-stop sequence for cycle time, but no phase through Phase 6 performs fleet-wide route optimization or VRP.
+Phase 7: dynamic fleet-wide multi-trip VRP, depot bay queue scheduling, rolling reroute, and immutable operational route versions.
+
+The repository includes read-only Phase 2–4 intelligence, persisted Phase 5 ML workflows, Phase 6 inference/assignment/availability estimation, and Phase 7 OR-Tools optimization/control. Phase 6 may estimate a preliminary small-stop sequence for cycle time; Phase 7 owns fleet-wide route optimization and depot bay scheduling.
 
 ## Phase 2
 
@@ -93,3 +95,22 @@ The repository includes read-only Phase 2–4 intelligence, persisted Phase 5 ML
 - Algorithm: `phase6.iterative_exact_capacity_assignment.v9` using `CAPACITY_TIME_ROUTE_SET_PACKING` within each capacity tier
 - Security: encrypted API key using environment-provided encryption secret; browser receives masked value only
 - Phase 7 boundary: Phase 6 never calls Google Route Optimization/GMPRO `optimizeTours` and never solves fleet-wide VRP; Phase 7 owns final globally optimized route and constraints
+
+## Phase 7
+
+- API prefix: `/api/v1/phase7`
+- UI: `/phase7-optimization`
+- Job scope: one depot + one operating date + one explicitly selected completed Phase 6 Prediction Run
+- Source boundary: original Phase 6 prediction fields are immutable warm-start/soft-preference evidence; current Phase 7 assignment is stored separately
+- Engine A: Google OR-Tools Routing Solver with a physical-vehicle multi-trip loop
+- Compartment engine: CP-SAT LO-to-compartment assignment with one product per compartment
+- Engine B: CP-SAT bay eligibility, actual occupancy/queue, loading, and gate-out schedule
+- Google role: prebuilt distance/time matrix, cache, final selected-leg geometry, and map display only; Google is never called from a solver callback
+- Hard compatibility: Phase 1 vehicle-class limit, canonical tag subset, depot, capacity, compartments, availability, working time, SPBU window, frozen assignment, and bay products
+- Soft evidence: Phase 3 pairing, Phase 4 MT affinity, Phase 6 vehicle/grouping, and previous-plan stability penalties
+- Reroute: freeze DONE, ONGOING, and near-term PLANNED; actual ETA/bay/queue overrides previous prediction; never rerun Phase 6 automatically
+- Versioning: every optimization appends V1/V2/... plus state snapshot, parameter snapshot/checksum, solver metadata, cost, dropped reason, and comparison
+- End of day: all-DONE closes the Job without a new version; remaining LO at depot close is explicit `UNSERVED_END_OF_DAY`
+- Schema: migration `0019_phase7_dynamic_vrp`
+- Algorithm: `phase7.dynamic_multitrip_vrp_bay.v1`
+- Technical documentation: `docs/PHASE_7_DYNAMIC_VRP.md`

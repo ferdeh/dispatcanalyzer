@@ -1,3 +1,5 @@
+from datetime import time
+
 from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, Time, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.sql import func
@@ -884,6 +886,8 @@ class PredictionShipmentLine(Base):
     loading_order_no: Mapped[str] = mapped_column(String(120), index=True)
     spbu_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_spbu.spbu_id"), index=True)
     spbu_no: Mapped[str] = mapped_column(String(120))
+    product_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("master_product.product_id"), index=True)
+    product_name: Mapped[str | None] = mapped_column(String(255))
     order_quantity_kl: Mapped[float | None] = mapped_column(Float)
     shipment_start_datetime = mapped_column(DateTime(timezone=True), nullable=True)
     model_predicted_shipment_id: Mapped[str] = mapped_column(String(120))
@@ -1040,3 +1044,495 @@ class DataQualityIssue(Base):
     status: Mapped[str] = mapped_column(String(40), default="OPEN")
     detected_at = mapped_column(DateTime(timezone=True), server_default=func.now())
     resolved_at = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+# Phase 7 intentionally keeps operational optimization state separate from the
+# immutable Phase 6 prediction tables above.  JSON columns are used for exact
+# solver/configuration snapshots, while the relational result tables support
+# dispatcher drill-down and version-to-version comparison.
+class OptimizationJob(Base):
+    __tablename__ = "optimization_job"
+    __table_args__ = (
+        Index("ix_optimization_job_depot_date", "depot_id", "operating_date"),
+        Index("ix_optimization_job_depot_status", "depot_id", "status"),
+    )
+
+    job_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    job_no: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    job_name: Mapped[str] = mapped_column(String(255))
+    depot_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_depot.depot_id"), index=True)
+    operating_date = mapped_column(Date, nullable=False, index=True)
+    source_prediction_run_id: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("prediction_run.id"), nullable=True, index=True
+    )
+    current_route_version_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    status: Mapped[str] = mapped_column(String(30), default="DRAFT", index=True)
+    depot_operational_start = mapped_column(Time, nullable=False, default=lambda: time(5, 0))
+    depot_operational_end = mapped_column(Time, nullable=False, default=lambda: time(22, 0))
+    created_by: Mapped[str] = mapped_column(String(120), default="local-user")
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    closed_at = mapped_column(DateTime(timezone=True), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text)
+
+
+class OperationalStateSnapshot(Base):
+    __tablename__ = "operational_state_snapshot"
+
+    state_snapshot_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    job_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("optimization_job.job_id", ondelete="CASCADE"), index=True
+    )
+    snapshot_reason: Mapped[str] = mapped_column(String(80))
+    captured_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    captured_by: Mapped[str] = mapped_column(String(120), default="local-user")
+    lo_state_snapshot: Mapped[list] = mapped_column(JSON, default=list)
+    vehicle_state_snapshot: Mapped[list] = mapped_column(JSON, default=list)
+    bay_state_snapshot: Mapped[list] = mapped_column(JSON, default=list)
+    queue_snapshot: Mapped[list] = mapped_column(JSON, default=list)
+    audit_events: Mapped[list] = mapped_column(JSON, default=list)
+
+
+class OptimizationParameterProfile(Base):
+    __tablename__ = "optimization_parameter_profile"
+    __table_args__ = (
+        UniqueConstraint("profile_name", "version", name="uq_optimization_parameter_profile_name_version"),
+    )
+
+    profile_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    profile_name: Mapped[str] = mapped_column(String(160), index=True)
+    description: Mapped[str | None] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    created_by: Mapped[str] = mapped_column(String(120), default="local-user")
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+
+
+class OptimizationParameterValue(Base):
+    __tablename__ = "optimization_parameter_value"
+    __table_args__ = (
+        UniqueConstraint("profile_id", "parameter_key", name="uq_optimization_parameter_value_key"),
+    )
+
+    parameter_value_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    profile_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("optimization_parameter_profile.profile_id", ondelete="CASCADE"), index=True
+    )
+    parameter_key: Mapped[str] = mapped_column(String(120))
+    parameter_value: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class OptimizationVehicleCostRule(Base):
+    __tablename__ = "optimization_vehicle_cost_rule"
+
+    cost_rule_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    profile_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("optimization_parameter_profile.profile_id", ondelete="CASCADE"), index=True
+    )
+    vehicle_class: Mapped[int | None] = mapped_column(Integer)
+    vehicle_tag: Mapped[str | None] = mapped_column(String(160))
+    activation_cost: Mapped[float] = mapped_column(Float, default=0)
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    active_status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
+
+
+class OptimizationParameterSnapshot(Base):
+    __tablename__ = "optimization_parameter_snapshot"
+
+    parameter_snapshot_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    job_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("optimization_job.job_id", ondelete="CASCADE"), index=True
+    )
+    source_profile_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("optimization_parameter_profile.profile_id"))
+    source_profile_version: Mapped[int | None] = mapped_column(Integer)
+    effective_parameters: Mapped[dict] = mapped_column(JSON, default=dict)
+    parameter_checksum: Mapped[str] = mapped_column(String(64), index=True)
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_by: Mapped[str] = mapped_column(String(120), default="local-user")
+
+
+class RouteVersion(Base):
+    __tablename__ = "route_version"
+    __table_args__ = (
+        UniqueConstraint("job_id", "version_number", name="uq_route_version_job_number"),
+        Index("ix_route_version_job_created", "job_id", "created_at"),
+    )
+
+    route_version_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    job_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("optimization_job.job_id", ondelete="CASCADE"), index=True
+    )
+    version_number: Mapped[int] = mapped_column(Integer)
+    version_label: Mapped[str] = mapped_column(String(80))
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_by: Mapped[str] = mapped_column(String(120), default="local-user")
+    reason: Mapped[str] = mapped_column(String(160))
+    state_snapshot_id: Mapped[str] = mapped_column(String(64), ForeignKey("operational_state_snapshot.state_snapshot_id"))
+    parameter_snapshot_id: Mapped[str] = mapped_column(String(64), ForeignKey("optimization_parameter_snapshot.parameter_snapshot_id"))
+    objective: Mapped[str] = mapped_column(String(60))
+    solver_status: Mapped[str] = mapped_column(String(30))
+    objective_value: Mapped[float | None] = mapped_column(Float)
+    first_gate_out = mapped_column(DateTime(timezone=True), nullable=True)
+    last_gate_out = mapped_column(DateTime(timezone=True), nullable=True)
+    depot_dispatch_span_minutes: Mapped[int] = mapped_column(Integer, default=0)
+    summary_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    cost_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    comparison_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class OptimizationRun(Base):
+    __tablename__ = "optimization_run"
+    __table_args__ = (Index("ix_optimization_run_job_started", "job_id", "start_time"),)
+
+    optimization_run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    job_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("optimization_job.job_id", ondelete="CASCADE"), index=True
+    )
+    run_type: Mapped[str] = mapped_column(String(30), default="INITIAL")
+    status: Mapped[str] = mapped_column(String(30), default="PENDING", index=True)
+    route_version_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("route_version.route_version_id"))
+    state_snapshot_id: Mapped[str] = mapped_column(String(64), ForeignKey("operational_state_snapshot.state_snapshot_id"))
+    parameter_snapshot_id: Mapped[str] = mapped_column(String(64), ForeignKey("optimization_parameter_snapshot.parameter_snapshot_id"))
+    start_time = mapped_column(DateTime(timezone=True), nullable=True)
+    end_time = mapped_column(DateTime(timezone=True), nullable=True)
+    solve_duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    solver_status: Mapped[str] = mapped_column(String(30), default="PENDING")
+    objective: Mapped[str] = mapped_column(String(60))
+    objective_value: Mapped[float | None] = mapped_column(Float)
+    coordination_iterations: Mapped[int] = mapped_column(Integer, default=0)
+    solver_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
+    error_code: Mapped[str | None] = mapped_column(String(80))
+    error_message: Mapped[str | None] = mapped_column(Text)
+
+
+class LOOperationalState(Base):
+    __tablename__ = "lo_operational_state"
+    __table_args__ = (
+        UniqueConstraint("job_id", "loading_order_id", name="uq_lo_operational_state_job_lo"),
+        Index("ix_lo_operational_state_job_status", "job_id", "status"),
+    )
+
+    lo_state_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    job_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("optimization_job.job_id", ondelete="CASCADE"), index=True
+    )
+    loading_order_id: Mapped[str] = mapped_column(String(120), index=True)
+    spbu_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_spbu.spbu_id"), index=True)
+    spbu_name_snapshot: Mapped[str | None] = mapped_column(String(255))
+    product_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("master_product.product_id"))
+    product_name_snapshot: Mapped[str | None] = mapped_column(String(255))
+    volume_kl: Mapped[float] = mapped_column(Float)
+    depot_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_depot.depot_id"), index=True)
+    operating_date = mapped_column(Date, nullable=False)
+    source_prediction_run_id: Mapped[str] = mapped_column(String(64), ForeignKey("prediction_run.id"))
+    phase6_predicted_shipment_id: Mapped[str | None] = mapped_column(String(120), index=True)
+    phase6_predicted_vehicle_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("master_mt.mt_id"))
+    phase6_predicted_spbu_pairing: Mapped[list] = mapped_column(JSON, default=list)
+    phase6_shipment_confidence: Mapped[float | None] = mapped_column(Float)
+    phase6_vehicle_assignment_confidence: Mapped[float | None] = mapped_column(Float)
+    phase6_model_id: Mapped[str | None] = mapped_column(String(64))
+    current_vehicle_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("master_mt.mt_id"), index=True)
+    current_trip_number: Mapped[int | None] = mapped_column(Integer)
+    current_shipment_id: Mapped[str | None] = mapped_column(String(120))
+    current_compartment_id: Mapped[str | None] = mapped_column(String(80))
+    planned_gate_out = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="PLANNED", index=True)
+    frozen: Mapped[bool] = mapped_column(Boolean, default=False)
+    frozen_reason: Mapped[str | None] = mapped_column(String(80))
+    actual_gate_out = mapped_column(DateTime(timezone=True), nullable=True)
+    actual_delivered_at = mapped_column(DateTime(timezone=True), nullable=True)
+    user_cancelled: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_at = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    updated_by: Mapped[str | None] = mapped_column(String(120))
+
+
+class VehicleOperationalState(Base):
+    __tablename__ = "vehicle_operational_state"
+    __table_args__ = (
+        UniqueConstraint("job_id", "mt_id", name="uq_vehicle_operational_state_job_mt"),
+        Index("ix_vehicle_operational_state_job_status", "job_id", "operational_status"),
+    )
+
+    vehicle_state_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    job_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("optimization_job.job_id", ondelete="CASCADE"), index=True
+    )
+    mt_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_mt.mt_id"), index=True)
+    registration_snapshot: Mapped[str | None] = mapped_column(String(80))
+    vehicle_class: Mapped[int | None] = mapped_column(Integer)
+    tag_snapshot: Mapped[list] = mapped_column(JSON, default=list)
+    capacity_kl: Mapped[float] = mapped_column(Float, default=0)
+    number_of_compartments: Mapped[int] = mapped_column(Integer, default=0)
+    compartment_configuration: Mapped[list] = mapped_column(JSON, default=list)
+    planned_eta_depot = mapped_column(DateTime(timezone=True), nullable=True)
+    system_eta_depot = mapped_column(DateTime(timezone=True), nullable=True)
+    user_eta_override = mapped_column(DateTime(timezone=True), nullable=True)
+    effective_eta_depot = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    operational_status: Mapped[str] = mapped_column(String(30), default="READY")
+    working_time_limit_minutes: Mapped[int] = mapped_column(Integer, default=720)
+    working_time_used_minutes: Mapped[int] = mapped_column(Integer, default=0)
+    working_time_remaining_minutes: Mapped[int] = mapped_column(Integer, default=720)
+    updated_at = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    updated_by: Mapped[str | None] = mapped_column(String(120))
+
+
+class ActualVehicleEvent(Base):
+    __tablename__ = "actual_vehicle_event"
+
+    vehicle_event_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    job_id: Mapped[str] = mapped_column(String(64), ForeignKey("optimization_job.job_id", ondelete="CASCADE"), index=True)
+    mt_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_mt.mt_id"), index=True)
+    event_type: Mapped[str] = mapped_column(String(60), index=True)
+    event_time = mapped_column(DateTime(timezone=True), nullable=False)
+    source: Mapped[str] = mapped_column(String(40), default="USER")
+    details: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class MasterLoadingBay(Base):
+    __tablename__ = "master_loading_bay"
+    __table_args__ = (UniqueConstraint("depot_id", "bay_id", name="uq_master_loading_bay_depot_bay"),)
+
+    master_bay_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    depot_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_depot.depot_id"), index=True)
+    bay_id: Mapped[str] = mapped_column(String(80), index=True)
+    bay_name: Mapped[str] = mapped_column(String(160))
+    all_products_allowed: Mapped[bool] = mapped_column(Boolean, default=False)
+    operational_start = mapped_column(Time, nullable=False, default=lambda: time(5, 0))
+    operational_end = mapped_column(Time, nullable=False, default=lambda: time(22, 0))
+    number_of_loading_arms: Mapped[int] = mapped_column(Integer, default=1)
+    loading_mode: Mapped[str] = mapped_column(String(20), default="SEQUENTIAL")
+    active_status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class LoadingBayProductCompatibility(Base):
+    __tablename__ = "loading_bay_product_compatibility"
+
+    master_bay_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("master_loading_bay.master_bay_id", ondelete="CASCADE"), primary_key=True
+    )
+    product_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_product.product_id"), primary_key=True)
+
+
+class ProductCompartmentLoadingDuration(Base):
+    __tablename__ = "product_compartment_loading_duration"
+    __table_args__ = (
+        UniqueConstraint("depot_id", "product_id", name="uq_product_compartment_loading_duration"),
+    )
+
+    loading_duration_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    depot_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_depot.depot_id"), index=True)
+    product_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_product.product_id"), index=True)
+    duration_minutes_per_compartment: Mapped[int] = mapped_column(Integer)
+    active_status: Mapped[str] = mapped_column(String(20), default="ACTIVE")
+
+
+class ActualBayState(Base):
+    __tablename__ = "actual_bay_state"
+    __table_args__ = (UniqueConstraint("job_id", "master_bay_id", name="uq_actual_bay_state_job_bay"),)
+
+    actual_bay_state_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    job_id: Mapped[str] = mapped_column(String(64), ForeignKey("optimization_job.job_id", ondelete="CASCADE"), index=True)
+    master_bay_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_loading_bay.master_bay_id"), index=True)
+    current_vehicle_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("master_mt.mt_id"))
+    current_compartment_id: Mapped[str | None] = mapped_column(String(80))
+    current_product_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("master_product.product_id"))
+    remaining_loading_minutes: Mapped[int] = mapped_column(Integer, default=0)
+    actual_queue_length: Mapped[int] = mapped_column(Integer, default=0)
+    state_effective_at = mapped_column(DateTime(timezone=True), nullable=False)
+    source: Mapped[str] = mapped_column(String(40), default="USER")
+    updated_at = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    updated_by: Mapped[str | None] = mapped_column(String(120))
+
+
+class OptimizationInitialQueue(Base):
+    __tablename__ = "optimization_initial_queue"
+    __table_args__ = (
+        UniqueConstraint("job_id", "master_bay_id", "queue_position", name="uq_optimization_initial_queue_position"),
+    )
+
+    initial_queue_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    job_id: Mapped[str] = mapped_column(String(64), ForeignKey("optimization_job.job_id", ondelete="CASCADE"), index=True)
+    master_bay_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_loading_bay.master_bay_id"), index=True)
+    queue_position: Mapped[int] = mapped_column(Integer)
+    vehicle_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_mt.mt_id"))
+    compartment_id: Mapped[str | None] = mapped_column(String(80))
+    product_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("master_product.product_id"))
+    estimated_loading_duration_minutes: Mapped[int] = mapped_column(Integer)
+    state_effective_at = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class RouteVersionTrip(Base):
+    __tablename__ = "route_version_trip"
+    __table_args__ = (
+        UniqueConstraint("route_version_id", "vehicle_id", "trip_number", name="uq_route_version_trip_vehicle_number"),
+        Index("ix_route_version_trip_gate_out", "route_version_id", "gate_out"),
+    )
+
+    route_version_trip_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    route_version_id: Mapped[str] = mapped_column(String(64), ForeignKey("route_version.route_version_id", ondelete="CASCADE"), index=True)
+    vehicle_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_mt.mt_id"), index=True)
+    trip_number: Mapped[int] = mapped_column(Integer)
+    shipment_id: Mapped[str] = mapped_column(String(120), index=True)
+    vehicle_ready_at_depot = mapped_column(DateTime(timezone=True), nullable=False)
+    queue_start = mapped_column(DateTime(timezone=True), nullable=True)
+    loading_start = mapped_column(DateTime(timezone=True), nullable=True)
+    loading_finish = mapped_column(DateTime(timezone=True), nullable=True)
+    gate_out = mapped_column(DateTime(timezone=True), nullable=False)
+    estimated_return_depot = mapped_column(DateTime(timezone=True), nullable=False)
+    distance_meters: Mapped[int] = mapped_column(Integer, default=0)
+    driving_seconds: Mapped[int] = mapped_column(Integer, default=0)
+    service_seconds: Mapped[int] = mapped_column(Integer, default=0)
+    queue_minutes: Mapped[int] = mapped_column(Integer, default=0)
+    loading_minutes: Mapped[int] = mapped_column(Integer, default=0)
+    operating_minutes: Mapped[int] = mapped_column(Integer, default=0)
+    assignment_status: Mapped[str] = mapped_column(String(30), default="PLANNED")
+    route_geometry: Mapped[list] = mapped_column(JSON, default=list)
+    route_geometry_source: Mapped[str | None] = mapped_column(String(80))
+    cost_breakdown: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class RouteVersionStop(Base):
+    __tablename__ = "route_version_stop"
+    __table_args__ = (
+        UniqueConstraint("route_version_trip_id", "sequence_number", name="uq_route_version_stop_sequence"),
+    )
+
+    route_version_stop_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    route_version_trip_id: Mapped[str] = mapped_column(String(64), ForeignKey("route_version_trip.route_version_trip_id", ondelete="CASCADE"), index=True)
+    sequence_number: Mapped[int] = mapped_column(Integer)
+    stop_type: Mapped[str] = mapped_column(String(30), default="SPBU")
+    spbu_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("master_spbu.spbu_id"))
+    arrival_time = mapped_column(DateTime(timezone=True), nullable=True)
+    departure_time = mapped_column(DateTime(timezone=True), nullable=True)
+    service_minutes: Mapped[int] = mapped_column(Integer, default=0)
+    distance_from_previous_meters: Mapped[int] = mapped_column(Integer, default=0)
+    travel_from_previous_seconds: Mapped[int] = mapped_column(Integer, default=0)
+    loading_order_ids: Mapped[list] = mapped_column(JSON, default=list)
+    products: Mapped[list] = mapped_column(JSON, default=list)
+    volume_kl: Mapped[float] = mapped_column(Float, default=0)
+
+
+class RouteVersionLOAssignment(Base):
+    __tablename__ = "route_version_lo_assignment"
+    __table_args__ = (
+        UniqueConstraint("route_version_id", "loading_order_id", name="uq_route_version_lo_assignment"),
+        Index("ix_route_version_lo_status", "route_version_id", "assignment_status"),
+    )
+
+    route_version_lo_assignment_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    route_version_id: Mapped[str] = mapped_column(String(64), ForeignKey("route_version.route_version_id", ondelete="CASCADE"), index=True)
+    route_version_trip_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("route_version_trip.route_version_trip_id", ondelete="CASCADE"), index=True)
+    loading_order_id: Mapped[str] = mapped_column(String(120), index=True)
+    vehicle_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("master_mt.mt_id"))
+    trip_number: Mapped[int | None] = mapped_column(Integer)
+    shipment_id: Mapped[str | None] = mapped_column(String(120))
+    compartment_id: Mapped[str | None] = mapped_column(String(80))
+    spbu_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_spbu.spbu_id"))
+    product_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("master_product.product_id"))
+    volume_kl: Mapped[float] = mapped_column(Float)
+    stop_sequence: Mapped[int | None] = mapped_column(Integer)
+    planned_gate_out = mapped_column(DateTime(timezone=True), nullable=True)
+    eta = mapped_column(DateTime(timezone=True), nullable=True)
+    frozen: Mapped[bool] = mapped_column(Boolean, default=False)
+    assignment_status: Mapped[str] = mapped_column(String(30), default="PLANNED")
+    dropped_reason_code: Mapped[str | None] = mapped_column(String(80))
+    dropped_reason_description: Mapped[str | None] = mapped_column(Text)
+    phase6_deviation: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class RouteVersionVehicleAssignment(Base):
+    __tablename__ = "route_version_vehicle_assignment"
+    __table_args__ = (
+        UniqueConstraint("route_version_id", "vehicle_id", name="uq_route_version_vehicle_assignment"),
+    )
+
+    route_version_vehicle_assignment_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    route_version_id: Mapped[str] = mapped_column(String(64), ForeignKey("route_version.route_version_id", ondelete="CASCADE"), index=True)
+    vehicle_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_mt.mt_id"), index=True)
+    used: Mapped[bool] = mapped_column(Boolean, default=False)
+    trip_count: Mapped[int] = mapped_column(Integer, default=0)
+    delivered_kl: Mapped[float] = mapped_column(Float, default=0)
+    total_distance_meters: Mapped[int] = mapped_column(Integer, default=0)
+    total_operating_minutes: Mapped[int] = mapped_column(Integer, default=0)
+    working_time_remaining_minutes: Mapped[int] = mapped_column(Integer, default=0)
+    activation_cost: Mapped[float] = mapped_column(Float, default=0)
+    system_eta_depot = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class OptimizationBayAssignment(Base):
+    __tablename__ = "optimization_bay_assignment"
+
+    bay_assignment_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    route_version_id: Mapped[str] = mapped_column(String(64), ForeignKey("route_version.route_version_id", ondelete="CASCADE"), index=True)
+    route_version_trip_id: Mapped[str] = mapped_column(String(64), ForeignKey("route_version_trip.route_version_trip_id", ondelete="CASCADE"), unique=True)
+    master_bay_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_loading_bay.master_bay_id"), index=True)
+    vehicle_ready_at_depot = mapped_column(DateTime(timezone=True), nullable=False)
+    queue_start = mapped_column(DateTime(timezone=True), nullable=False)
+    loading_start = mapped_column(DateTime(timezone=True), nullable=False)
+    loading_finish = mapped_column(DateTime(timezone=True), nullable=False)
+    gate_out = mapped_column(DateTime(timezone=True), nullable=False)
+    queue_minutes: Mapped[int] = mapped_column(Integer, default=0)
+    loading_minutes: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class OptimizationBayOperation(Base):
+    __tablename__ = "optimization_bay_operation"
+    __table_args__ = (
+        Index("ix_optimization_bay_operation_bay_start", "master_bay_id", "loading_start"),
+    )
+
+    bay_operation_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    bay_assignment_id: Mapped[str] = mapped_column(String(64), ForeignKey("optimization_bay_assignment.bay_assignment_id", ondelete="CASCADE"), index=True)
+    master_bay_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_loading_bay.master_bay_id"), index=True)
+    compartment_id: Mapped[str] = mapped_column(String(80))
+    product_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("master_product.product_id"))
+    loading_start = mapped_column(DateTime(timezone=True), nullable=False)
+    loading_finish = mapped_column(DateTime(timezone=True), nullable=False)
+    duration_minutes: Mapped[int] = mapped_column(Integer)
+    loading_mode: Mapped[str] = mapped_column(String(20), default="SEQUENTIAL")
+
+
+class RouteMatrixCache(Base):
+    __tablename__ = "route_matrix_cache"
+    __table_args__ = (
+        UniqueConstraint("cache_key", name="uq_phase7_route_matrix_cache_key"),
+        Index("ix_phase7_route_matrix_cache_expiry", "expires_at"),
+    )
+
+    route_matrix_cache_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    cache_key: Mapped[str] = mapped_column(String(128), index=True)
+    origin_location_id: Mapped[str] = mapped_column(String(120))
+    destination_location_id: Mapped[str] = mapped_column(String(120))
+    departure_time_bucket = mapped_column(DateTime(timezone=True), nullable=True)
+    route_vehicle_mode: Mapped[str] = mapped_column(String(30), default="GENERAL_VEHICLE")
+    traffic_aware: Mapped[bool] = mapped_column(Boolean, default=True)
+    distance_meters: Mapped[int] = mapped_column(Integer)
+    duration_seconds: Mapped[int] = mapped_column(Integer)
+    route_polyline: Mapped[str | None] = mapped_column(Text)
+    route_geometry: Mapped[list] = mapped_column(JSON, default=list)
+    provider: Mapped[str] = mapped_column(String(60), default="GOOGLE_ROUTES")
+    response_metadata: Mapped[dict] = mapped_column(JSON, default=dict)
+    calculated_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    expires_at = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class RouteAPIRequestLog(Base):
+    __tablename__ = "route_api_request_log"
+
+    request_log_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    job_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("optimization_job.job_id"), index=True)
+    request_type: Mapped[str] = mapped_column(String(60))
+    provider: Mapped[str] = mapped_column(String(60), default="GOOGLE_ROUTES")
+    request_fingerprint: Mapped[str] = mapped_column(String(128), index=True)
+    requested_pair_count: Mapped[int] = mapped_column(Integer, default=0)
+    cache_hit_count: Mapped[int] = mapped_column(Integer, default=0)
+    http_status: Mapped[int | None] = mapped_column(Integer)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    success: Mapped[bool] = mapped_column(Boolean, default=False)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())

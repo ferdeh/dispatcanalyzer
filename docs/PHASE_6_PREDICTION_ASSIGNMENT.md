@@ -8,7 +8,9 @@ Setiap run terikat pada satu depot dan satu model `SAVED`/`ACTIVE`. Input, param
 
 ## Input dan Data Demo
 
-Loading Order workbook memerlukan `loading_order_no`, `shipment_start_datetime`, `spbu_no`, dan `order_quantity_kl`. Setiap LO wajib tepat 8 KL; total demo harus habis dibagi 8 dan sistem menghasilkan `total KL / 8` baris LO.
+Loading Order workbook memuat `loading_order_no`, `shipment_start_datetime`, `spbu_no`, `product`, dan `order_quantity_kl`. Setiap LO wajib tepat 8 KL; total demo harus habis dibagi 8 dan sistem menghasilkan `total KL / 8` baris LO. Product yang diisi dipetakan terhadap `master_product` dan `product_alias`; identifier yang tidak dikenal atau product nonaktif menjadi blocking error. File legacy tanpa product tetap dapat dibaca, sedangkan Data Demo dan LO baru dari management selalu mengisi product canonical aktif.
+
+Setelah upload manual atau pembuatan Data Demo divalidasi, UI membuka **Loading Order Management**. Tabel ini mendukung Add, Edit, Delete, pagination, filter per kolom—termasuk Product—dan sort per header. Pada form Add/Edit, nomor SPBU wajib dipilih dari dropdown Master SPBU aktif milik depot run dan Product wajib dipilih dari dropdown Master Product aktif; keduanya bukan free text. Mutation tidak hanya mengubah preview: backend membentuk ulang workbook LO aktif dan memvalidasinya kembali, sehingga snapshot yang dikirim ke Run Prediction selalu sama dengan isi terakhir tabel. Error hasil perubahan tetap memblokir Run Prediction melalui kontrak validator yang sama.
 
 Data Demo LO tidak memakai sembarang SPBU aktif. Kandidat harus berada pada assignment model yang dipilih dan memenuhi seluruh syarat berikut:
 
@@ -19,7 +21,7 @@ Data Demo LO tidak memakai sembarang SPBU aktif. Kandidat harus berada pada assi
 
 Cold-start, no-history, insufficient-history, inactive, dan unseen SPBU tidak digunakan. Timestamp dibentuk dalam batch cluster/dominant-shift agar pairing multi-SPBU dapat diuji tanpa mengubah evidence model.
 
-MT Availability workbook memerlukan `vehicle_registration_no` dan `initial_available_datetime`. Data Demo memilih subset acak MT aktif dengan total kapasitas terdekat ke target. Jam buka depot adalah `start_time` shift pertama dan jam tutup adalah `end_time` shift terakhir pada snapshot model. Tanpa Random availability, semua MT tersedia pada jam buka; bila dipilih, waktu tersedia diacak di dalam window tersebut.
+MT Availability tidak lagi diunggah manual atau dibuat melalui Data Demo. User menekan **Import Data from Master Data** untuk mengambil seluruh MT canonical aktif pada depot terpilih. Card **MT Management** menampilkan No MT, MT Tag Class, Status, dan ETA on Depot. User tidak dapat Add/Delete MT; perubahan hanya berupa status operasional Active/Deactive dan ETA. Status tersebut tidak mengubah `master_mt`. Semua MT mendapat ETA pada tanggal operasi dan `start_time` Shift 1 dari snapshot model. MT dengan profil kapasitas 8 KL valid default Active; MT yang profilnya tidak valid tetap ditampilkan tetapi default Deactive beserta alasan validasinya. Hanya MT Active yang dibentuk menjadi workbook internal `vehicle_registration_no` + `initial_available_datetime` dan divalidasi backend. ETA on Depot berarti waktu MT mulai available di depot.
 
 ## Grouping dan Exact Full-Load Assignment
 

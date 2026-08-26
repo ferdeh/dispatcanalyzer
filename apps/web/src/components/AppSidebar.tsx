@@ -13,6 +13,7 @@ import {
   ShieldCheck,
   Sparkles,
   Tags,
+  Truck,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -26,6 +27,7 @@ export type AppPage =
   | "affinity-intelligence"
   | "machine-learning-intelligence"
   | "prediction-assignment"
+  | "phase7-optimization"
   | "google-maps-integration"
   | "documentation";
 
@@ -66,6 +68,7 @@ const navGroups: NavGroup[] = [
     label: "Planning",
     items: [
       { page: "prediction-assignment", label: "Prediction & Assignment", icon: Sparkles, phase: 6 },
+      { page: "phase7-optimization", label: "Dynamic VRP & Bay", icon: Truck, phase: 7 },
     ],
   },
   {

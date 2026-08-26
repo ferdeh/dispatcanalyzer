@@ -55,6 +55,7 @@ from .pairing_intelligence import build_pairing_date_availability, build_pairing
 from .phase5_behavioral import recover_interrupted_behavioral_training_runs
 from .phase5_routes import router as phase5_router
 from .phase6_routes import router as phase6_router
+from .phase7_routes import router as phase7_router
 from .google_routes_settings_routes import router as google_routes_settings_router
 from .tag_consistency import build_tag_consistency_payload, get_tag_consistency_detail
 
@@ -86,6 +87,7 @@ app.add_middleware(
 )
 app.include_router(phase5_router)
 app.include_router(phase6_router)
+app.include_router(phase7_router)
 app.include_router(google_routes_settings_router)
 
 
@@ -380,8 +382,24 @@ def foundation_charts(depot_id: str | None = None, db: Session = Depends(get_db)
 
 
 @app.get("/api/v1/master/mt")
-def list_mt(limit: int = 100, offset: int = 0, db: Session = Depends(get_db)) -> list[dict]:
-    rows = db.scalars(select(MasterMT).order_by(MasterMT.vehicle_registration).offset(offset).limit(limit)).all()
+def list_mt(
+    limit: int = 100,
+    offset: int = 0,
+    depot_id: str | None = None,
+    active_only: bool = False,
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    statement = select(MasterMT)
+    if depot_id:
+        statement = statement.where(MasterMT.depot_id == depot_id)
+    if active_only:
+        statement = statement.where(MasterMT.active_status == "ACTIVE")
+    rows = db.scalars(
+        statement
+        .order_by(MasterMT.vehicle_registration)
+        .offset(offset)
+        .limit(min(max(limit, 1), 10000))
+    ).all()
     return [public(row) for row in rows]
 
 
@@ -395,8 +413,19 @@ def get_mt(mt_id: str, db: Session = Depends(get_db)) -> dict:
 
 
 @app.get("/api/v1/master/spbu")
-def list_spbu(limit: int = 100, offset: int = 0, db: Session = Depends(get_db)) -> list[dict]:
-    rows = db.scalars(select(MasterSPBU).order_by(MasterSPBU.spbu_code).offset(offset).limit(limit)).all()
+def list_spbu(
+    limit: int = 100,
+    offset: int = 0,
+    depot_id: str | None = None,
+    active_only: bool = False,
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    statement = select(MasterSPBU)
+    if depot_id:
+        statement = statement.where(MasterSPBU.primary_depot_id == depot_id)
+    if active_only:
+        statement = statement.where(MasterSPBU.active_status == "ACTIVE")
+    rows = db.scalars(statement.order_by(MasterSPBU.spbu_code).offset(offset).limit(min(max(limit, 1), 10000))).all()
     sync_spbu_coordinates_from_source(db, rows)
     return [public(row) for row in rows]
 

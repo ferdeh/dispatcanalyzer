@@ -14,7 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .departure_intelligence import shift_for_minute, validate_shift_config
-from .models import MLBehavioralModel, MasterDepot, MasterMT, MasterSPBU, SpbuIdentifierAlias
+from .models import MLBehavioralModel, MasterDepot, MasterMT, MasterProduct, MasterSPBU, ProductAlias, SpbuIdentifierAlias
 from .normalization import clean_str, normalize_key
 from .phase6_capacity import LOADING_ORDER_COMPARTMENT_KL, loading_order_compartments, mt_compartment_profile
 
@@ -167,6 +167,10 @@ def validate_loading_orders(
             "spbu_no": "spbu_no",
             "spbu_code": "spbu_no",
             "spbu_id": "spbu_no",
+            "product": "product",
+            "product_name": "product",
+            "product_id": "product",
+            "jenis_produk": "product",
             "order_quantity_kl": "order_quantity_kl",
             "quantity_kl": "order_quantity_kl",
             "total_order_kl": "order_quantity_kl",
@@ -174,7 +178,19 @@ def validate_loading_orders(
         },
     )
     if issues:
-        return _validation_payload("LOADING_ORDER", [], issues, started)
+        return _validation_payload("LOADING_ORDER", [], issues, started, editable_rows=[])
+
+    editable_rows = [
+        {
+            "source_row_number": int(row["_row_number"]),
+            "loading_order_no": clean_str(row.get("loading_order_no")),
+            "shipment_start_datetime": clean_str(row.get("shipment_start_datetime")),
+            "spbu_no": clean_str(row.get("spbu_no")),
+            "product": clean_str(row.get("product")),
+            "order_quantity_kl": clean_str(row.get("order_quantity_kl")),
+        }
+        for row in rows
+    ]
 
     timezone_info = _depot_timezone(db, depot_id)
     shift_config = _model_shift_config(model)
@@ -184,6 +200,21 @@ def validate_loading_orders(
     for alias in db.scalars(select(SpbuIdentifierAlias).where(SpbuIdentifierAlias.active_status == "ACTIVE")).all():
         if normalize_key(alias.identifier_value) and alias.spbu_id in spbu_by_id:
             spbu_by_key[normalize_key(alias.identifier_value)] = spbu_by_id[alias.spbu_id]
+    products = db.scalars(select(MasterProduct)).all()
+    product_by_id = {product.product_id: product for product in products}
+    product_by_key = {
+        key: product
+        for product in products
+        for key in {
+            normalize_key(product.product_id),
+            normalize_key(product.product_name),
+            normalize_key(product.normalized_product),
+        }
+        if key
+    }
+    for alias in db.scalars(select(ProductAlias).where(ProductAlias.active_status == "ACTIVE")).all():
+        if normalize_key(alias.alias_value) and alias.product_id in product_by_id:
+            product_by_key[normalize_key(alias.alias_value)] = product_by_id[alias.product_id]
     duplicates = Counter(normalize_key(row.get("loading_order_no")) for row in rows if normalize_key(row.get("loading_order_no")))
     normalized_rows = []
     for row in rows:
@@ -199,6 +230,12 @@ def validate_loading_orders(
             issues.append(_issue(file_name, row_number, "spbu_no", "ERROR", "SPBU_NOT_FOUND", "SPBU identifier is not present in canonical master data."))
         elif spbu and spbu.primary_depot_id != depot_id:
             issues.append(_issue(file_name, row_number, "spbu_no", "ERROR", "SPBU_DEPOT_MISMATCH", "SPBU belongs to another depot."))
+        product_value = clean_str(row.get("product"))
+        product = product_by_key.get(normalize_key(product_value) or "") if product_value else None
+        if product_value and not product:
+            issues.append(_issue(file_name, row_number, "product", "ERROR", "PRODUCT_NOT_FOUND", "Product identifier is not present in canonical master data."))
+        elif product and product.active_status != "ACTIVE":
+            issues.append(_issue(file_name, row_number, "product", "ERROR", "PRODUCT_INACTIVE", "Product is not active in canonical master data."))
         parsed = _parse_datetime(row.get("shipment_start_datetime"), timezone_info)
         if row.get("shipment_start_datetime") and not parsed:
             issues.append(_issue(file_name, row_number, "shipment_start_datetime", "ERROR", "INVALID_DATETIME", "shipment_start_datetime must be a valid complete datetime."))
@@ -225,6 +262,7 @@ def validate_loading_orders(
             and parsed
             and quantity_valid
             and quantity_compartments == 1
+            and (not product_value or (product and product.active_status == "ACTIVE"))
         ):
             local = parsed.astimezone(timezone_info)
             shift = shift_for_minute(local.hour * 60 + local.minute, shift_config)
@@ -239,6 +277,8 @@ def validate_loading_orders(
                     "spbu_id": spbu.spbu_id,
                     "spbu_no": spbu.spbu_code,
                     "spbu_name": spbu.spbu_name,
+                    "product_id": product.product_id if product else None,
+                    "product_name": product.product_name if product else None,
                     "order_quantity_kl": quantity,
                     "required_compartments": quantity_compartments,
                 }
@@ -246,7 +286,7 @@ def validate_loading_orders(
     datetimes = [datetime.fromisoformat(row["shipment_start_datetime"]) for row in normalized_rows]
     if datetimes and max(datetimes) - min(datetimes) > timedelta(days=max(1, maximum_planning_horizon_days)):
         issues.append(_issue(file_name, 1, "shipment_start_datetime", "ERROR", "PLANNING_HORIZON_EXCEEDED", f"Loading Orders must fit within a {maximum_planning_horizon_days}-day planning horizon."))
-    return _validation_payload("LOADING_ORDER", normalized_rows, issues, started)
+    return _validation_payload("LOADING_ORDER", normalized_rows, issues, started, editable_rows=editable_rows)
 
 
 def validate_mt_availability(db: Session, *, depot_id: str, model: MLBehavioralModel, content: bytes, file_name: str) -> dict:
@@ -330,7 +370,14 @@ def validate_mt_availability(db: Session, *, depot_id: str, model: MLBehavioralM
     return _validation_payload("MT_AVAILABILITY", normalized_rows, issues, started)
 
 
-def _validation_payload(file_type: str, rows: list[dict], issues: list[dict], started: float) -> dict:
+def _validation_payload(
+    file_type: str,
+    rows: list[dict],
+    issues: list[dict],
+    started: float,
+    *,
+    editable_rows: list[dict] | None = None,
+) -> dict:
     errors = sum(issue["status"] == "ERROR" for issue in issues)
     warnings = sum(issue["status"] == "WARNING" for issue in issues)
     return {
@@ -340,6 +387,7 @@ def _validation_payload(file_type: str, rows: list[dict], issues: list[dict], st
         "warning_count": warnings,
         "issues": issues,
         "normalized_rows": rows,
+        "editable_rows": editable_rows or [],
         "row_count": len(rows),
         "detected_shifts": sorted({row["shift"] for row in rows if row.get("shift")}),
         "duration_ms": round((perf_counter() - started) * 1000),

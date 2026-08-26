@@ -64,3 +64,21 @@ Phase 6 prediction persistence:
 - `prediction_assignment`: original and final vehicle/score, assigned/unassigned/manual status, unassigned reason, and override user/reason/time.
 
 Frequently filtered run/model/depot/shift/shipment/vehicle/SPBU/time fields are indexed. Run children cascade on run deletion, but the model foreign key is intentionally restrictive so an audited prediction cannot silently lose model lineage. The original prediction snapshot remains immutable while current shipment and final assignment rows support dispatcher overrides.
+
+Phase 7 operational optimization persistence:
+
+- `optimization_job`: one depot, operating date, immutable source Prediction Run reference, lifecycle, current route-version pointer, and depot operating-hours snapshot.
+- `optimization_run`: every initial/reroute solver attempt, state/parameter snapshot references, timing, status, objective, iteration metadata, and durable failure details.
+- `operational_state_snapshot`: exact LO, MT, bay, queue, and dispatcher-event input used by one optimization.
+- `optimization_parameter_profile`, `optimization_parameter_value`, `optimization_vehicle_cost_rule`: versioned reusable settings; saving an existing profile appends a new version.
+- `optimization_parameter_snapshot`: immutable effective parameter JSON plus SHA-256 checksum used for reproducibility.
+- `lo_operational_state`: immutable Phase 6 warm-start columns alongside separate current Phase 7 vehicle/shipment/trip/compartment/gate-out and execution status columns.
+- `vehicle_operational_state`, `actual_vehicle_event`: initial planned, prior system, user override, effective ETA precedence, working time, and operational audit.
+- `route_version`: append-only V1/V2/... result header with snapshots, cost, comparison, solver outcome, and dispatch-span KPI.
+- `route_version_trip`, `route_version_stop`, `route_version_lo_assignment`, `route_version_vehicle_assignment`: physical-MT multi-trip timeline, stop evidence, compartment-level LO placement, explicit dropped reasons, and fleet utilization.
+- `master_loading_bay`, `loading_bay_product_compatibility`, `product_compartment_loading_duration`: depot bay master, hard product eligibility, and per-product/per-compartment duration.
+- `actual_bay_state`, `optimization_initial_queue`: actual occupancy and ordered physical queue that override previous prediction.
+- `optimization_bay_assignment`, `optimization_bay_operation`: CP-SAT queue/loading/gate-out result and compartment operations for each versioned trip.
+- `route_matrix_cache`, `route_api_request_log`: departure-bucket travel data, provider/fallback metadata, expiry, pair counts, cache hits, request duration, and audit outcome.
+
+Route versions are never updated in place. Reroute copies frozen execution units and writes re-optimized future work into a new version. `optimization_job.current_route_version_id` is the only mutable pointer to the latest operational plan; older versions and their snapshots remain queryable.

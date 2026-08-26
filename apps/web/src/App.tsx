@@ -10,6 +10,7 @@ import { PredictionAssignmentPage } from "./components/PredictionAssignmentPage"
 import { GoogleMapsIntegrationPage } from "./components/GoogleMapsIntegrationPage";
 import { AppSidebar, type AppPage } from "./components/AppSidebar";
 import { DocumentationPage } from "./components/DocumentationPage";
+import { Phase7OptimizationPage } from "./components/Phase7OptimizationPage";
 
 type Overview = Record<string, number>;
 type Charts = Record<string, SeriesPoint[]>;
@@ -47,6 +48,7 @@ type Depot = {
 type Product = {
   product_id: string;
   product_name: string;
+  active_status?: string;
 };
 type TagType = {
   tag_type_id: string;
@@ -118,6 +120,11 @@ const pageMetadata: Record<Page, { eyebrow: string; title: string; description: 
     eyebrow: "Phase 6 · Planning",
     title: "Prediction & Assignment",
     description: "Time-aware shipment prediction, rolling multi-trip MT assignment, and availability estimates.",
+  },
+  "phase7-optimization": {
+    eyebrow: "Phase 7 · Optimization & Control",
+    title: "Dynamic Multi-Trip VRP & Depot Bay Queue",
+    description: "Fleet-wide OR-Tools routing, CP-SAT bay scheduling, rolling operational updates, and immutable route versions.",
   },
   "google-maps-integration": {
     eyebrow: "Settings",
@@ -766,6 +773,7 @@ function pageFromPath(pathname: string): Page {
   if (pathname === "/affinity-intelligence") return "affinity-intelligence";
   if (pathname === "/machine-learning-intelligence") return "machine-learning-intelligence";
   if (pathname === "/prediction-assignment") return "prediction-assignment";
+  if (pathname === "/phase7-optimization") return "phase7-optimization";
   if (pathname === "/settings/google-maps-integration") return "google-maps-integration";
   if (pathname === "/documentation") return "documentation";
   return "dashboard";
@@ -2228,6 +2236,8 @@ function App() {
                   ? "/machine-learning-intelligence"
                   : page === "prediction-assignment"
                     ? "/prediction-assignment"
+                    : page === "phase7-optimization"
+                      ? "/phase7-optimization"
                     : page === "google-maps-integration"
                       ? "/settings/google-maps-integration"
                       : page === "documentation"
@@ -2369,7 +2379,11 @@ function App() {
         )}
 
         {currentPage === "prediction-assignment" && (
-          <PredictionAssignmentPage depots={depots} />
+          <PredictionAssignmentPage depots={depots} products={products} />
+        )}
+
+        {currentPage === "phase7-optimization" && (
+          <Phase7OptimizationPage depots={depots} products={products} />
         )}
 
         {currentPage === "google-maps-integration" && (

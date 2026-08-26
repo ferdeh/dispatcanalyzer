@@ -237,6 +237,7 @@ def list_prediction_models(db: Session, depot_id: str) -> list[dict]:
                 "average_membership_probability": model.average_membership_probability,
                 "noise_spbu_count": model.noise_spbu_count,
             },
+            "shift_definition_snapshot": model.shift_definition_snapshot,
         }
         for model in models
     ]
@@ -364,6 +365,8 @@ def _persist_iterative_capacity_plan(db: Session, run: PredictionRun, planning: 
                     loading_order_no=line["loading_order_no"],
                     spbu_id=line["spbu_id"],
                     spbu_no=line["spbu_no"],
+                    product_id=line.get("product_id"),
+                    product_name=line.get("product_name"),
                     order_quantity_kl=line.get("order_quantity_kl"),
                     shipment_start_datetime=datetime.fromisoformat(line["shipment_start_datetime"]),
                     model_predicted_shipment_id=prediction["predicted_shipment_id"],
@@ -1072,6 +1075,8 @@ def get_prediction_run(
                 "spbu_id": line.spbu_id,
                 "spbu_no": line.spbu_no,
                 "spbu_name": spbus[line.spbu_id].spbu_name if line.spbu_id in spbus else None,
+                "product_id": line.product_id,
+                "product_name": line.product_name,
                 "cluster_id": cluster_assignments[line.spbu_id].cluster_id if line.spbu_id in cluster_assignments else None,
                 "cluster_number": (
                     int(cluster_assignments[line.spbu_id].cluster_id) + 1
@@ -1513,6 +1518,8 @@ def _rebuild_candidates_and_timeline(db: Session, run: PredictionRun) -> None:
                     "loading_order_no": line.loading_order_no,
                     "spbu_id": line.spbu_id,
                     "spbu_no": line.spbu_no,
+                    "product_id": line.product_id,
+                    "product_name": line.product_name,
                     "shipment_start_datetime": _iso(line.shipment_start_datetime),
                     "shift_id": shipment.shift_id,
                     "shift": shipment.shift_name,
@@ -1643,8 +1650,8 @@ def duplicate_prediction_run(db: Session, run_id: str, *, model_id: str | None, 
         return buffer.getvalue()
 
     lo_content = workbook_bytes(
-        ["loading_order_no", "shipment_start_datetime", "spbu_no", "order_quantity_kl"],
-        [[row["loading_order_no"], row["shipment_start_datetime_local"], row["spbu_no"], row.get("order_quantity_kl")] for row in source.input_loading_order_snapshot],
+        ["loading_order_no", "shipment_start_datetime", "spbu_no", "product", "order_quantity_kl"],
+        [[row["loading_order_no"], row["shipment_start_datetime_local"], row["spbu_no"], row.get("product_name"), row.get("order_quantity_kl")] for row in source.input_loading_order_snapshot],
     )
     mt_content = workbook_bytes(
         ["vehicle_registration_no", "initial_available_datetime"],

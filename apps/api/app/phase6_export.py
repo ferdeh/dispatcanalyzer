@@ -32,13 +32,52 @@ def workbook_bytes(sheets: list[tuple[str, list[str], list[list]]]) -> bytes:
 
 def loading_order_template() -> bytes:
     return workbook_bytes(
-        [("Loading Order", ["loading_order_no", "shipment_start_datetime", "spbu_no", "order_quantity_kl"], [["LO000001", "2026-08-22 05:00:00", "SPBU001", 8]])]
+        [("Loading Order", ["loading_order_no", "shipment_start_datetime", "spbu_no", "product", "order_quantity_kl"], [["LO000001", "2026-08-22 05:00:00", "SPBU001", "PERTAMAX", 8]])]
+    )
+
+
+def loading_order_workbook(rows: list[dict]) -> bytes:
+    return workbook_bytes(
+        [
+            (
+                "Loading Order",
+                ["loading_order_no", "shipment_start_datetime", "spbu_no", "product", "order_quantity_kl"],
+                [
+                    [
+                        row.get("loading_order_no"),
+                        row.get("shipment_start_datetime"),
+                        row.get("spbu_no"),
+                        row.get("product"),
+                        row.get("order_quantity_kl"),
+                    ]
+                    for row in rows
+                ],
+            )
+        ]
     )
 
 
 def mt_availability_template() -> bytes:
     return workbook_bytes(
         [("MT Availability", ["vehicle_registration_no", "initial_available_datetime"], [["B9123ABC", "2026-08-22 04:30:00"]])]
+    )
+
+
+def mt_availability_workbook(rows: list[dict]) -> bytes:
+    return workbook_bytes(
+        [
+            (
+                "MT Availability",
+                ["vehicle_registration_no", "initial_available_datetime"],
+                [
+                    [
+                        row.get("vehicle_registration_no"),
+                        row.get("initial_available_datetime"),
+                    ]
+                    for row in rows
+                ],
+            )
+        ]
     )
 
 
@@ -75,6 +114,7 @@ def prediction_export(db: Session, run_id: str) -> tuple[bytes, str]:
                     line["loading_order_no"],
                     line["shipment_start_datetime"],
                     line["spbu_no"],
+                    line.get("product_name"),
                     line["order_quantity_kl"],
                     shipment["shipment_prediction_score"],
                     shipment["shipment_confidence_level"],
@@ -138,7 +178,7 @@ def prediction_export(db: Session, run_id: str) -> tuple[bytes, str]:
             ("Summary", ["Metric", "Value"], summary_rows),
             (
                 "Shipment Result",
-                ["prediction_run_id", "derived_shift", "planned_start_datetime", "predicted_shipment_id", "loading_order_no", "shipment_start_datetime", "spbu_no", "order_quantity_kl", "shipment_prediction_score", "shipment_confidence_level"],
+                ["prediction_run_id", "derived_shift", "planned_start_datetime", "predicted_shipment_id", "loading_order_no", "shipment_start_datetime", "spbu_no", "product", "order_quantity_kl", "shipment_prediction_score", "shipment_confidence_level"],
                 shipment_rows,
             ),
             (

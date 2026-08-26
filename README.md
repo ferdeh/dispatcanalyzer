@@ -1,10 +1,10 @@
 # Dispatch Intelligence Platform
 
-Dispatch Intelligence Platform adalah aplikasi analitik operasional distribusi BBM. Platform ini dibangun bertahap dari Phase 0 sampai Phase 6 untuk mengubah:
+Dispatch Intelligence Platform adalah aplikasi intelligence dan operational control distribusi BBM. Platform ini dibangun bertahap dari Phase 0 sampai Phase 7 untuk mengubah:
 
 Master Data + Loading Order + GPS Operational Data + Historical Dispatch
 
-menjadi trusted operational intelligence yang nanti dapat menjadi input untuk optimasi rute. Phase 6 memakai Google Maps Routes API hanya untuk estimasi waktu perjalanan/cycle time; optimasi rute fleet-wide tetap belum menjadi scope Phase 0-6.
+menjadi trusted operational intelligence, saved prediction, dan dynamic multi-trip route plan yang auditable. Phase 6 menghasilkan warm start shipment/MT; Phase 7 memakai Google OR-Tools untuk optimasi fleet-wide dan depot bay scheduling. Google Routes API tetap hanya menjadi provider jarak, waktu, matrix, dan geometry—bukan optimization engine.
 
 Prinsip utama: jangan lanjut ke phase berikutnya sebelum phase berjalan benar, diuji, tervalidasi visual, terdokumentasi, dan usable.
 
@@ -41,6 +41,7 @@ WEB_PORT=3001 docker compose up -d web
 - Phase 4 - SPBU–MT Historical Affinity & Stability Intelligence: `/affinity-intelligence`
 - Phase 5 - Machine Learning Intelligence: `/machine-learning-intelligence`
 - Phase 6 - Shipment & MT Assignment Prediction: `/prediction-assignment`
+- Phase 7 - Dynamic Multi-Trip VRP & Depot Bay Queue: `/phase7-optimization`
 - Settings - Google Maps Integration: `/settings/google-maps-integration`
 - Documentation - Panduan Pengguna: `/documentation`
 
@@ -445,7 +446,7 @@ Operational Shift Intelligence di Phase 2:
 
 Operational Shift Intelligence tetap berbasis perilaku historis. Output ini tidak memaksa jadwal dispatch masa depan dan tidak melakukan multi-feature SPBU clustering; advanced clustering tetap menjadi tanggung jawab fase lanjutan.
 
-Catatan scope saat ini: fondasi Phase 0 tetap menjadi dasar data utama, dan Phase 2 departure intelligence sudah tersedia sebagai read-only derived analysis. Analisa di luar scope seperti SPBU arrival, ETA, route intelligence, route optimization, dan recommendation workflow belum dikerjakan sebagai fitur aktif.
+Catatan scope: fondasi Phase 0 tetap menjadi dasar data utama dan Phase 2 tetap read-only historical intelligence. Prediction/availability Phase 6 dan dynamic route/bay optimization Phase 7 sudah tersedia sebagai modul terpisah; GPS-confirmed arrival/visit dan actual stop reconstruction tetap menunggu evidence GPS yang tervalidasi.
 
 Load sample data:
 
@@ -479,6 +480,7 @@ Implemented stack:
 - TypeScript
 - Tailwind CSS
 - Apache ECharts
+- Google OR-Tools Routing Solver dan CP-SAT
 - Docker Compose
 
 Monorepo layout:
@@ -492,6 +494,7 @@ Monorepo layout:
 Phase 2 departure intelligence details are documented in `docs/PHASE_2_DEPOT_DEPARTURE_INTELLIGENCE.md`.
 Phase 3 pairing intelligence implementation is summarized in `PHASE_3_COMPLETION_REPORT.md`.
 Phase 4 methodology is documented in `docs/PHASE_4_SPBU_MT_AFFINITY.md`, with implementation status in `PHASE_4_COMPLETION_REPORT.md`.
+Phase 7 architecture, workflow, hard/soft constraints, API, schema, dan operasi dispatcher didokumentasikan di `docs/PHASE_7_DYNAMIC_VRP.md`.
 
 ## Phase Roadmap
 
@@ -780,12 +783,14 @@ Detail teknis dan panduan operasional lengkap: `docs/PHASE_6_PREDICTION_ASSIGNME
 
 Input workbook:
 
-- Loading Order: `loading_order_no`, `shipment_start_datetime`, `spbu_no`, dan `order_quantity_kl`; setiap LO wajib tepat 8 KL
-- MT Availability: `vehicle_registration_no`, `initial_available_datetime`
-- template dapat diunduh dari page atau API; `.xlsx` dibatasi 10 MB
+- Loading Order: `loading_order_no`, `shipment_start_datetime`, `spbu_no`, `product`, dan `order_quantity_kl`; setiap LO wajib tepat 8 KL. Nilai product dipetakan ke `master_product`/alias canonical dan disimpan pada snapshot line prediction
+- MT Availability internal: `vehicle_registration_no`, `initial_available_datetime`; user tidak lagi mengunggah workbook MT manual
+- template Loading Order dapat diunduh dari page atau API; `.xlsx` dibatasi 10 MB
 - card **Loading Order Upload** menyediakan **Data Demo**: user memasukkan total order kelipatan 8 KL, sistem membuat satu LO 8 KL per unit order, lalu hanya memilih SPBU aktif non-noise dengan `history_eligible=true` dan `coverage_source=BEHAVIORAL_HISTORY` pada saved model yang dipilih. Dengan demikian SPBU cold-start, inactive, noise, dan unseen tidak masuk data demo. LO dibentuk sebagai batch cluster/dominant-shift bertimestamp berdekatan agar demo dapat menguji multi-SPBU; input dengan sisa di bawah 8 KL ditolak
-- card **MT Availability Upload** menyediakan **Data Demo**: user memasukkan target total kapasitas MT dalam KL, sistem memilih kombinasi acak MT aktif dari master depot dengan total kapasitas paling dekat ke target; jam buka depot mengikuti `start_time` shift pertama dan jam tutup mengikuti `end_time` shift terakhir pada snapshot model. Secara default semua MT tersedia tepat pada jam buka, sedangkan opsi **Random availability** membuat jam availability secara acak di dalam window buka–tutup tersebut
-- workbook demo langsung dipasang sebagai file upload aktif dan melewati validator yang sama dengan file manual; nama SPBU, kuantitas order, kapasitas MT terpilih, dan timestamp ikut dipertahankan untuk audit
+- setelah file manual atau Data Demo LO tervalidasi, card **Loading Order Management** membuka seluruh row input—termasuk Product—untuk Add, Edit, dan Delete. Form Add/Edit memakai dropdown SPBU aktif dari Master SPBU pada depot terpilih dan dropdown Product aktif dari Master Product, bukan free text. Setiap header data memiliki filter dan sort, tabel dipaginasi, dan setiap perubahan membentuk ulang workbook aktif lalu menjalankan validator backend yang sama; hasil tabel inilah yang dikirim saat **Run Prediction**
+- card **MT Availability** hanya menyediakan **Import Data from Master Data**. Tombol ini mengambil seluruh MT canonical aktif pada depot terpilih dan membuka **MT Management** dengan kolom No MT, MT Tag Class, Status, dan ETA on Depot. Tidak tersedia Add/Delete; status Active/Deactive adalah state operasional run dan tidak menulis balik ke Master MT
+- seluruh MT hasil import mendapat ETA pada tanggal operasi dan jam awal Shift 1 dari snapshot model. MT dengan profil kapasitas 8 KL yang valid default Active; MT canonical aktif yang profil kapasitasnya tidak valid tetap ditampilkan tetapi default Deactive beserta alasannya. User dapat mengubah status atau ETA; hanya row Active yang dibentuk menjadi workbook internal, divalidasi backend, dan dikirim saat **Run Prediction**. ETA on Depot berarti waktu MT mulai available di depot
+- workbook internal hasil management langsung dipasang sebagai input aktif dan melewati validator yang sama; nomor MT, kapasitas, status operasional, dan timestamp ikut dipertahankan untuk audit
 - timestamp tanpa offset dibaca memakai timezone depot; normalized snapshot disimpan dalam UTC dan local time
 - shift bukan input utama: shift diturunkan dari `shipment_start_datetime` menggunakan exact full-day shift-definition snapshot model Phase 5/Phase 2
 - LO divalidasi terhadap planning horizon; MT harus unik, aktif, ada di master, dan berada pada depot run
@@ -897,19 +902,80 @@ Authorization mengikuti seam existing melalui `X-User` dan `X-Permissions`: `pha
 
 Phase 6 boleh menghitung travel estimate, cycle time, preliminary visit sequence dalam satu shipment, dan rolling multi-trip availability. Phase 6 tidak memanggil Google Route Optimization API/GMPRO `optimizeTours`, tidak menyelesaikan full fleet VRP, tidak mengoptimalkan urutan semua shipment/MT secara global, dan tidak menghasilkan final optimized route.
 
-Phase 7 tetap bertanggung jawab atas final route optimization, fleet-wide constraints, global visit sequencing, driver hours, cost objective, dan Google Route Optimization API/GMPRO bila dipilih.
+Phase 7 sekarang bertanggung jawab atas final route optimization, fleet-wide constraints, global visit sequencing, vehicle working time, depot bay queue, dan cost objective. Implementasi tidak memakai Google Route Optimization API/GMPRO; optimization engine adalah OR-Tools.
 
 Verification terakhir:
 
-- migration PostgreSQL memiliki single head revision `0017_phase5_sufficiency_geo`
-- seluruh **68 backend tests** lulus pada deployment image
-- focused Phase 5 + Phase 6 regression suite berisi **33 tests** dan seluruhnya lulus pada deployment image
-- focused Phase 5 suite berisi **9 tests** untuk sufficiency boundaries, geographic validation/Haversine/KNN features, marginal projection, persistence contract, dan pemisahan insufficient dari HDBSCAN noise
-- **24 focused Phase 6 tests** lulus, termasuk asynchronous queue/worker recovery, iterative 32→24→16→8 KL assignment, three-LO/24-KL grouping, exact full-load capacity matching, tag compatibility, route geometry, dan pagination/lazy payload
+- migration PostgreSQL memiliki single head revision `0019_phase7_dynamic_vrp`
+- full deployment-image regression terbaru lulus **92 tests**; focused Phase 7 setelah hardening KPI/stability lulus **18 tests**, termasuk geometry depot-stop-depot, kelanjutan nomor trip setelah frozen plan, fallback TRUCK yang dilabeli eksplisit, activation cost satu kali per MT, dan material gate-out change
+- focused Phase 5 + Phase 6 regression suite berisi **39 tests**
+- Phase 7 acceptance/hardening meliputi warm start, compartment, multi-trip, ETA, freeze, DONE/ONGOING, bay compatibility/queue/loading, versioning, dropped reason, final geometry, dan trip-number continuation
 - TypeScript type checking dan Vite production build lulus
-- API health, kedua generator Data Demo, closest-capacity MT subset, timestamp validation, rolling assignment, DRIVE route cache/fallback, encrypted settings, exports, dan persistence telah diuji
-- Vite memberi non-blocking warning untuk application chunk sekitar 1,79 MB; code splitting ECharts/page modules menjadi technical debt performance
+- API health, 22 path OpenAPI Phase 7, end-to-end V1 persistence, route fallback geometry, parameter profiles, migration, dan existing Phase 0–6 behavior telah diuji
+- visual browser smoke test lulus untuk navigation, depot-scoped empty state, Create Job modal, dan dokumentasi Phase 7 tanpa console error
+- Vite memberi non-blocking warning untuk application chunk sekitar 1,90 MB; code splitting ECharts/page modules menjadi technical debt performance
 - host Python tanpa dependency ML lengkap tidak dapat menjalankan dua training tests Phase 5; deployment image adalah verification environment canonical dan membutuhkan `NUMBA_CPU_NAME=generic` serta `NUMBA_DISABLE_JIT=1` pada ARM untuk menghindari illegal-instruction dari Numba/UMAP
+
+### Phase 7 — Dynamic Multi-Trip VRP & Depot Bay Queue Optimization
+
+Phase 7 adalah workspace operational control per depot dan operating date. Dispatcher membuat Job, memilih completed Phase 6 Prediction Run secara eksplisit berdasarkan Run ID, mengimpor LO + warm start tanpa mengubah tabel Phase 6, memuat MT canonical depot, mengisi initial ETA Depot, memperbarui actual bay state/queue, memilih parameter profile, lalu menjalankan initial plan atau reroute.
+
+Pemilihan Prediction Run bersifat ketat dan auditable. Dropdown hanya menampilkan run Phase 6 berstatus `COMPLETED` pada depot yang sama dan memiliki sedikitnya satu LO dengan tanggal operasional lokal yang sama dengan `operating_date` Job Phase 7. Tanggal yang tertulis di `prediction_run_no` seperti `PRED-20260826-71EF00` adalah tanggal pembuatan run, bukan jaminan tanggal operasional LO. Tanggal operasional diturunkan dari `shipment_start_datetime_local`, atau dari timestamp UTC yang dikonversi memakai timezone Master Depot. Jika dropdown kosong, periksa kombinasi depot, Job Operating Date, status run, dan tanggal lokal LO; buat Job baru dengan tanggal yang benar atau hasilkan completed Phase 6 Run untuk tanggal tersebut. Jangan mengubah tanggal snapshot atau source run secara langsung karena akan merusak lineage audit.
+
+```text
+Saved Phase 6 Run (immutable)
+    → Phase 7 LO operational state + soft warm start
+    → cached Google Routes distance/time matrix
+    → OR-Tools Routing Solver per physical-vehicle trip round
+    → CP-SAT compartment assignment
+    → CP-SAT bay eligibility, queue, loading, and gate-out schedule
+    → iterative return/availability coordination
+    → immutable route version + state and parameter snapshots
+```
+
+Kontrak utama:
+
+- Phase 6 predicted shipment, MT, pairing, confidence, dan model ID disimpan terpisah dari current Phase 7 vehicle/trip/shipment/compartment assignment.
+- Phase 6 adalah warm start dan soft preference. OR-Tools boleh mengubah MT, grouping, pairing, trip, sequence, dan gate-out selama seluruh hard constraint valid.
+- Routing Solver dijalankan dalam physical-vehicle multi-trip loop. Setelah Trip 1 kembali, availability dan remaining working time diperbarui sebelum MT dapat menerima Trip 2 dan seterusnya.
+- CP-SAT compartment assignment menjaga satu compartment hanya memuat satu product dan tidak melebihi capacity.
+- CP-SAT bay scheduler memilih eligible bay, mempertahankan actual occupancy/queue, menjadwalkan complete per-compartment loading, dan menghasilkan gate-out.
+- Default loading mode adalah `SEQUENTIAL`; model mendukung `PARALLEL` dengan `number_of_loading_arms`.
+- `DONE`, `ONGOING`, dan near-term `PLANNED` di dalam `freeze_window_minutes` dibekukan. Jika satu LO frozen berada pada trip yang sama, seluruh trip dipertahankan sebagai unit execution yang konsisten.
+- Actual user ETA/bay/queue state mengalahkan previous predicted state. Reroute tidak menjalankan Phase 6 ulang.
+- Setiap run membuat `V1`, `V2`, dan seterusnya secara append-only bersama operational snapshot, parameter checksum/snapshot, solver metadata, cost, dropped reason, dan comparison/adherence.
+- LO infeasible tidak pernah hilang: result menyimpan reason seperti `NO_COMPATIBLE_MT`, `COMPARTMENT_INFEASIBLE`, `BAY_PRODUCT_CONSTRAINT`, `DEPOT_TIME_EXHAUSTED`, atau `UNSERVED_END_OF_DAY`.
+
+Objectives tersedia tanpa mengubah hard constraints:
+
+- `MIN_TOTAL_COST`: activation + distance + operating + queue + loading + overtime + penalties.
+- `MIN_TOTAL_DISTANCE`: total route distance.
+- `MIN_TOTAL_OPERATING_TIME`: driving + waiting + SPBU service + depot queue + loading.
+
+Google Routes configuration Phase 7:
+
+- `route_vehicle_mode=GENERAL_VEHICLE` adalah default dan tidak memerlukan Large Vehicle Routing.
+- `route_vehicle_mode=TRUCK` hanya dipilih secara eksplisit. Pada deployment/region yang belum mendukung truck request, hasil harus tetap menunjukkan fallback/provider source dan tidak boleh disamarkan sebagai truck road result.
+- `traffic_aware` dan `route_matrix_cache_enabled` configurable.
+- Matrix dimaterialisasi sebelum solver callback. Google tidak pernah dipanggil dari cost callback OR-Tools.
+- Final selected legs dapat mengambil road geometry; cached/master-coordinate fallback terlihat sebagai `MIXED_OR_MASTER_FALLBACK`.
+
+Parameter profiles (`Balanced Default`, `Cost Efficiency`, `High Historical Adherence`, `Peak Operation`, `High Bay Congestion`) mendukung Load, Save sebagai versi berikutnya, dan Save As. Exact effective values selalu disalin ke immutable `optimization_parameter_snapshot`.
+
+Schema migration `0019_phase7_dynamic_vrp` menambah job/run/version/trip/stop/LO/vehicle result, operational state, bay state/queue/operation, parameter profile/snapshot/cost rules, serta Phase 7 route matrix cache/request log. Service logic dipisahkan di `phase7_service.py`, `phase7_optimization.py`, dan `phase7_matrix.py`; handler API tidak memuat solver logic.
+
+Environment dan run:
+
+```bash
+cd apps/api
+python -m pip install -r requirements.txt  # includes ortools
+pytest tests/test_phase7_dynamic_vrp.py
+
+# full stack and migrations
+docker compose up --build
+```
+
+Google API key tetap disimpan melalui Settings UI dan dienkripsi oleh `GOOGLE_ROUTES_ENCRYPTION_KEY`. Tidak ada key baru yang ditempatkan di frontend atau parameter snapshot.
 
 ## Phase Quality Gate
 
@@ -987,8 +1053,27 @@ Setiap phase harus melewati gate berikut sebelum phase berikutnya dimulai:
 - `PUT /api/v1/settings/google-routes`
 - `DELETE /api/v1/settings/google-routes/api-key`
 - `POST /api/v1/settings/google-routes/test`
-
-Route optimization / VRP endpoints belum diimplementasikan dan tetap menjadi scope Phase 7.
+- `POST /api/v1/phase7/jobs`
+- `GET /api/v1/phase7/jobs?depot_id=...`
+- `GET /api/v1/phase7/jobs/{job_id}`
+- `GET /api/v1/phase7/jobs/{job_id}/prediction-runs`
+- `POST /api/v1/phase7/jobs/{job_id}/prediction-run`
+- `GET/PATCH /api/v1/phase7/jobs/{job_id}/loading-orders[/status]`
+- `POST /api/v1/phase7/jobs/{job_id}/vehicles/load-master`
+- `GET/PATCH /api/v1/phase7/jobs/{job_id}/vehicles`
+- `GET/PUT /api/v1/phase7/depots/{depot_id}/bays`
+- `GET/PUT /api/v1/phase7/jobs/{job_id}/bay-state`
+- `GET /api/v1/phase7/jobs/{job_id}/validation`
+- `POST /api/v1/phase7/jobs/{job_id}/optimize`
+- `POST /api/v1/phase7/jobs/{job_id}/reroute`
+- `GET /api/v1/phase7/jobs/{job_id}/versions`
+- `GET /api/v1/phase7/jobs/{job_id}/versions/{version_id}`
+- `GET /api/v1/phase7/jobs/{job_id}/versions/{version_id}/trips/{trip_id}`
+- `GET /api/v1/phase7/jobs/{job_id}/simulation`
+- `GET /api/v1/phase7/jobs/{job_id}/map`
+- `GET /api/v1/phase7/jobs/{job_id}/cost-analysis`
+- `GET /api/v1/phase7/jobs/{job_id}/dropped-loading-orders`
+- `GET/POST/PUT /api/v1/phase7/parameter-profiles[...]`
 
 ## Important Design Principles
 
@@ -996,7 +1081,8 @@ Route optimization / VRP endpoints belum diimplementasikan dan tetap menjadi sco
 - Pisahkan official master rule, operational instruction, observed behavior, analytical finding, recommendation, dan approved master-data change.
 - Semua canonical dan derived records harus menjaga lineage jika memungkinkan.
 - Jangan menggunakan LLM untuk deterministic analytics.
-- Jangan implement route optimization sebelum Phase 6 selesai.
+- Phase 7 route optimization hanya boleh membaca saved Phase 6 sebagai warm start; jangan menulis balik atau menjalankan Phase 6 otomatis saat reroute.
+- Google Routes menyediakan travel data dan geometry saja; OR-Tools adalah satu-satunya optimization engine Phase 7.
 - Jangan tampilkan uncertainty sebagai fakta pasti; gunakan status seperti `UNKNOWN`, `UNMAPPED`, `AMBIGUOUS`, `LOW CONFIDENCE`, `PARTIAL`, atau `INSUFFICIENT DATA`.
 
 ## Documentation
@@ -1011,6 +1097,7 @@ Dokumen pendukung:
 - `docs/TAG_MODEL.md`
 - `docs/TAG_COMPATIBILITY.md`
 - `docs/DATA_QUALITY.md`
+- `docs/PHASE_7_DYNAMIC_VRP.md`
 - `docs/SHIPMENT_MODEL.md`
 - `docs/GPS_MODEL.md`
 - `docs/PHASES.md`

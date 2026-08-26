@@ -36,3 +36,20 @@ Timestamped LO + Initial MT Availability
 Google Routes requests are backend-only. The global API key is encrypted using an environment-provided application secret; the database stores ciphertext/fingerprint/mask, the frontend receives only the mask, and prediction snapshots retain configuration version—not key material. Phase 6 Indonesia enforces `DRIVE`; no TRUCK/Large Vehicle request or profile is sent. Route cache identity includes endpoints, departure bucket, routing preference, DRIVE mode, and configuration version. Google failures use visibly marked historical/default route estimates.
 
 Phase 6 run rows retain immutable input/model/routing/parameter/original-result snapshots and a separate final dispatch snapshot. Audited overrides recalculate route/cycle/availability and downstream rolling state without retraining Phase 5 or rewriting the original model layer. `phase6_auth` exposes `phase6:view`, `phase6:run`, `phase6:export`, `phase6:override`, `google_routes:view`, and `google_routes:manage` through the same replaceable header seam.
+
+Phase 7 adds a depot/date-scoped operational control workspace without changing the Phase 6 source run. The selected completed Prediction Run is imported once: Phase 6 shipment, vehicle, pairing, and confidence remain immutable warm-start/soft-preference fields, while Phase 7 current shipment, vehicle, trip, compartment, stop, bay, and gate-out fields live in separate state/version tables.
+
+```text
+Immutable Phase 6 run + current LO/MT/bay state + parameter snapshot
+    → prebuilt Google Routes/master-fallback distance-time matrix
+    → OR-Tools Routing Solver physical-MT trip rounds
+    → CP-SAT one-product compartment placement
+    → CP-SAT bay eligibility, actual queue, loading, and gate-out
+    → propagate bay delay to return availability
+    → repeat coordination until tolerance/iteration limit
+    → append immutable Route V1/V2/... + cost/audit/dropped reasons
+```
+
+Google Routes is a travel-data provider only. Matrix calls are completed before solver evaluation, callbacks use in-memory integers, and Compute Routes geometry is requested only for solver-selected final legs. Neither Phase 6 nor Phase 7 calls GMPRO/`optimizeTours`. Offline/master Haversine fallback remains explicit in provider metadata and map styling.
+
+The multi-trip state is keyed by physical MT, not by duplicated virtual vehicles. Each accepted trip updates predicted depot return, used/remaining working time, and completed trip count before the same MT may enter another routing round. During reroute, DONE, ONGOING, freeze-window PLANNED, and every LO sharing one of those physical trips are copied unchanged into the next version. Actual user ETA and bay/queue state outrank prior system predictions.
