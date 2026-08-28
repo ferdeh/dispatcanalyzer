@@ -2,13 +2,17 @@ from __future__ import annotations
 
 from datetime import date, datetime
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from .database import get_db
+from .phase7_constants import constraint_catalog
 from .phase7_service import (
     create_job,
+    delete_bay_configuration,
+    delete_job,
+    enqueue_optimization,
     get_actual_bay_state,
     get_bay_configuration,
     get_cost_analysis,
@@ -27,7 +31,7 @@ from .phase7_service import (
     list_route_versions,
     load_mt_from_master,
     load_prediction_run,
-    run_optimization,
+    run_optimization_background,
     save_parameter_profile,
     update_actual_bay_state,
     update_lo_statuses,
@@ -130,8 +134,12 @@ class ParameterProfileRequest(BaseModel):
 class OptimizationRequest(BaseModel):
     profile_id: str | None = None
     parameters: dict = Field(default_factory=dict)
-    current_time: datetime | None = None
+    current_time: datetime
     reason: str | None = Field(default=None, max_length=160)
+
+
+class ValidationRequest(BaseModel):
+    parameters: dict = Field(default_factory=dict)
 
 
 @router.post("/jobs", status_code=status.HTTP_201_CREATED)
@@ -147,6 +155,11 @@ def phase7_jobs(depot_id: str = Query(...), db: Session = Depends(get_db)) -> li
 @router.get("/jobs/{job_id}")
 def phase7_job(job_id: str, db: Session = Depends(get_db)) -> dict:
     return get_job(db, job_id)
+
+
+@router.delete("/jobs/{job_id}")
+def phase7_delete_job(job_id: str, db: Session = Depends(get_db)) -> dict:
+    return delete_job(db, job_id)
 
 
 @router.get("/jobs/{job_id}/prediction-runs")
@@ -199,6 +212,11 @@ def phase7_save_bay_configuration(depot_id: str, request: BayConfigurationReques
     )
 
 
+@router.delete("/depots/{depot_id}/bays/{bay_id}")
+def phase7_delete_bay_configuration(depot_id: str, bay_id: str, db: Session = Depends(get_db)) -> dict:
+    return delete_bay_configuration(db, depot_id, bay_id)
+
+
 @router.get("/jobs/{job_id}/bay-state")
 def phase7_bay_state(job_id: str, db: Session = Depends(get_db)) -> dict:
     return get_actual_bay_state(db, job_id)
@@ -219,14 +237,25 @@ def phase7_validate_job(job_id: str, db: Session = Depends(get_db)) -> dict:
     return validate_job(db, job_id)
 
 
-@router.post("/jobs/{job_id}/optimize")
-def phase7_initial_optimization(job_id: str, request: OptimizationRequest, db: Session = Depends(get_db)) -> dict:
-    return run_optimization(db, job_id, request.model_dump(mode="json", exclude_none=True), reroute=False)
+@router.post("/jobs/{job_id}/validation")
+def phase7_validate_job_parameters(job_id: str, request: ValidationRequest, db: Session = Depends(get_db)) -> dict:
+    return validate_job(db, job_id, request.parameters)
 
 
-@router.post("/jobs/{job_id}/reroute")
-def phase7_reroute(job_id: str, request: OptimizationRequest, db: Session = Depends(get_db)) -> dict:
-    return run_optimization(db, job_id, request.model_dump(mode="json", exclude_none=True), reroute=True)
+@router.post("/jobs/{job_id}/optimize", status_code=status.HTTP_202_ACCEPTED)
+def phase7_initial_optimization(job_id: str, request: OptimizationRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)) -> dict:
+    payload = request.model_dump(mode="json", exclude_none=True)
+    accepted = enqueue_optimization(db, job_id, payload, reroute=False)
+    background_tasks.add_task(run_optimization_background, job_id, payload, reroute=False)
+    return accepted
+
+
+@router.post("/jobs/{job_id}/reroute", status_code=status.HTTP_202_ACCEPTED)
+def phase7_reroute(job_id: str, request: OptimizationRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)) -> dict:
+    payload = request.model_dump(mode="json", exclude_none=True)
+    accepted = enqueue_optimization(db, job_id, payload, reroute=True)
+    background_tasks.add_task(run_optimization_background, job_id, payload, reroute=True)
+    return accepted
 
 
 @router.get("/jobs/{job_id}/versions")
@@ -267,6 +296,11 @@ def phase7_dropped(job_id: str, version_id: str | None = None, db: Session = Dep
 @router.get("/parameter-profiles")
 def phase7_parameter_profiles(include_inactive: bool = False, db: Session = Depends(get_db)) -> list[dict]:
     return list_parameter_profiles(db, include_inactive=include_inactive)
+
+
+@router.get("/constraint-catalog")
+def phase7_constraint_catalog() -> list[dict]:
+    return constraint_catalog()
 
 
 @router.get("/parameter-profiles/{profile_id}")

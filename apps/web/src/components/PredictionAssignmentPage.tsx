@@ -698,6 +698,7 @@ export function PredictionAssignmentPage({ depots, products }: { depots: Depot[]
   const [maximumDelay, setMaximumDelay] = useState("30");
   const [demoDialogOpen, setDemoDialogOpen] = useState(false);
   const [demoTotalKl, setDemoTotalKl] = useState("80");
+  const [demoLoadingOrderDate, setDemoLoadingOrderDate] = useState(localTomorrowDate);
   const [demoLoading, setDemoLoading] = useState(false);
   const [demoNotice, setDemoNotice] = useState<string | null>(null);
   const [loadingOrderManagementReady, setLoadingOrderManagementReady] = useState(false);
@@ -1133,9 +1134,13 @@ export function PredictionAssignmentPage({ depots, products }: { depots: Depot[]
     }
   }
 
-  async function generateDemoLoadingOrders() {
+  async function generateDemoLoadingOrders(selectedLoadingOrderDate = demoLoadingOrderDate) {
     const totalOrderKl = Number(demoTotalKl);
-    if (!depotId || !modelId || !Number.isFinite(totalOrderKl) || totalOrderKl <= 0 || totalOrderKl > 40000 || totalOrderKl % 8 !== 0) {
+    if (!depotId || !modelId || !selectedLoadingOrderDate || !/^\d{4}-\d{2}-\d{2}$/.test(selectedLoadingOrderDate)) {
+      setError("Tanggal Loading Order wajib dipilih.");
+      return;
+    }
+    if (!Number.isFinite(totalOrderKl) || totalOrderKl <= 0 || totalOrderKl > 40000 || totalOrderKl % 8 !== 0) {
       setError("Total order harus kelipatan 8 KL, lebih dari 0, dan maksimum 40.000 KL.");
       return;
     }
@@ -1145,13 +1150,13 @@ export function PredictionAssignmentPage({ depots, products }: { depots: Depot[]
       const file = await apiFile(
         "/api/v1/phase6/demo/loading-order",
         "POST",
-        { depot_id: depotId, model_id: modelId, total_order_kl: totalOrderKl },
+        { depot_id: depotId, model_id: modelId, total_order_kl: totalOrderKl, loading_order_date: selectedLoadingOrderDate },
         "phase6-demo-loading-order.xlsx",
       );
       setDemoDialogOpen(false);
       const validation = await loadLoadingOrderFile(file);
       if (validation) {
-        setDemoNotice(`Data demo ${totalOrderKl.toLocaleString("id-ID", { maximumFractionDigits: 3 })} KL berhasil dibuat dan divalidasi.`);
+        setDemoNotice(`Data demo ${totalOrderKl.toLocaleString("id-ID", { maximumFractionDigits: 3 })} KL untuk tanggal ${selectedLoadingOrderDate} berhasil dibuat dan divalidasi.`);
       }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Data demo gagal dibuat.");
@@ -1597,12 +1602,21 @@ export function PredictionAssignmentPage({ depots, products }: { depots: Depot[]
 
       {demoDialogOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-petroink/50 p-4" role="dialog" aria-modal="true" aria-labelledby="demo-loading-order-title">
-          <form className="w-full max-w-md border border-line bg-white p-5 shadow-xl" onSubmit={(event) => { event.preventDefault(); void generateDemoLoadingOrders(); }}>
+          <form className="w-full max-w-md border border-line bg-white p-5 shadow-xl" onSubmit={(event) => {
+            event.preventDefault();
+            const selectedDate = String(new FormData(event.currentTarget).get("loading_order_date") ?? "");
+            setDemoLoadingOrderDate(selectedDate);
+            void generateDemoLoadingOrders(selectedDate);
+          }}>
             <div id="demo-loading-order-title" className="text-base font-semibold text-petroink">Buat Data Demo Loading Order</div>
-            <p className="mt-2 text-sm text-slate-500">Masukkan total order kelipatan 8 KL. Sistem membuat satu Loading Order 8 KL per kompartemen dan hanya memilih SPBU aktif yang memiliki histori shipment cukup pada model Fase 5 terpilih. SPBU cold-start, noise, tidak aktif, dan yang tidak tercakup model tidak digunakan. LO dibuat per kelompok cluster/shift agar data demo dapat menguji shipment multi-SPBU tanpa UNSEEN_SPBU.</p>
+            <p className="mt-2 text-sm text-slate-500">Pilih tanggal Loading Order dan masukkan total order kelipatan 8 KL. Sistem membuat satu Loading Order 8 KL per kompartemen dan hanya memilih SPBU aktif yang memiliki histori shipment cukup pada model Fase 5 terpilih. Jam LO tetap dibentuk berdasarkan shift model agar data demo dapat menguji shipment multi-SPBU tanpa UNSEEN_SPBU.</p>
             <label className="mt-5 grid gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
+              Tanggal Loading Order
+              <input autoFocus required className="border border-line px-3 py-2 text-base font-normal normal-case tracking-normal text-petroink" type="date" name="loading_order_date" defaultValue={demoLoadingOrderDate} />
+            </label>
+            <label className="mt-4 grid gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
               Total Order (KL)
-              <input autoFocus required className="border border-line px-3 py-2 text-base font-normal normal-case tracking-normal text-petroink" type="number" min="8" max="40000" step="8" value={demoTotalKl} onChange={(event) => setDemoTotalKl(event.target.value)} />
+              <input required className="border border-line px-3 py-2 text-base font-normal normal-case tracking-normal text-petroink" type="number" min="8" max="40000" step="8" value={demoTotalKl} onChange={(event) => setDemoTotalKl(event.target.value)} />
             </label>
             <div className="mt-5 flex justify-end gap-2">
               <button type="button" className="border border-line px-4 py-2 text-sm" disabled={demoLoading} onClick={() => setDemoDialogOpen(false)}>Batal</button>

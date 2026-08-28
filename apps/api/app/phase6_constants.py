@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 
-PHASE6_ALGORITHM_VERSION = "phase6.iterative_exact_capacity_assignment.v9"
+PHASE6_ALGORITHM_VERSION = "phase6.iterative_exact_capacity_assignment.v11"
+PHASE6_VEHICLE_COMPATIBILITY_MODE = "MT_CAPACITY_LE_SPBU_LIMIT"
 
 PHASE6_PERMISSIONS = {
     "view": "phase6:view",
@@ -21,6 +22,7 @@ DEFAULT_PREDICTION_PARAMETERS = {
     "maximum_shipment_compartments": 4,
     "maximum_group_route_detour_ratio": 2.0,
     "require_full_mt_utilization": True,
+    "vehicle_compatibility_mode": PHASE6_VEHICLE_COMPATIBILITY_MODE,
     "assignment_mode": "STRICT_START",
     "maximum_allowed_delay_minutes": 30,
     "max_exact_sequence_stops": 4,

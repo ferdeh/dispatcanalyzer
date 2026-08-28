@@ -10,10 +10,11 @@ from time import perf_counter
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import HTTPException
-from sqlalchemy import delete, desc, func, select
+from sqlalchemy import delete, desc, func, select, update
 from sqlalchemy.orm import Session
 
 from .compatibility import evaluate_compatibility_entities
+from .database import SessionLocal
 from .google_routes import get_google_routes_configuration
 from .models import (
     ActualBayState,
@@ -45,6 +46,7 @@ from .models import (
     PredictionShipment,
     PredictionShipmentLine,
     ProductCompartmentLoadingDuration,
+    RouteAPIRequestLog,
     RouteVersion,
     RouteVersionLOAssignment,
     RouteVersionStop,
@@ -54,11 +56,17 @@ from .models import (
 )
 from .phase6_capacity import mt_compartment_profile
 from .phase7_constants import (
+    CONSTRAINT_DEFINITIONS,
     DEFAULT_PARAMETER_PROFILES,
     DEFAULT_PHASE7_PARAMETERS,
     JOB_STATUSES,
     LO_STATUSES,
     MT_STATUSES,
+    constraint_is_hard,
+    constraint_is_soft,
+    constraint_limit_minutes,
+    constraint_penalty,
+    constraint_rule,
     effective_parameters,
 )
 from .phase7_matrix import RouteMatrixService
@@ -83,6 +91,90 @@ def _timezone(depot: MasterDepot | None) -> ZoneInfo:
         return ZoneInfo(depot.timezone if depot and depot.timezone else "Asia/Jakarta")
     except ZoneInfoNotFoundError:
         return ZoneInfo("Asia/Jakarta")
+
+
+def _optimization_reference_context(db: Session, job: OptimizationJob) -> tuple[datetime | None, datetime | None]:
+    runs = db.scalars(
+        select(OptimizationRun)
+        .where(
+            OptimizationRun.job_id == job.job_id,
+            OptimizationRun.status == "COMPLETED",
+        )
+        .order_by(OptimizationRun.start_time, OptimizationRun.optimization_run_id)
+    ).all()
+    references = [
+        (run, _utc(run.optimization_reference_time or run.start_time))
+        for run in runs
+        if run.optimization_reference_time or run.start_time
+    ]
+    initial_reference = next((reference for run, reference in references if run.run_type == "INITIAL"), None)
+    latest_reference = references[-1][1] if references else None
+    return initial_reference, latest_reference
+
+
+def _normalize_optimization_reference_time(
+    job: OptimizationJob,
+    depot: MasterDepot | None,
+    raw_value: datetime | str | None,
+    *,
+    reroute: bool,
+    initial_reference_time: datetime | None = None,
+    latest_reference_time: datetime | None = None,
+) -> datetime:
+    if raw_value is None or raw_value == "":
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "OPTIMIZATION_REFERENCE_TIME_REQUIRED",
+                "message": "Select the optimization date and time before starting Phase 7.",
+            },
+        )
+    try:
+        parsed = raw_value if isinstance(raw_value, datetime) else datetime.fromisoformat(str(raw_value).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "INVALID_OPTIMIZATION_REFERENCE_TIME", "message": "Optimization date and time is invalid."},
+        ) from exc
+
+    zone = _timezone(depot)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=zone)
+    local_reference = parsed.astimezone(zone)
+    reference_utc = local_reference.astimezone(timezone.utc)
+
+    if reroute:
+        locked_date = (
+            _utc(initial_reference_time).astimezone(zone).date()
+            if initial_reference_time
+            else job.operating_date
+        )
+        if local_reference.date() != locked_date:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "REROUTE_DATE_LOCKED",
+                    "message": f"Re-optimization date is locked to the initial optimization date {locked_date.isoformat()}.",
+                },
+            )
+        if latest_reference_time and reference_utc < _utc(latest_reference_time):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "OPTIMIZATION_TIME_BEFORE_LAST_RUN",
+                    "message": "Re-optimization time cannot be earlier than the latest completed optimization time.",
+                },
+            )
+    elif local_reference.date() != job.operating_date:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "OPTIMIZATION_DATE_MISMATCH",
+                "message": f"Initial optimization date must match Job operating date {job.operating_date.isoformat()}.",
+            },
+        )
+
+    return reference_utc
 
 
 def _job_day(job: OptimizationJob, depot: MasterDepot) -> tuple[datetime, datetime, datetime]:
@@ -279,6 +371,8 @@ def create_job(db: Session, payload: dict, *, actor: str = "local-user") -> dict
         job_name=name,
         depot_id=depot.depot_id,
         operating_date=operating_date,
+        depot_operational_start=depot.depot_operational_start,
+        depot_operational_end=depot.depot_operational_end,
         status="DRAFT",
         created_by=actor,
     )
@@ -292,6 +386,25 @@ def list_jobs(db: Session, depot_id: str) -> list[dict]:
         raise HTTPException(status_code=400, detail={"code": "DEPOT_REQUIRED", "message": "Select a depot before listing Phase 7 Jobs."})
     jobs = db.scalars(select(OptimizationJob).where(OptimizationJob.depot_id == depot_id).order_by(desc(OptimizationJob.updated_at))).all()
     return [_job_summary(db, job) for job in jobs]
+
+
+def delete_job(db: Session, job_id: str) -> dict:
+    job = _require_job(db, job_id)
+    if job.status == "CALCULATING":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "PHASE7_JOB_CALCULATING",
+                "message": "Job cannot be deleted while optimization is calculating.",
+            },
+        )
+    deleted = {"job_id": job.job_id, "job_no": job.job_no, "status": "DELETED"}
+    # Provider request logs remain as audit evidence, detached from the Job
+    # whose complete Phase 7 workspace is cascaded away.
+    db.execute(update(RouteAPIRequestLog).where(RouteAPIRequestLog.job_id == job.job_id).values(job_id=None))
+    db.delete(job)
+    db.commit()
+    return deleted
 
 
 def _job_summary(db: Session, job: OptimizationJob) -> dict:
@@ -341,7 +454,35 @@ def _job_kpis(db: Session, job: OptimizationJob) -> dict:
 def get_job(db: Session, job_id: str) -> dict:
     job = _require_job(db, job_id)
     depot = db.get(MasterDepot, job.depot_id)
+    initial_reference_time, latest_reference_time = _optimization_reference_context(db, job)
     current = db.get(RouteVersion, job.current_route_version_id) if job.current_route_version_id else None
+    latest_run = db.scalar(
+        select(OptimizationRun)
+        .where(OptimizationRun.job_id == job.job_id)
+        .order_by(desc(OptimizationRun.start_time))
+        .limit(1)
+    )
+    optimization = None
+    if latest_run:
+        metadata = latest_run.solver_metadata or {}
+        elapsed_ms = latest_run.solve_duration_ms or 0
+        if latest_run.status == "RUNNING" and latest_run.start_time:
+            elapsed_ms = round((datetime.now(timezone.utc) - _utc(latest_run.start_time)).total_seconds() * 1000)
+        optimization = {
+            "run_id": latest_run.optimization_run_id,
+            "run_type": latest_run.run_type,
+            "status": latest_run.status,
+            "solver_status": latest_run.solver_status,
+            "stage": metadata.get("stage") or latest_run.solver_status,
+            "progress_pct": int(metadata.get("progress_pct") or 0),
+            "elapsed_ms": elapsed_ms,
+            "started_at": _iso(latest_run.start_time),
+            "ended_at": _iso(latest_run.end_time),
+            "optimization_reference_time": _iso(latest_run.optimization_reference_time or latest_run.start_time),
+            "metadata": metadata,
+            "error_code": latest_run.error_code,
+            "error_message": latest_run.error_message,
+        }
     return {
         **_job_summary(db, job),
         "header": {
@@ -355,7 +496,11 @@ def get_job(db: Session, job_id: str) -> dict:
         "kpis": _job_kpis(db, job),
         "depot_operational_start": _iso(job.depot_operational_start),
         "depot_operational_end": _iso(job.depot_operational_end),
+        "depot_timezone": _timezone(depot).key,
+        "initial_optimization_reference_time": _iso(initial_reference_time),
+        "latest_optimization_reference_time": _iso(latest_reference_time),
         "error_message": job.error_message,
+        "optimization": optimization,
     }
 
 
@@ -545,6 +690,7 @@ def load_mt_from_master(db: Session, job_id: str, *, actor: str = "local-user") 
         capacity = float(profile["capacity_kl"] or 0)
         compartment_capacity = capacity / compartment_count if compartment_count else 0
         compartments = [{"compartment_id": f"C{index}", "capacity_kl": compartment_capacity} for index in range(1, compartment_count + 1)]
+        default_working_time_limit = constraint_limit_minutes(DEFAULT_PHASE7_PARAMETERS, "vehicle_working_time")
         db.add(
             VehicleOperationalState(
                 vehicle_state_id=uuid.uuid4().hex,
@@ -557,8 +703,8 @@ def load_mt_from_master(db: Session, job_id: str, *, actor: str = "local-user") 
                 number_of_compartments=compartment_count,
                 compartment_configuration=compartments,
                 operational_status="READY",
-                working_time_limit_minutes=720,
-                working_time_remaining_minutes=720,
+                working_time_limit_minutes=default_working_time_limit,
+                working_time_remaining_minutes=default_working_time_limit,
                 updated_by=actor,
             )
         )
@@ -667,8 +813,28 @@ def upsert_bay_configuration(db: Session, depot_id: str, bays: list[dict], durat
     return get_bay_configuration(db, depot_id)
 
 
+def delete_bay_configuration(db: Session, depot_id: str, bay_id: str) -> dict:
+    if not db.get(MasterDepot, depot_id):
+        raise HTTPException(status_code=404, detail={"code": "DEPOT_NOT_FOUND", "message": "Depot was not found."})
+    bay = db.scalar(
+        select(MasterLoadingBay).where(
+            MasterLoadingBay.depot_id == depot_id,
+            (MasterLoadingBay.master_bay_id == bay_id) | (MasterLoadingBay.bay_id == bay_id),
+            MasterLoadingBay.active_status != "DELETED",
+        )
+    )
+    if not bay:
+        raise HTTPException(status_code=404, detail={"code": "BAY_NOT_FOUND", "message": "Loading bay was not found."})
+    bay.active_status = "DELETED"
+    db.execute(delete(LoadingBayProductCompatibility).where(LoadingBayProductCompatibility.master_bay_id == bay.master_bay_id))
+    db.execute(delete(ActualBayState).where(ActualBayState.master_bay_id == bay.master_bay_id))
+    db.execute(delete(OptimizationInitialQueue).where(OptimizationInitialQueue.master_bay_id == bay.master_bay_id))
+    db.commit()
+    return {"master_bay_id": bay.master_bay_id, "bay_id": bay.bay_id, "status": "DELETED"}
+
+
 def get_bay_configuration(db: Session, depot_id: str) -> dict:
-    bays = db.scalars(select(MasterLoadingBay).where(MasterLoadingBay.depot_id == depot_id).order_by(MasterLoadingBay.bay_id)).all()
+    bays = db.scalars(select(MasterLoadingBay).where(MasterLoadingBay.depot_id == depot_id, MasterLoadingBay.active_status != "DELETED").order_by(MasterLoadingBay.bay_id)).all()
     bay_ids = [row.master_bay_id for row in bays]
     compat: dict[str, list[str]] = defaultdict(list)
     if bay_ids:
@@ -765,16 +931,28 @@ def get_actual_bay_state(db: Session, job_id: str) -> dict:
     }
 
 
-def apply_freeze_rules(rows: list[LOOperationalState], *, current_time: datetime, freeze_window_minutes: int) -> list[LOOperationalState]:
+def apply_freeze_rules(
+    rows: list[LOOperationalState],
+    *,
+    current_time: datetime,
+    freeze_window_minutes: int,
+    parameters: dict | None = None,
+) -> list[LOOperationalState]:
+    parameters = effective_parameters(parameters or {})
     horizon = _utc(current_time) + timedelta(minutes=max(0, freeze_window_minutes))
     frozen_groups: set[tuple[str, int]] = set()
     for row in rows:
+        setattr(row, "_soft_freeze_candidate", False)
         if row.status == "DONE":
             row.frozen, row.frozen_reason = True, "DONE"
         elif row.status == "ONGOING":
             row.frozen, row.frozen_reason = True, "ONGOING"
         elif row.status == "PLANNED" and row.planned_gate_out and _utc(row.planned_gate_out) <= horizon:
-            row.frozen, row.frozen_reason = True, "FREEZE_WINDOW"
+            if constraint_is_hard(parameters, "freeze_window"):
+                row.frozen, row.frozen_reason = True, "FREEZE_WINDOW"
+            else:
+                row.frozen, row.frozen_reason = False, None
+                setattr(row, "_soft_freeze_candidate", constraint_is_soft(parameters, "freeze_window"))
         else:
             row.frozen, row.frozen_reason = False, None
         if row.frozen and row.current_vehicle_id and row.current_trip_number is not None:
@@ -787,13 +965,15 @@ def apply_freeze_rules(rows: list[LOOperationalState], *, current_time: datetime
     return rows
 
 
-def validate_job(db: Session, job_id: str) -> dict:
+def validate_job(db: Session, job_id: str, parameters: dict | None = None) -> dict:
     job = _require_job(db, job_id)
     ensure_default_parameter_profiles(db)
+    parameters = effective_parameters(parameters or {})
     messages: list[dict] = []
     def add(code: str, level: str, message: str) -> None:
         messages.append({"code": code, "level": level, "message": message})
     lo_rows = db.scalars(select(LOOperationalState).where(LOOperationalState.job_id == job.job_id)).all()
+    depot = db.get(MasterDepot, job.depot_id)
     vehicles = db.scalars(select(VehicleOperationalState).where(VehicleOperationalState.job_id == job.job_id)).all()
     bays = db.scalars(select(MasterLoadingBay).where(MasterLoadingBay.depot_id == job.depot_id, MasterLoadingBay.active_status == "ACTIVE")).all()
     durations = {row.product_id for row in db.scalars(select(ProductCompartmentLoadingDuration).where(ProductCompartmentLoadingDuration.depot_id == job.depot_id, ProductCompartmentLoadingDuration.active_status == "ACTIVE")).all()}
@@ -803,15 +983,28 @@ def validate_job(db: Session, job_id: str) -> dict:
         add("LO_REQUIRED", "BLOCKED", "No Phase 7 LO has been imported.")
     if not vehicles:
         add("MT_REQUIRED", "BLOCKED", "Load MT from the selected depot master data.")
+    if not depot or depot.depot_operational_start is None or depot.depot_operational_end is None:
+        add("DEPOT_OPERATING_WINDOW_REQUIRED", "BLOCKED", "Master Depot must contain both depot_operational_start and depot_operational_end.")
+    if job.depot_operational_start is None or job.depot_operational_end is None:
+        add("JOB_DEPOT_OPERATING_WINDOW_REQUIRED", "BLOCKED", "Phase 7 Job is missing its Depot operating-window snapshot.")
     missing_eta = [row.registration_snapshot or row.mt_id for row in vehicles if row.operational_status != "UNAVAILABLE" and not (row.user_eta_override or row.system_eta_depot or row.planned_eta_depot)]
-    if missing_eta:
-        add("MT_ETA_REQUIRED", "BLOCKED", f"Planned ETA Depot is missing for {len(missing_eta)} available MT.")
+    if missing_eta and constraint_rule(parameters, "vehicle_availability").get("enabled", True):
+        add("MT_ETA_REQUIRED", "BLOCKED" if constraint_is_hard(parameters, "vehicle_availability") else "WARNING", f"Planned ETA Depot is missing for {len(missing_eta)} available MT.")
     if any(not row.spbu_id or not db.get(MasterSPBU, row.spbu_id) for row in lo_rows):
         add("SPBU_MAPPING_REQUIRED", "BLOCKED", "One or more LO does not map to canonical SPBU master data.")
+    missing_spbu_windows = {
+        row.spbu_id
+        for row in lo_rows
+        if row.spbu_id
+        and (spbu := db.get(MasterSPBU, row.spbu_id))
+        and (spbu.official_window_start is None or spbu.official_window_end is None)
+    }
+    if missing_spbu_windows:
+        add("SPBU_TIME_WINDOW_REQUIRED", "BLOCKED", f"Master SPBU is missing official_window_start or official_window_end for {len(missing_spbu_windows)} SPBU used by this Job.")
     if any(not row.product_id or not db.get(MasterProduct, row.product_id) for row in lo_rows):
         add("PRODUCT_MAPPING_REQUIRED", "BLOCKED", "One or more LO does not map to canonical product master data.")
-    if any(row.vehicle_class is None for row in vehicles):
-        add("VEHICLE_CLASS_REQUIRED", "BLOCKED", "Vehicle class is missing on one or more loaded MT.")
+    if any(row.vehicle_class is None for row in vehicles) and constraint_rule(parameters, "vehicle_compatibility").get("enabled", True):
+        add("VEHICLE_CLASS_REQUIRED", "BLOCKED" if constraint_is_hard(parameters, "vehicle_compatibility") else "WARNING", "Vehicle class is missing on one or more loaded MT.")
     if lo_rows and vehicles:
         spbu_ids = sorted({row.spbu_id for row in lo_rows if row.spbu_id})
         mt_ids = [row.mt_id for row in vehicles]
@@ -839,14 +1032,17 @@ def validate_job(db: Session, job_id: str) -> dict:
             )
             if not compatible:
                 incompatible_los.append(lo.loading_order_id)
-        if incompatible_los:
-            add("NO_COMPATIBLE_MT", "BLOCKED", f"No loaded active MT passes canonical vehicle-class/tag compatibility for {len(incompatible_los)} LO.")
+        if incompatible_los and constraint_rule(parameters, "vehicle_compatibility").get("enabled", True):
+            add("NO_COMPATIBLE_MT", "BLOCKED" if constraint_is_hard(parameters, "vehicle_compatibility") else "WARNING", f"No loaded active MT passes canonical vehicle-class/tag compatibility for {len(incompatible_los)} LO.")
     if any(not row.compartment_configuration or sum(float(item.get("capacity_kl") or 0) for item in row.compartment_configuration) + 1e-9 < row.capacity_kl for row in vehicles):
-        add("COMPARTMENT_CONFIGURATION_INVALID", "BLOCKED", "MT compartment configuration is missing or does not cover total capacity.")
+        compartment_hard = constraint_is_hard(parameters, "compartment_capacity") or constraint_is_hard(parameters, "compartment_product_separation")
+        compartment_enabled = constraint_rule(parameters, "compartment_capacity").get("enabled", True) or constraint_rule(parameters, "compartment_product_separation").get("enabled", True)
+        if compartment_enabled:
+            add("COMPARTMENT_CONFIGURATION_INVALID", "BLOCKED" if compartment_hard else "WARNING", "MT compartment configuration is missing or does not cover total capacity.")
     if not bays:
         add("BAY_CONFIGURATION_REQUIRED", "BLOCKED", "Configure at least one active loading bay for the depot.")
-    if bays and any(not bay.all_products_allowed and not db.scalar(select(func.count()).select_from(LoadingBayProductCompatibility).where(LoadingBayProductCompatibility.master_bay_id == bay.master_bay_id)) for bay in bays):
-        add("BAY_PRODUCT_COMPATIBILITY_REQUIRED", "BLOCKED", "Every restricted bay needs at least one allowed product.")
+    if bays and any(not bay.all_products_allowed and not db.scalar(select(func.count()).select_from(LoadingBayProductCompatibility).where(LoadingBayProductCompatibility.master_bay_id == bay.master_bay_id)) for bay in bays) and constraint_rule(parameters, "bay_product_compatibility").get("enabled", True):
+        add("BAY_PRODUCT_COMPATIBILITY_REQUIRED", "BLOCKED" if constraint_is_hard(parameters, "bay_product_compatibility") else "WARNING", "Every restricted bay needs at least one allowed product.")
     required_products = {row.product_id for row in lo_rows if row.product_id}
     missing_durations = required_products - durations
     if missing_durations:
@@ -893,14 +1089,22 @@ def _solver_inputs(db: Session, job: OptimizationJob, parameters: dict, *, curre
     day_start, operational_start, operational_end = _job_day(job, depot)
     rows = db.scalars(select(LOOperationalState).where(LOOperationalState.job_id == job.job_id).order_by(LOOperationalState.loading_order_id)).all()
     if reroute:
-        apply_freeze_rules(rows, current_time=current_time, freeze_window_minutes=int(parameters["freeze_window_minutes"]))
+        apply_freeze_rules(
+            rows,
+            current_time=current_time,
+            freeze_window_minutes=int(parameters["freeze_window_minutes"]),
+            parameters=parameters,
+        )
     else:
         for row in rows:
             row.frozen = row.status in {"ONGOING", "DONE"}
             row.frozen_reason = row.status if row.frozen else None
     optimizable = [row for row in rows if row.status == "PLANNED" and not row.frozen and not row.user_cancelled]
     vehicle_rows = db.scalars(select(VehicleOperationalState).where(VehicleOperationalState.job_id == job.job_id)).all()
+    working_time_limit = constraint_limit_minutes(parameters, "vehicle_working_time")
     for row in vehicle_rows:
+        row.working_time_limit_minutes = working_time_limit
+        row.working_time_remaining_minutes = max(0, working_time_limit - row.working_time_used_minutes)
         row.effective_eta_depot = row.user_eta_override or row.system_eta_depot or row.planned_eta_depot
     mts = {row.mt_id: db.get(MasterMT, row.mt_id) for row in vehicle_rows}
     spbu_ids = sorted({row.spbu_id for row in optimizable})
@@ -935,11 +1139,20 @@ def _solver_inputs(db: Session, job: OptimizationJob, parameters: dict, *, curre
             if key not in historical_pairing or calculated > historical_pairing[key][0]:
                 historical_pairing[key] = (calculated, float(row.support or 0))
     latest_assignment_by_lo: dict[str, RouteVersionLOAssignment] = {}
+    current_bay_by_trip: dict[str, str] = {}
     if job.current_route_version_id:
         latest_assignment_by_lo = {
             row.loading_order_id: row
             for row in db.scalars(
                 select(RouteVersionLOAssignment).where(RouteVersionLOAssignment.route_version_id == job.current_route_version_id)
+            ).all()
+        }
+        current_bay_by_trip = {
+            row.route_version_trip_id: row.master_bay_id
+            for row in db.scalars(
+                select(OptimizationBayAssignment).where(
+                    OptimizationBayAssignment.route_version_id == job.current_route_version_id
+                )
             ).all()
         }
     # A frozen trip is copied into the next immutable version. New solver
@@ -957,6 +1170,7 @@ def _solver_inputs(db: Session, job: OptimizationJob, parameters: dict, *, curre
     for matrix_node_index, row in enumerate(optimizable, start=1):
         spbu = spbus[row.spbu_id]
         allowed = []
+        violations_by_vehicle: dict[str, list[str]] = {}
         for vehicle in vehicle_rows:
             mt = mts[vehicle.mt_id]
             compatibility = evaluate_compatibility_entities(
@@ -968,8 +1182,17 @@ def _solver_inputs(db: Session, job: OptimizationJob, parameters: dict, *, curre
                 product_id=row.product_id,
                 vehicle_mode="MT_CAPACITY_LE_SPBU_LIMIT",
             )
-            if compatibility["compatible"] and float(vehicle.capacity_kl) + 1e-9 >= float(row.volume_kl):
-                allowed.append(vehicle.mt_id)
+            violations = []
+            if not compatibility["compatible"]:
+                violations.append("vehicle_compatibility")
+            if float(vehicle.capacity_kl) + 1e-9 < float(row.volume_kl):
+                violations.append("vehicle_capacity")
+            if vehicle.operational_status == "UNAVAILABLE":
+                violations.append("vehicle_availability")
+            violations_by_vehicle[vehicle.mt_id] = violations
+            if any(constraint_is_hard(parameters, constraint_id) for constraint_id in violations):
+                continue
+            allowed.append(vehicle.mt_id)
         start_minutes, end_minutes = None, None
         if spbu and spbu.official_window_start and spbu.official_window_end:
             zone = _timezone(depot)
@@ -1001,15 +1224,18 @@ def _solver_inputs(db: Session, job: OptimizationJob, parameters: dict, *, curre
                 "current_vehicle_id": row.current_vehicle_id,
                 "current_shipment_id": row.current_shipment_id,
                 "current_stop_sequence": latest_assignment_by_lo[row.loading_order_id].stop_sequence if row.loading_order_id in latest_assignment_by_lo else None,
+                "current_bay_id": current_bay_by_trip.get(latest_assignment_by_lo[row.loading_order_id].route_version_trip_id) if row.loading_order_id in latest_assignment_by_lo and latest_assignment_by_lo[row.loading_order_id].route_version_trip_id else None,
                 "current_planned_gate_out_minutes": (
                     round((_utc(row.planned_gate_out) - day_start).total_seconds() / 60)
                     if row.planned_gate_out else None
                 ),
                 "allowed_vehicle_ids": allowed,
+                "constraint_violations_by_vehicle": violations_by_vehicle,
                 "time_window_start_minutes": start_minutes,
                 "time_window_end_minutes": end_minutes,
                 "mandatory": True,
                 "user_cancelled": row.user_cancelled,
+                "freeze_window_candidate": bool(getattr(row, "_soft_freeze_candidate", False)),
             }
         )
     vehicles = [
@@ -1020,7 +1246,10 @@ def _solver_inputs(db: Session, job: OptimizationJob, parameters: dict, *, curre
             "tags": row.tag_snapshot,
             "capacity_kl": row.capacity_kl,
             "compartments": row.compartment_configuration,
-            "effective_eta_depot": max(_utc(row.effective_eta_depot), operational_start, _utc(current_time)) if row.effective_eta_depot else max(operational_start, _utc(current_time)),
+            "availability_eta_depot": _utc(row.effective_eta_depot) if row.effective_eta_depot else _utc(current_time),
+            "effective_eta_depot": max(_utc(row.effective_eta_depot), _utc(current_time)) if row.effective_eta_depot else _utc(current_time),
+            "optimization_reference_time": _utc(current_time),
+            "depot_operational_start": operational_start,
             "operational_status": row.operational_status,
             "working_time_limit_minutes": row.working_time_limit_minutes,
             "working_time_used_minutes": row.working_time_used_minutes,
@@ -1030,10 +1259,24 @@ def _solver_inputs(db: Session, job: OptimizationJob, parameters: dict, *, curre
         for row in vehicle_rows
     ]
     bay_config = get_bay_configuration(db, job.depot_id)
-    bays = [
-        {"master_bay_id": row["master_bay_id"], "all_products_allowed": row["all_products_allowed"], "allowed_product_ids": row["allowed_products"], "number_of_loading_arms": row["number_of_loading_arms"], "loading_mode": row["loading_mode"]}
-        for row in bay_config["bays"] if row["active_status"] == "ACTIVE"
-    ]
+    bays = []
+    zone = _timezone(depot)
+    for row in bay_config["bays"]:
+        if row["active_status"] != "ACTIVE":
+            continue
+        bay_open = datetime.combine(job.operating_date, time.fromisoformat(str(row["operational_start"])), tzinfo=zone).astimezone(timezone.utc)
+        bay_close = datetime.combine(job.operating_date, time.fromisoformat(str(row["operational_end"])), tzinfo=zone).astimezone(timezone.utc)
+        if bay_close <= bay_open:
+            bay_close += timedelta(days=1)
+        bays.append({
+            "master_bay_id": row["master_bay_id"],
+            "all_products_allowed": row["all_products_allowed"],
+            "allowed_product_ids": row["allowed_products"],
+            "number_of_loading_arms": row["number_of_loading_arms"],
+            "loading_mode": row["loading_mode"],
+            "operational_start_minutes": max(0, round((bay_open - day_start).total_seconds() / 60)),
+            "operational_end_minutes": max(0, round((bay_close - day_start).total_seconds() / 60)),
+        })
     actual = db.scalars(select(ActualBayState).where(ActualBayState.job_id == job.job_id)).all()
     queue = db.scalars(select(OptimizationInitialQueue).where(OptimizationInitialQueue.job_id == job.job_id)).all()
     return {
@@ -1052,12 +1295,26 @@ def _solver_inputs(db: Session, job: OptimizationJob, parameters: dict, *, curre
     }
 
 
-def _state_snapshot(db: Session, job: OptimizationJob, *, reason: str, actor: str) -> OperationalStateSnapshot:
+def _state_snapshot(
+    db: Session,
+    job: OptimizationJob,
+    *,
+    reason: str,
+    actor: str,
+    optimization_reference_time: datetime,
+    optimization_timezone: str,
+) -> OperationalStateSnapshot:
     lo_rows = list_job_los(db, job.job_id)
     vehicle_rows = list_job_vehicles(db, job.job_id)
     bay = get_actual_bay_state(db, job.job_id)
     current_version = db.get(RouteVersion, job.current_route_version_id) if job.current_route_version_id else None
-    audit_events = []
+    audit_events = [
+        {
+            "event": "OPTIMIZATION_REFERENCE_TIME",
+            "reference_time": _iso(optimization_reference_time),
+            "timezone": optimization_timezone,
+        }
+    ]
     if current_version:
         updated_lo = [row for row in lo_rows if (db.get(LOOperationalState, row["lo_state_id"]).updated_at or current_version.created_at) > current_version.created_at]
         updated_vehicle = db.scalars(select(ActualVehicleEvent).where(ActualVehicleEvent.job_id == job.job_id, ActualVehicleEvent.created_at > current_version.created_at)).all()
@@ -1109,9 +1366,9 @@ def _cost_breakdown(result: dict, vehicles: list[dict], parameters: dict) -> dic
     loading = sum(int(trip.get("loading_minutes") or 0) for trip in result["trips"]) * float(parameters["loading_cost"])
     overtime_minutes = sum(max(0, int(trip["operating_minutes"]) - int(vehicle_map[trip["vehicle_id"]]["working_time_remaining_minutes"])) for trip in result["trips"])
     overtime = overtime_minutes * float(parameters["overtime_cost"])
-    unserved = len(result["dropped"]) * float(parameters["unserved_penalty"])
-    phase6_changes = sum(assignment.get("phase6_predicted_vehicle_id") and assignment.get("phase6_predicted_vehicle_id") != trip["vehicle_id"] for trip in result["trips"] for assignment in trip["lo_assignments"])
-    penalties = unserved + phase6_changes * float(parameters["phase6_vehicle_change_penalty"])
+    unserved = len(result["dropped"]) * constraint_penalty(parameters, "serve_loading_order")
+    explicit_constraint_penalties = sum(float(trip.get("constraint_penalty_cost") or 0) for trip in result["trips"])
+    penalties = unserved + explicit_constraint_penalties
     total = activation + distance + operating + queue + loading + overtime + penalties
     total_kl = sum(float(row["volume_kl"]) for trip in result["trips"] for row in trip["lo_assignments"])
     total_distance_km = sum(trip["distance_meters"] for trip in result["trips"]) / 1000
@@ -1149,11 +1406,7 @@ def _trip_cost_breakdowns(result: dict, vehicles: list[dict], parameters: dict) 
         loading = int(trip.get("loading_minutes") or 0) * float(parameters["loading_cost"])
         overtime_minutes = max(0, int(trip["operating_minutes"]) - int(vehicle["working_time_remaining_minutes"]))
         overtime = overtime_minutes * float(parameters["overtime_cost"])
-        phase6_changes = sum(
-            bool(row.get("phase6_predicted_vehicle_id") and row["phase6_predicted_vehicle_id"] != trip["vehicle_id"])
-            for row in trip["lo_assignments"]
-        )
-        penalty = phase6_changes * float(parameters["phase6_vehicle_change_penalty"])
+        penalty = float(trip.get("constraint_penalty_cost") or 0)
         total = activation + distance + operating + queue + loading + overtime + penalty
         breakdowns[(trip["vehicle_id"], trip["trip_number"])] = {
             "vehicle_activation_cost": round(activation, 2),
@@ -1163,6 +1416,7 @@ def _trip_cost_breakdowns(result: dict, vehicles: list[dict], parameters: dict) 
             "loading_cost": round(loading, 2),
             "overtime_cost": round(overtime, 2),
             "penalty_cost": round(penalty, 2),
+            "constraint_violations": trip.get("constraint_violations") or [],
             "total_cost": round(total, 2),
         }
     return breakdowns
@@ -1224,6 +1478,10 @@ def _copy_frozen_plan(db: Session, job: OptimizationJob, version: RouteVersion, 
             route_geometry_source=old.route_geometry_source, cost_breakdown=old.cost_breakdown,
         )
         db.add(new)
+        # SessionLocal disables autoflush and these models use scalar FK ids
+        # rather than ORM relationships. Materialize the parent trip before
+        # any copied stop, LO assignment, or bay assignment can be flushed.
+        db.flush()
         trip_map[old.route_version_trip_id] = new
         for stop in db.scalars(select(RouteVersionStop).where(RouteVersionStop.route_version_trip_id == old.route_version_trip_id)).all():
             db.add(RouteVersionStop(route_version_stop_id=uuid.uuid4().hex, route_version_trip_id=new.route_version_trip_id, sequence_number=stop.sequence_number, stop_type=stop.stop_type, spbu_id=stop.spbu_id, arrival_time=stop.arrival_time, departure_time=stop.departure_time, service_minutes=stop.service_minutes, distance_from_previous_meters=stop.distance_from_previous_meters, travel_from_previous_seconds=stop.travel_from_previous_seconds, loading_order_ids=stop.loading_order_ids, products=stop.products, volume_kl=stop.volume_kl))
@@ -1247,6 +1505,9 @@ def _copy_frozen_plan(db: Session, job: OptimizationJob, version: RouteVersion, 
                 loading_minutes=old_bay.loading_minutes,
             )
             db.add(new_bay)
+            # Bay operations have the same scalar-id dependency. Persist the
+            # copied bay assignment before adding its operation rows.
+            db.flush()
             for operation in db.scalars(
                 select(OptimizationBayOperation).where(
                     OptimizationBayOperation.bay_assignment_id == old_bay.bay_assignment_id
@@ -1273,6 +1534,9 @@ def _copy_frozen_plan(db: Session, job: OptimizationJob, version: RouteVersion, 
         copied_ids.add(lo.loading_order_id)
         new_trip = trip_map.get(old.route_version_trip_id)
         db.add(RouteVersionLOAssignment(route_version_lo_assignment_id=uuid.uuid4().hex, route_version_id=version.route_version_id, route_version_trip_id=new_trip.route_version_trip_id if new_trip else None, loading_order_id=old.loading_order_id, vehicle_id=old.vehicle_id, trip_number=old.trip_number, shipment_id=old.shipment_id, compartment_id=old.compartment_id, spbu_id=old.spbu_id, product_id=old.product_id, volume_kl=old.volume_kl, stop_sequence=old.stop_sequence, planned_gate_out=old.planned_gate_out, eta=old.eta, frozen=True, assignment_status=lo.status, dropped_reason_code=old.dropped_reason_code, dropped_reason_description=old.dropped_reason_description, phase6_deviation=old.phase6_deviation))
+    # Keep the helper transactionally complete so downstream persistence does
+    # not inherit unresolved child rows from the frozen-plan copy.
+    db.flush()
     return list(trip_map.values()), copied_ids
 
 
@@ -1316,12 +1580,93 @@ def _summary(result: dict, all_rows: list[LOOperationalState], frozen_trips: lis
     }
 
 
-def run_optimization(db: Session, job_id: str, payload: dict, *, reroute: bool, actor: str = "local-user") -> dict:
-    job = _require_job(db, job_id)
-    if job.status == "CALCULATING":
+def _set_optimization_stage(
+    db: Session,
+    run: OptimizationRun,
+    *,
+    stage: str,
+    progress_pct: int,
+    metadata: dict | None = None,
+    commit: bool = True,
+) -> None:
+    run.solver_metadata = {
+        **(run.solver_metadata or {}),
+        **(metadata or {}),
+        "stage": stage,
+        "progress_pct": max(0, min(100, int(progress_pct))),
+        "stage_updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if commit:
+        db.commit()
+    else:
+        db.flush()
+
+
+def recover_interrupted_phase7_optimizations(db: Session) -> int:
+    """Fail in-process optimization rows left behind by an API restart."""
+    now = datetime.now(timezone.utc)
+    runs = db.scalars(select(OptimizationRun).where(OptimizationRun.status == "RUNNING")).all()
+    recovered_job_ids: set[str] = set()
+    for run in runs:
+        run.status = "FAILED"
+        run.solver_status = "FAILED"
+        run.end_time = now
+        run.solve_duration_ms = round((now - _utc(run.start_time)).total_seconds() * 1000) if run.start_time else 0
+        run.error_code = "PHASE7_PROCESS_INTERRUPTED"
+        run.error_message = "The API process stopped before Phase 7 optimization completed. Retry the optimization."
+        _set_optimization_stage(db, run, stage="INTERRUPTED", progress_pct=100, commit=False)
+        recovered_job_ids.add(run.job_id)
+    calculating_jobs = db.scalars(select(OptimizationJob).where(OptimizationJob.status == "CALCULATING")).all()
+    for job in calculating_jobs:
+        job.status = "FAILED"
+        job.error_message = "The previous Phase 7 optimization was interrupted by an API restart. Retry the optimization."
+        recovered_job_ids.add(job.job_id)
+    if runs or calculating_jobs:
+        db.commit()
+    return len(recovered_job_ids)
+
+
+def _prepare_optimization(
+    db: Session,
+    job_id: str,
+    payload: dict,
+    *,
+    reroute: bool,
+    allow_calculating: bool = False,
+    lock_job: bool = False,
+) -> dict:
+    if lock_job:
+        job = db.scalar(
+            select(OptimizationJob)
+            .where(OptimizationJob.job_id == job_id)
+            .with_for_update()
+        )
+        if not job:
+            job = db.scalar(
+                select(OptimizationJob)
+                .where(OptimizationJob.job_no == job_id)
+                .with_for_update()
+            )
+        if not job:
+            raise HTTPException(status_code=404, detail={"code": "PHASE7_JOB_NOT_FOUND", "message": "Phase 7 Job was not found."})
+    else:
+        job = _require_job(db, job_id)
+    if job.status == "CALCULATING" and not allow_calculating:
         raise HTTPException(status_code=409, detail={"code": "OPTIMIZATION_ALREADY_RUNNING", "message": "This Job is already calculating."})
+    if not reroute and job.current_route_version_id:
+        raise HTTPException(status_code=409, detail={"code": "INITIAL_OPTIMIZATION_ALREADY_COMPLETED", "message": "Initial optimization already exists. Use Re-Optimize Now to create the next immutable version."})
     if reroute and not job.current_route_version_id:
         raise HTTPException(status_code=409, detail={"code": "INITIAL_PLAN_REQUIRED", "message": "Run initial optimization before rerouting."})
+    depot = db.get(MasterDepot, job.depot_id)
+    initial_reference_time, latest_reference_time = _optimization_reference_context(db, job)
+    current_time = _normalize_optimization_reference_time(
+        job,
+        depot,
+        payload.get("current_time"),
+        reroute=reroute,
+        initial_reference_time=initial_reference_time,
+        latest_reference_time=latest_reference_time,
+    )
     current_lo_rows = db.scalars(select(LOOperationalState).where(LOOperationalState.job_id == job.job_id)).all()
     if current_lo_rows and all(row.status == "DONE" for row in current_lo_rows):
         job.status = "CLOSED"
@@ -1331,17 +1676,65 @@ def run_optimization(db: Session, job_id: str, payload: dict, *, reroute: bool, 
             status_code=409,
             detail={"code": "ALL_LO_DONE", "message": "All LO are DONE. The Job is closed and no new operational plan was created."},
         )
-    validation = validate_job(db, job.job_id)
-    if validation["status"] == "BLOCKED":
-        raise HTTPException(status_code=422, detail={"code": "JOB_VALIDATION_BLOCKED", "message": "Phase 7 Job validation is blocked.", "validation": validation})
     profile_id = payload.get("profile_id")
     profile_parameters = get_parameter_profile(db, profile_id)["parameters"] if profile_id else DEFAULT_PHASE7_PARAMETERS
     try:
         parameters = effective_parameters({**profile_parameters, **(payload.get("parameters") or {})})
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail={"code": "INVALID_PHASE7_PARAMETER", "message": str(exc)}) from exc
-    current_time = datetime.fromisoformat(str(payload["current_time"]).replace("Z", "+00:00")) if payload.get("current_time") else datetime.now(timezone.utc)
+    validation = validate_job(db, job.job_id, parameters)
+    if validation["status"] == "BLOCKED":
+        raise HTTPException(status_code=422, detail={"code": "JOB_VALIDATION_BLOCKED", "message": "Phase 7 Job validation is blocked.", "validation": validation})
     reason = str(payload.get("reason") or ("Reroute" if reroute else "Initial Plan"))
+    return {
+        "job": job,
+        "depot": depot,
+        "current_time": current_time,
+        "profile_id": profile_id,
+        "parameters": parameters,
+        "reason": reason,
+    }
+
+
+def enqueue_optimization(db: Session, job_id: str, payload: dict, *, reroute: bool) -> dict:
+    """Validate and reserve one Job before returning HTTP 202 to the UI."""
+    prepared = _prepare_optimization(db, job_id, payload, reroute=reroute, lock_job=True)
+    job = prepared["job"]
+    job.status = "CALCULATING"
+    job.error_message = None
+    db.commit()
+    return {
+        "job_id": job.job_id,
+        "job_no": job.job_no,
+        "status": job.status,
+        "run_type": "REROUTE" if reroute else "INITIAL",
+        "optimization_reference_time": _iso(prepared["current_time"]),
+        "message": "Phase 7 optimization was accepted and will continue in the background.",
+    }
+
+
+def run_optimization(
+    db: Session,
+    job_id: str,
+    payload: dict,
+    *,
+    reroute: bool,
+    actor: str = "local-user",
+    accepted: bool = False,
+) -> dict:
+    prepared = _prepare_optimization(
+        db,
+        job_id,
+        payload,
+        reroute=reroute,
+        allow_calculating=accepted,
+    )
+    job = prepared["job"]
+    depot = prepared["depot"]
+    current_time = prepared["current_time"]
+    profile_id = prepared["profile_id"]
+    parameters = prepared["parameters"]
+    reason = prepared["reason"]
     job.status = "CALCULATING"
     job.error_message = None
     db.commit()
@@ -1349,7 +1742,14 @@ def run_optimization(db: Session, job_id: str, payload: dict, *, reroute: bool, 
     optimization_run = None
     try:
         inputs = _solver_inputs(db, job, parameters, current_time=current_time, reroute=reroute)
-        state_snapshot = _state_snapshot(db, job, reason=reason, actor=actor)
+        state_snapshot = _state_snapshot(
+            db,
+            job,
+            reason=reason,
+            actor=actor,
+            optimization_reference_time=current_time,
+            optimization_timezone=_timezone(depot).key,
+        )
         parameter_snapshot = _parameter_snapshot(db, job, parameters, profile_id, actor=actor)
         optimization_run = OptimizationRun(
             optimization_run_id=uuid.uuid4().hex,
@@ -1358,9 +1758,23 @@ def run_optimization(db: Session, job_id: str, payload: dict, *, reroute: bool, 
             status="RUNNING",
             state_snapshot_id=state_snapshot.state_snapshot_id,
             parameter_snapshot_id=parameter_snapshot.parameter_snapshot_id,
+            optimization_reference_time=current_time,
             start_time=datetime.now(timezone.utc),
             solver_status="PENDING",
             objective=parameters["objective"],
+            solver_metadata={
+                "stage": "BUILDING_MATRIX",
+                "progress_pct": 5,
+                "optimization_reference_time": _iso(current_time),
+                "optimization_timezone": _timezone(depot).key,
+                "constraint_summary": {
+                    constraint_id: {
+                        **constraint_rule(parameters, constraint_id),
+                        "effective_penalty": constraint_penalty(parameters, constraint_id),
+                    }
+                    for constraint_id in CONSTRAINT_DEFINITIONS
+                },
+            },
         )
         db.add(optimization_run)
         db.flush()
@@ -1369,14 +1783,44 @@ def run_optimization(db: Session, job_id: str, payload: dict, *, reroute: bool, 
         # outcome instead of losing the run that failed.
         db.commit()
         matrix_service = RouteMatrixService(db, job_id=job.job_id)
+
+        def update_matrix_progress(progress: dict) -> None:
+            total_pairs = max(1, int(progress.get("total_unique_pairs") or 0))
+            completed_pairs = int(progress.get("completed_unique_pairs") or 0)
+            matrix_progress = 5 + round(35 * completed_pairs / total_pairs)
+            _set_optimization_stage(
+                db,
+                optimization_run,
+                stage="BUILDING_MATRIX",
+                progress_pct=matrix_progress,
+                metadata={"route_matrix_progress": progress},
+            )
+
         matrix = matrix_service.build(
-            depot=inputs["depot"], loading_orders=inputs["loading_orders"], spbus=inputs["spbus"], departure=max(current_time, inputs["operational_start"]), parameters=parameters
+            depot=inputs["depot"], loading_orders=inputs["loading_orders"], spbus=inputs["spbus"], departure=max(current_time, inputs["operational_start"]), parameters=parameters,
+            progress_callback=update_matrix_progress,
         ) if inputs["loading_orders"] else {"distance_matrix": [[0]], "time_matrix": [[0]], "geometry": {}, "metadata": {"location_count": 1, "pair_count": 0, "cache_hit_count": 0, "google_request_count": 0}}
+        # Matrix/cache work is a durable checkpoint. A later solver or result
+        # persistence failure must not force the next retry to rebuild it.
+        _set_optimization_stage(
+            db,
+            optimization_run,
+            stage="SOLVING_ROUTES",
+            progress_pct=45,
+            metadata={"route_matrix": matrix["metadata"]},
+        )
         result = OptimizationCoordinatorService().optimize(
             loading_orders=inputs["loading_orders"], vehicles=inputs["vehicles"], distance_matrix=matrix["distance_matrix"],
             time_matrix=matrix["time_matrix"], bays=inputs["bays"], actual_bay_states=inputs["actual_bay_states"],
             initial_queue=inputs["initial_queue"], loading_durations=inputs["loading_durations"], day_start=inputs["day_start"],
             depot_close=inputs["operational_end"], parameters=parameters,
+        )
+        _set_optimization_stage(
+            db,
+            optimization_run,
+            stage="PERSISTING_RESULT",
+            progress_pct=85,
+            metadata={"solver": result.get("solver_metadata") or {}},
         )
         end_of_day = _utc(current_time) >= _utc(inputs["operational_end"])
         if end_of_day:
@@ -1414,6 +1858,11 @@ def run_optimization(db: Session, job_id: str, payload: dict, *, reroute: bool, 
         frozen_rows = [row for row in inputs["all_lo_rows"] if row.frozen]
         frozen_trips, copied_frozen_ids = _copy_frozen_plan(db, job, route_version, frozen_rows)
         persisted_trips: list[RouteVersionTrip] = []
+        geometry_started = perf_counter()
+        geometry_request_budget = int(parameters.get("route_geometry_google_request_budget", 500))
+        geometry_time_limit = int(parameters.get("route_geometry_time_limit_seconds", 120))
+        geometry_google_requests = 0
+        geometry_cache_hits = 0
         for trip in result["trips"]:
             ordered_spbus = [
                 inputs["spbus"][stop["loading_order"]["spbu_id"]]
@@ -1424,8 +1873,14 @@ def run_optimization(db: Session, job_id: str, payload: dict, *, reroute: bool, 
                 depot=inputs["depot"],
                 ordered_spbus=ordered_spbus,
                 departure=trip["gate_out"],
-                parameters=parameters,
+                parameters={
+                    **parameters,
+                    "route_geometry_google_request_budget": max(0, geometry_request_budget - geometry_google_requests),
+                    "route_geometry_time_limit_seconds": max(0, round(geometry_time_limit - (perf_counter() - geometry_started))),
+                },
             )
+            geometry_google_requests += int(geometry.get("google_request_count") or 0)
+            geometry_cache_hits += int(geometry.get("cache_hit_count") or 0)
             entity = RouteVersionTrip(
                 route_version_trip_id=uuid.uuid4().hex, route_version_id=route_version.route_version_id, vehicle_id=trip["vehicle_id"], trip_number=trip["trip_number"], shipment_id=trip["shipment_id"],
                 vehicle_ready_at_depot=trip["vehicle_ready_at_depot"], queue_start=trip.get("queue_start"), loading_start=trip.get("loading_start"), loading_finish=trip.get("loading_finish"), gate_out=trip["gate_out"],
@@ -1453,9 +1908,10 @@ def run_optimization(db: Session, job_id: str, payload: dict, *, reroute: bool, 
             if trip.get("master_bay_id"):
                 bay_assignment = OptimizationBayAssignment(bay_assignment_id=uuid.uuid4().hex, route_version_id=route_version.route_version_id, route_version_trip_id=entity.route_version_trip_id, master_bay_id=trip["master_bay_id"], vehicle_ready_at_depot=trip["vehicle_ready_at_depot"], queue_start=trip["queue_start"], loading_start=trip["loading_start"], loading_finish=trip["loading_finish"], gate_out=trip["gate_out"], queue_minutes=trip["queue_minutes"], loading_minutes=trip["loading_minutes"])
                 db.add(bay_assignment)
-                product_by_compartment = {row["compartment_id"]: row.get("product_id") for row in trip["lo_assignments"]}
+                db.flush()
+                compartment_products = sorted({(row["compartment_id"], row.get("product_id")) for row in trip["lo_assignments"]})
                 operation_start = trip["loading_start"]
-                for compartment_id, product_id in product_by_compartment.items():
+                for compartment_id, product_id in compartment_products:
                     duration = int(inputs["loading_durations"].get(product_id, 0))
                     operation_finish = operation_start + timedelta(minutes=duration)
                     db.add(OptimizationBayOperation(bay_operation_id=uuid.uuid4().hex, bay_assignment_id=bay_assignment.bay_assignment_id, master_bay_id=trip["master_bay_id"], compartment_id=compartment_id, product_id=product_id, loading_start=operation_start, loading_finish=operation_finish, duration_minutes=duration, loading_mode=parameters["loading_mode"]))
@@ -1537,7 +1993,21 @@ def run_optimization(db: Session, job_id: str, payload: dict, *, reroute: bool, 
         optimization_run.solver_status = result["solver_status"]
         optimization_run.objective_value = result["objective_value"]
         optimization_run.coordination_iterations = result["coordination_iterations"]
-        optimization_run.solver_metadata = {**result["solver_metadata"], "route_matrix": matrix["metadata"]}
+        optimization_run.solver_metadata = {
+            **(optimization_run.solver_metadata or {}),
+            **result["solver_metadata"],
+            "solver": result["solver_metadata"],
+            "route_matrix": matrix["metadata"],
+            "route_geometry": {
+                "google_request_count": geometry_google_requests,
+                "cache_hit_count": geometry_cache_hits,
+                "request_budget": geometry_request_budget,
+                "duration_ms": round((perf_counter() - geometry_started) * 1000),
+            },
+            "stage": "COMPLETED",
+            "progress_pct": 100,
+            "stage_updated_at": datetime.now(timezone.utc).isoformat(),
+        }
         optimization_run.end_time = datetime.now(timezone.utc)
         optimization_run.solve_duration_ms = round((perf_counter() - started) * 1000)
         job.current_route_version_id = route_version.route_version_id
@@ -1559,6 +2029,12 @@ def run_optimization(db: Session, job_id: str, payload: dict, *, reroute: bool, 
                 run.solve_duration_ms = round((perf_counter() - started) * 1000)
                 run.error_code = "PHASE7_OPTIMIZATION_FAILED"
                 run.error_message = str(exc)
+                run.solver_metadata = {
+                    **(run.solver_metadata or {}),
+                    "stage": "FAILED",
+                    "progress_pct": 100,
+                    "stage_updated_at": datetime.now(timezone.utc).isoformat(),
+                }
         db.commit()
         logger.exception("Phase 7 optimization failed for job %s", job_id)
         if isinstance(exc, HTTPException):
@@ -1566,10 +2042,40 @@ def run_optimization(db: Session, job_id: str, payload: dict, *, reroute: bool, 
         raise HTTPException(status_code=500, detail={"code": "PHASE7_OPTIMIZATION_FAILED", "message": str(exc)}) from exc
 
 
+def run_optimization_background(job_id: str, payload: dict, *, reroute: bool, actor: str = "local-user") -> None:
+    """Run an accepted optimization with an independent database session."""
+    with SessionLocal() as db:
+        try:
+            run_optimization(db, job_id, payload, reroute=reroute, actor=actor, accepted=True)
+        except Exception as exc:  # the worker must persist a terminal state instead of leaking CALCULATING
+            db.rollback()
+            job = db.get(OptimizationJob, job_id)
+            if job and job.status == "CALCULATING":
+                detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+                if isinstance(detail, dict):
+                    message = str(detail.get("message") or detail)
+                else:
+                    message = str(detail)
+                job.status = "FAILED"
+                job.error_message = message
+                db.commit()
+            logger.exception("Phase 7 background optimization terminated for job %s", job_id)
+
+
 def list_route_versions(db: Session, job_id: str) -> list[dict]:
     job = _require_job(db, job_id)
     rows = db.scalars(select(RouteVersion).where(RouteVersion.job_id == job.job_id).order_by(desc(RouteVersion.version_number))).all()
-    return [{"route_version_id": row.route_version_id, "version_number": row.version_number, "version_label": row.version_label, "created_at": _iso(row.created_at), "created_by": row.created_by, "reason": row.reason, "objective": row.objective, "solver_status": row.solver_status, "objective_value": row.objective_value, "state_snapshot_id": row.state_snapshot_id, "parameter_snapshot_id": row.parameter_snapshot_id, "summary": row.summary_snapshot, "comparison": row.comparison_snapshot} for row in rows]
+    runs_by_version = {
+        run.route_version_id: run
+        for run in db.scalars(
+            select(OptimizationRun).where(
+                OptimizationRun.job_id == job.job_id,
+                OptimizationRun.route_version_id.is_not(None),
+            )
+        ).all()
+        if run.route_version_id
+    }
+    return [{"route_version_id": row.route_version_id, "version_number": row.version_number, "version_label": row.version_label, "created_at": _iso(row.created_at), "created_by": row.created_by, "reason": row.reason, "objective": row.objective, "solver_status": row.solver_status, "objective_value": row.objective_value, "optimization_reference_time": _iso(runs_by_version[row.route_version_id].optimization_reference_time or runs_by_version[row.route_version_id].start_time) if row.route_version_id in runs_by_version else None, "state_snapshot_id": row.state_snapshot_id, "parameter_snapshot_id": row.parameter_snapshot_id, "summary": row.summary_snapshot, "comparison": row.comparison_snapshot} for row in rows]
 
 
 def get_route_version(db: Session, job_id: str, version_id: str | None = None) -> dict:
@@ -1583,6 +2089,8 @@ def get_route_version(db: Session, job_id: str, version_id: str | None = None) -
     vehicles = {row.mt_id: row for row in db.scalars(select(MasterMT)).all()}
     spbu_ids = {row.spbu_id for row in assignments}
     spbus = {row.spbu_id: row for row in db.scalars(select(MasterSPBU).where(MasterSPBU.spbu_id.in_(spbu_ids))).all()} if spbu_ids else {}
+    product_ids = {row.product_id for row in assignments if row.product_id}
+    products = {row.product_id: row for row in db.scalars(select(MasterProduct).where(MasterProduct.product_id.in_(product_ids))).all()} if product_ids else {}
     stops_by_trip: dict[str, list[RouteVersionStop]] = defaultdict(list)
     assignments_by_trip: dict[str, list[RouteVersionLOAssignment]] = defaultdict(list)
     for row in stops:
@@ -1593,11 +2101,12 @@ def get_route_version(db: Session, job_id: str, version_id: str | None = None) -
     bay_by_trip = {row.route_version_trip_id: row for row in bays}
     trip_payload = []
     for trip in trips:
-        trip_payload.append({"route_version_trip_id": trip.route_version_trip_id, "vehicle_id": trip.vehicle_id, "registration": vehicles[trip.vehicle_id].vehicle_registration if trip.vehicle_id in vehicles else trip.vehicle_id, "trip_number": trip.trip_number, "shipment_id": trip.shipment_id, "vehicle_ready_at_depot": _iso(trip.vehicle_ready_at_depot), "queue_start": _iso(trip.queue_start), "loading_start": _iso(trip.loading_start), "loading_finish": _iso(trip.loading_finish), "gate_out": _iso(trip.gate_out), "return_depot": _iso(trip.estimated_return_depot), "distance_meters": trip.distance_meters, "travel_time_seconds": trip.driving_seconds, "service_seconds": trip.service_seconds, "queue_minutes": trip.queue_minutes, "loading_minutes": trip.loading_minutes, "operating_minutes": trip.operating_minutes, "assignment_status": trip.assignment_status, "route_geometry": trip.route_geometry, "route_geometry_source": trip.route_geometry_source, "cost_breakdown": trip.cost_breakdown or {}, "bay_assignment": {"master_bay_id": bay_by_trip[trip.route_version_trip_id].master_bay_id, "queue_minutes": bay_by_trip[trip.route_version_trip_id].queue_minutes} if trip.route_version_trip_id in bay_by_trip else None, "stops": [{"sequence": row.sequence_number, "spbu_id": row.spbu_id, "spbu_name": spbus[row.spbu_id].spbu_name if row.spbu_id in spbus else row.spbu_id, "latitude": float(spbus[row.spbu_id].latitude) if row.spbu_id in spbus and spbus[row.spbu_id].latitude is not None else None, "longitude": float(spbus[row.spbu_id].longitude) if row.spbu_id in spbus and spbus[row.spbu_id].longitude is not None else None, "arrival_time": _iso(row.arrival_time), "departure_time": _iso(row.departure_time), "service_minutes": row.service_minutes, "distance_from_previous_meters": row.distance_from_previous_meters, "travel_from_previous_seconds": row.travel_from_previous_seconds, "loading_order_ids": row.loading_order_ids, "products": row.products, "volume_kl": row.volume_kl} for row in stops_by_trip[trip.route_version_trip_id]], "loading_orders": [{"loading_order_id": row.loading_order_id, "spbu_id": row.spbu_id, "spbu_name": spbus[row.spbu_id].spbu_name if row.spbu_id in spbus else row.spbu_id, "product_id": row.product_id, "volume_kl": row.volume_kl, "compartment_id": row.compartment_id, "stop_sequence": row.stop_sequence, "eta": _iso(row.eta), "frozen": row.frozen, "status": row.assignment_status, "phase6_deviation": row.phase6_deviation} for row in assignments_by_trip[trip.route_version_trip_id]]})
-    dropped = [{"loading_order_id": row.loading_order_id, "spbu_id": row.spbu_id, "spbu": spbus[row.spbu_id].spbu_name if row.spbu_id in spbus else row.spbu_id, "product_id": row.product_id, "volume_kl": row.volume_kl, "reason_code": row.dropped_reason_code, "reason_description": row.dropped_reason_description, "route_version": version.version_label} for row in assignments if row.assignment_status == "DROPPED"]
+        trip_payload.append({"route_version_trip_id": trip.route_version_trip_id, "vehicle_id": trip.vehicle_id, "registration": vehicles[trip.vehicle_id].vehicle_registration if trip.vehicle_id in vehicles else trip.vehicle_id, "trip_number": trip.trip_number, "shipment_id": trip.shipment_id, "vehicle_ready_at_depot": _iso(trip.vehicle_ready_at_depot), "queue_start": _iso(trip.queue_start), "loading_start": _iso(trip.loading_start), "loading_finish": _iso(trip.loading_finish), "gate_out": _iso(trip.gate_out), "return_depot": _iso(trip.estimated_return_depot), "distance_meters": trip.distance_meters, "travel_time_seconds": trip.driving_seconds, "service_seconds": trip.service_seconds, "queue_minutes": trip.queue_minutes, "loading_minutes": trip.loading_minutes, "operating_minutes": trip.operating_minutes, "assignment_status": trip.assignment_status, "route_geometry": trip.route_geometry, "route_geometry_source": trip.route_geometry_source, "cost_breakdown": trip.cost_breakdown or {}, "bay_assignment": {"master_bay_id": bay_by_trip[trip.route_version_trip_id].master_bay_id, "queue_minutes": bay_by_trip[trip.route_version_trip_id].queue_minutes} if trip.route_version_trip_id in bay_by_trip else None, "stops": [{"sequence": row.sequence_number, "spbu_id": row.spbu_id, "spbu_name": spbus[row.spbu_id].spbu_name if row.spbu_id in spbus else row.spbu_id, "latitude": float(spbus[row.spbu_id].latitude) if row.spbu_id in spbus and spbus[row.spbu_id].latitude is not None else None, "longitude": float(spbus[row.spbu_id].longitude) if row.spbu_id in spbus and spbus[row.spbu_id].longitude is not None else None, "arrival_time": _iso(row.arrival_time), "departure_time": _iso(row.departure_time), "service_minutes": row.service_minutes, "distance_from_previous_meters": row.distance_from_previous_meters, "travel_from_previous_seconds": row.travel_from_previous_seconds, "loading_order_ids": row.loading_order_ids or [], "products": row.products or [], "product_names": [products[product_id].product_name if product_id in products else product_id for product_id in (row.products or []) if product_id], "volume_kl": row.volume_kl} for row in stops_by_trip[trip.route_version_trip_id]], "loading_orders": [{"loading_order_id": row.loading_order_id, "spbu_id": row.spbu_id, "spbu_name": spbus[row.spbu_id].spbu_name if row.spbu_id in spbus else row.spbu_id, "product_id": row.product_id, "product_name": products[row.product_id].product_name if row.product_id in products else row.product_id, "volume_kl": row.volume_kl, "compartment_id": row.compartment_id, "stop_sequence": row.stop_sequence, "eta": _iso(row.eta), "frozen": row.frozen, "status": row.assignment_status, "phase6_deviation": row.phase6_deviation} for row in assignments_by_trip[trip.route_version_trip_id]]})
+    dropped = [{"loading_order_id": row.loading_order_id, "spbu_id": row.spbu_id, "spbu": spbus[row.spbu_id].spbu_name if row.spbu_id in spbus else row.spbu_id, "product_id": row.product_id, "product_name": products[row.product_id].product_name if row.product_id in products else row.product_id, "volume_kl": row.volume_kl, "reason_code": row.dropped_reason_code, "reason_description": row.dropped_reason_description, "route_version": version.version_label} for row in assignments if row.assignment_status == "DROPPED"]
     snapshot = db.get(OperationalStateSnapshot, version.state_snapshot_id)
     parameters = db.get(OptimizationParameterSnapshot, version.parameter_snapshot_id)
-    return {"route_version_id": version.route_version_id, "version_number": version.version_number, "version_label": version.version_label, "created_at": _iso(version.created_at), "created_by": version.created_by, "reason": version.reason, "objective": version.objective, "solver_status": version.solver_status, "objective_value": version.objective_value, "first_gate_out": _iso(version.first_gate_out), "last_gate_out": _iso(version.last_gate_out), "depot_dispatch_span_minutes": version.depot_dispatch_span_minutes, "summary": version.summary_snapshot, "cost": version.cost_snapshot, "comparison": version.comparison_snapshot, "audit_events": snapshot.audit_events if snapshot else [], "parameter_snapshot": parameters.effective_parameters if parameters else {}, "parameter_checksum": parameters.parameter_checksum if parameters else None, "trips": trip_payload, "dropped_lo": dropped}
+    optimization_run = db.scalar(select(OptimizationRun).where(OptimizationRun.route_version_id == version.route_version_id))
+    return {"route_version_id": version.route_version_id, "version_number": version.version_number, "version_label": version.version_label, "created_at": _iso(version.created_at), "created_by": version.created_by, "reason": version.reason, "objective": version.objective, "solver_status": version.solver_status, "objective_value": version.objective_value, "optimization_reference_time": _iso(optimization_run.optimization_reference_time or optimization_run.start_time) if optimization_run else None, "first_gate_out": _iso(version.first_gate_out), "last_gate_out": _iso(version.last_gate_out), "depot_dispatch_span_minutes": version.depot_dispatch_span_minutes, "summary": version.summary_snapshot, "cost": version.cost_snapshot, "comparison": version.comparison_snapshot, "audit_events": snapshot.audit_events if snapshot else [], "parameter_snapshot": parameters.effective_parameters if parameters else {}, "parameter_checksum": parameters.parameter_checksum if parameters else None, "trips": trip_payload, "dropped_lo": dropped}
 
 
 def get_trip_details(db: Session, job_id: str, version_id: str, trip_id: str) -> dict:

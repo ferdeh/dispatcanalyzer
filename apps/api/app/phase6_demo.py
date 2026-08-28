@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 import secrets
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -84,6 +84,7 @@ def generate_demo_loading_orders(
     depot_id: str,
     model: MLBehavioralModel,
     total_order_kl: float,
+    loading_order_date: date,
     random_seed: int | None = None,
 ) -> tuple[bytes, str]:
     total = _positive_demo_total(
@@ -170,7 +171,12 @@ def generate_demo_loading_orders(
     rng = random.Random(seed)
     order_count = int(total / DEMO_LOADING_ORDER_UNIT_KL)
     token = f"{seed % 1_000_000:06d}"
-    planning_day = datetime.now(depot_timezone).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    planning_day = datetime(
+        loading_order_date.year,
+        loading_order_date.month,
+        loading_order_date.day,
+        tzinfo=depot_timezone,
+    )
     shift_by_name = {shift["name"]: shift for shift in shifts}
     demo_pool = [
         (spbu, assignment)

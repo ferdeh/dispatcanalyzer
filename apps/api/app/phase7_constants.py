@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 
 PHASE7_ALGORITHM_VERSION = "phase7.dynamic_multitrip_vrp_bay.v1"
 
@@ -8,6 +10,7 @@ LO_STATUSES = {"PLANNED", "ONGOING", "DONE"}
 MT_STATUSES = {"READY", "ON_TRIP", "RETURNING", "QUEUEING", "LOADING", "UNAVAILABLE"}
 SOLVER_STATUSES = {"OPTIMAL", "FEASIBLE", "PARTIAL", "INFEASIBLE", "TIME_LIMIT", "FAILED"}
 OBJECTIVES = {"MIN_TOTAL_COST", "MIN_TOTAL_DISTANCE", "MIN_TOTAL_OPERATING_TIME"}
+CONSTRAINT_MODES = {"HARD", "SOFT"}
 DROPPED_REASON_CODES = {
     "NO_COMPATIBLE_MT",
     "INSUFFICIENT_CAPACITY",
@@ -23,6 +26,239 @@ DROPPED_REASON_CODES = {
 }
 
 
+# Every item in this catalog is intentionally configurable.  Solver/data
+# integrity invariants (for example one persisted assignment row per LO) are
+# not exposed as business constraints and therefore cannot be disabled.
+CONSTRAINT_DEFINITIONS: dict[str, dict] = {
+    "vehicle_compatibility": {
+        "label": "MT–SPBU Compatibility",
+        "category": "ROUTING",
+        "description": "Vehicle class, canonical tag, and depot-compatible MT selection.",
+        "default_mode": "HARD",
+        "default_penalty": 2_000_000.0,
+    },
+    "vehicle_capacity": {
+        "label": "Vehicle Capacity",
+        "category": "ROUTING",
+        "description": "Total LO volume assigned to one MT trip must fit the MT capacity.",
+        "default_mode": "HARD",
+        "default_penalty": 2_000_000.0,
+    },
+    "compartment_capacity": {
+        "label": "Compartment Capacity",
+        "category": "COMPARTMENT",
+        "description": "Volume placed in a compartment must not exceed its capacity.",
+        "default_mode": "HARD",
+        "default_penalty": 2_000_000.0,
+    },
+    "compartment_product_separation": {
+        "label": "One Product per Compartment",
+        "category": "COMPARTMENT",
+        "description": "A compartment cannot mix more than one product.",
+        "default_mode": "HARD",
+        "default_penalty": 2_000_000.0,
+    },
+    "vehicle_availability": {
+        "label": "MT Availability / ETA",
+        "category": "TIME",
+        "description": "An MT may not depart before its effective depot ETA.",
+        "default_mode": "HARD",
+        "default_penalty": 1_000_000.0,
+    },
+    "vehicle_working_time": {
+        "label": "MT Working Time",
+        "category": "TIME",
+        "description": "MT working time runs from vehicle use/queue/loading through route completion and return to depot.",
+        "default_mode": "HARD",
+        "default_penalty": 500_000.0,
+        "default_limit_minutes": 720,
+        "legacy_penalty": "overtime_penalty",
+    },
+    "spbu_time_window": {
+        "label": "SPBU Receiving Window",
+        "category": "TIME",
+        "description": "Arrival must be within the official SPBU receiving window.",
+        "default_mode": "HARD",
+        "default_penalty": 250_000.0,
+        "legacy_penalty": "late_penalty",
+    },
+    "depot_operating_window": {
+        "label": "Depot Operating Window",
+        "category": "TIME",
+        "description": "Trip return and bay gate-out must stay inside depot operating hours.",
+        "default_mode": "HARD",
+        "default_penalty": 500_000.0,
+        "legacy_penalty": "overtime_penalty",
+    },
+    "freeze_window": {
+        "label": "Reroute Freeze Window",
+        "category": "REROUTE",
+        "description": "Near-term PLANNED trips retain their current operational assignment.",
+        "default_mode": "HARD",
+        "default_penalty": 200_000.0,
+        "legacy_penalty": "plan_change_penalty",
+    },
+    "bay_product_compatibility": {
+        "label": "Bay Product Compatibility",
+        "category": "BAY",
+        "description": "Every trip product must be allowed by the selected loading bay.",
+        "default_mode": "HARD",
+        "default_penalty": 1_000_000.0,
+    },
+    "bay_operating_window": {
+        "label": "Bay Operating Window",
+        "category": "BAY",
+        "description": "Loading and gate-out must stay inside the selected bay operating hours.",
+        "default_mode": "HARD",
+        "default_penalty": 500_000.0,
+    },
+    "bay_actual_queue": {
+        "label": "Actual Bay Occupancy & Queue",
+        "category": "BAY",
+        "description": "New loading starts after actual occupancy and physical queue reservations.",
+        "default_mode": "HARD",
+        "default_penalty": 25_000.0,
+        "legacy_penalty": "bay_queue_penalty",
+    },
+    "bay_no_overlap": {
+        "label": "Bay No Overlap",
+        "category": "BAY",
+        "description": "One bay cannot load overlapping trips.",
+        "default_mode": "HARD",
+        "default_penalty": 1_000_000.0,
+    },
+    "bay_change_stability": {
+        "label": "Previous Bay Stability",
+        "category": "REROUTE",
+        "description": "Retain the loading bay used by the current Phase 7 trip when feasible.",
+        "default_mode": "SOFT",
+        "default_penalty": 25_000.0,
+        "legacy_penalty": "bay_change_penalty",
+    },
+    "serve_loading_order": {
+        "label": "Serve Loading Order",
+        "category": "SERVICE",
+        "description": "Avoid leaving an eligible LO unserved.",
+        "default_mode": "SOFT",
+        "default_penalty": 10_000_000.0,
+        "legacy_penalty": "unserved_penalty",
+    },
+    "phase6_vehicle_preference": {
+        "label": "Phase 6 Vehicle Preference",
+        "category": "PREFERENCE",
+        "description": "Retain the MT predicted by the immutable Phase 6 warm start.",
+        "default_mode": "SOFT",
+        "default_penalty": 250_000.0,
+        "legacy_penalty": "phase6_vehicle_change_penalty",
+    },
+    "phase6_shipment_preference": {
+        "label": "Phase 6 Shipment Preference",
+        "category": "PREFERENCE",
+        "description": "Retain Phase 6 shipment grouping where feasible.",
+        "default_mode": "SOFT",
+        "default_penalty": 150_000.0,
+        "legacy_penalty": "phase6_shipment_change_penalty",
+    },
+    "historical_pairing_preference": {
+        "label": "Historical SPBU Pairing",
+        "category": "PREFERENCE",
+        "description": "Prefer SPBU combinations supported by Phase 3 history.",
+        "default_mode": "SOFT",
+        "default_penalty": 25_000.0,
+        "legacy_penalty": "historical_pairing_penalty",
+    },
+    "historical_mt_affinity_preference": {
+        "label": "Historical MT Affinity",
+        "category": "PREFERENCE",
+        "description": "Prefer MT–SPBU assignments supported by Phase 4 history.",
+        "default_mode": "SOFT",
+        "default_penalty": 25_000.0,
+        "legacy_penalty": "historical_mt_affinity_penalty",
+    },
+    "previous_vehicle_stability": {
+        "label": "Previous Vehicle Stability",
+        "category": "REROUTE",
+        "description": "Retain the current Phase 7 MT assignment during reroute.",
+        "default_mode": "SOFT",
+        "default_penalty": 150_000.0,
+        "legacy_penalty": "vehicle_reassignment_penalty",
+    },
+    "previous_shipment_stability": {
+        "label": "Previous Shipment Stability",
+        "category": "REROUTE",
+        "description": "Retain the current Phase 7 shipment grouping during reroute.",
+        "default_mode": "SOFT",
+        "default_penalty": 100_000.0,
+        "legacy_penalty": "shipment_change_penalty",
+    },
+    "route_sequence_stability": {
+        "label": "Route Sequence Stability",
+        "category": "REROUTE",
+        "description": "Avoid reversing the current stop sequence during reroute.",
+        "default_mode": "SOFT",
+        "default_penalty": 50_000.0,
+        "legacy_penalty": "route_sequence_change_penalty",
+    },
+    "gateout_stability": {
+        "label": "Gate-Out Stability",
+        "category": "REROUTE",
+        "description": "Keep the new gate-out close to the current operational plan.",
+        "default_mode": "SOFT",
+        "default_penalty": 50_000.0,
+        "legacy_penalty": "gateout_change_penalty",
+    },
+}
+
+
+def default_constraint_rules() -> dict[str, dict]:
+    return {
+        constraint_id: {
+            "enabled": True,
+            "mode": definition["default_mode"],
+            "penalty": float(definition["default_penalty"]),
+            **({"limit_minutes": int(definition["default_limit_minutes"])} if definition.get("default_limit_minutes") is not None else {}),
+        }
+        for constraint_id, definition in CONSTRAINT_DEFINITIONS.items()
+    }
+
+
+def constraint_catalog() -> list[dict]:
+    return [
+        {"constraint_id": constraint_id, **definition}
+        for constraint_id, definition in CONSTRAINT_DEFINITIONS.items()
+    ]
+
+
+def constraint_rule(parameters: dict, constraint_id: str) -> dict:
+    return (parameters.get("constraint_rules") or default_constraint_rules()).get(
+        constraint_id,
+        default_constraint_rules()[constraint_id],
+    )
+
+
+def constraint_is_hard(parameters: dict, constraint_id: str) -> bool:
+    rule = constraint_rule(parameters, constraint_id)
+    return bool(rule.get("enabled", True)) and rule.get("mode") == "HARD"
+
+
+def constraint_is_soft(parameters: dict, constraint_id: str) -> bool:
+    rule = constraint_rule(parameters, constraint_id)
+    return bool(rule.get("enabled", True)) and rule.get("mode") == "SOFT"
+
+
+def constraint_penalty(parameters: dict, constraint_id: str) -> int:
+    rule = constraint_rule(parameters, constraint_id)
+    if not bool(rule.get("enabled", True)) or rule.get("mode") != "SOFT":
+        return 0
+    return max(0, round(float(rule.get("penalty") or 0)))
+
+
+def constraint_limit_minutes(parameters: dict, constraint_id: str) -> int:
+    rule = constraint_rule(parameters, constraint_id)
+    definition = CONSTRAINT_DEFINITIONS[constraint_id]
+    return max(1, int(rule.get("limit_minutes") or definition.get("default_limit_minutes") or 1))
+
+
 DEFAULT_PHASE7_PARAMETERS: dict = {
     "objective": "MIN_TOTAL_COST",
     "freeze_window_minutes": 60,
@@ -32,7 +268,6 @@ DEFAULT_PHASE7_PARAMETERS: dict = {
     "departure_time_tolerance_minutes": 5,
     "return_time_tolerance_minutes": 5,
     "maximum_trips_per_mt": 6,
-    "default_vehicle_working_time_minutes": 720,
     "default_spbu_service_minutes": 30,
     "cost_per_km": 10_000.0,
     "cost_per_operating_hour": 50_000.0,
@@ -57,8 +292,13 @@ DEFAULT_PHASE7_PARAMETERS: dict = {
     "traffic_aware": True,
     "route_matrix_cache_enabled": True,
     "route_matrix_cache_ttl_minutes": 60,
+    "route_matrix_time_limit_seconds": 90,
+    "route_matrix_google_element_budget": 2500,
+    "route_geometry_time_limit_seconds": 120,
+    "route_geometry_google_request_budget": 500,
     "gate_process_time": 5,
     "loading_mode": "SEQUENTIAL",
+    "constraint_rules": default_constraint_rules(),
     "vehicle_activation_cost_rules": [
         {"vehicle_class": 8, "vehicle_tag": None, "activation_cost": 500_000.0, "priority": 10},
         {"vehicle_class": 16, "vehicle_tag": None, "activation_cost": 700_000.0, "priority": 10},
@@ -78,7 +318,53 @@ DEFAULT_PARAMETER_PROFILES = (
 
 
 def effective_parameters(overrides: dict | None = None) -> dict:
-    parameters = {**DEFAULT_PHASE7_PARAMETERS, **(overrides or {})}
+    overrides = overrides or {}
+    parameters = {**DEFAULT_PHASE7_PARAMETERS, **overrides}
+    # Removed legacy duplicate: the MT work limit now lives only on the
+    # vehicle_working_time constraint rule.
+    parameters.pop("default_vehicle_working_time_minutes", None)
+    supplied_rules = overrides.get("constraint_rules") or {}
+    if not isinstance(supplied_rules, dict):
+        raise ValueError("constraint_rules must be an object keyed by constraint id")
+    unknown = sorted(set(supplied_rules) - set(CONSTRAINT_DEFINITIONS))
+    if unknown:
+        raise ValueError(f"Unsupported Phase 7 constraint: {', '.join(unknown)}")
+    rules = default_constraint_rules()
+    legacy_penalty_values = {
+        definition["legacy_penalty"]: parameters.get(definition["legacy_penalty"])
+        for definition in CONSTRAINT_DEFINITIONS.values()
+        if definition.get("legacy_penalty")
+    }
+    for constraint_id, definition in CONSTRAINT_DEFINITIONS.items():
+        supplied = supplied_rules.get(constraint_id) or {}
+        if not isinstance(supplied, dict):
+            raise ValueError(f"constraint_rules.{constraint_id} must be an object")
+        mode = str(supplied.get("mode", rules[constraint_id]["mode"])).upper()
+        if mode not in CONSTRAINT_MODES:
+            raise ValueError(f"constraint_rules.{constraint_id}.mode must be HARD or SOFT")
+        legacy_key = definition.get("legacy_penalty")
+        penalty = supplied.get(
+            "penalty",
+            legacy_penalty_values.get(legacy_key, rules[constraint_id]["penalty"]) if legacy_key else rules[constraint_id]["penalty"],
+        )
+        penalty = float(penalty)
+        if not math.isfinite(penalty) or penalty < 0:
+            raise ValueError(f"constraint_rules.{constraint_id}.penalty must be a non-negative finite number")
+        rules[constraint_id] = {
+            "enabled": bool(supplied.get("enabled", rules[constraint_id]["enabled"])),
+            "mode": mode,
+            "penalty": penalty,
+            **(
+                {"limit_minutes": int(supplied.get("limit_minutes", rules[constraint_id]["limit_minutes"]))}
+                if "limit_minutes" in rules[constraint_id]
+                else {}
+            ),
+        }
+        if "limit_minutes" in rules[constraint_id] and not 1 <= int(rules[constraint_id]["limit_minutes"]) <= 2880:
+            raise ValueError(f"constraint_rules.{constraint_id}.limit_minutes must be between 1 and 2880")
+        if legacy_key:
+            parameters[legacy_key] = penalty
+    parameters["constraint_rules"] = rules
     if parameters["objective"] not in OBJECTIVES:
         raise ValueError(f"Unsupported Phase 7 objective: {parameters['objective']}")
     if str(parameters.get("route_vehicle_mode", "GENERAL_VEHICLE")).upper() not in {"GENERAL_VEHICLE", "TRUCK"}:
@@ -95,10 +381,13 @@ def effective_parameters(overrides: dict | None = None) -> dict:
         "departure_time_tolerance_minutes": (0, 240),
         "return_time_tolerance_minutes": (0, 240),
         "maximum_trips_per_mt": (1, 20),
-        "default_vehicle_working_time_minutes": (1, 2880),
         "default_spbu_service_minutes": (0, 1440),
         "gate_process_time": (0, 240),
         "route_matrix_cache_ttl_minutes": (1, 10080),
+        "route_matrix_time_limit_seconds": (1, 900),
+        "route_matrix_google_element_budget": (0, 3000),
+        "route_geometry_time_limit_seconds": (0, 300),
+        "route_geometry_google_request_budget": (0, 500),
     }
     for key, (minimum, maximum) in integer_bounds.items():
         value = int(parameters[key])

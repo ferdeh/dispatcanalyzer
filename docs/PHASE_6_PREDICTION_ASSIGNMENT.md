@@ -8,7 +8,7 @@ Setiap run terikat pada satu depot dan satu model `SAVED`/`ACTIVE`. Input, param
 
 ## Input dan Data Demo
 
-Loading Order workbook memuat `loading_order_no`, `shipment_start_datetime`, `spbu_no`, `product`, dan `order_quantity_kl`. Setiap LO wajib tepat 8 KL; total demo harus habis dibagi 8 dan sistem menghasilkan `total KL / 8` baris LO. Product yang diisi dipetakan terhadap `master_product` dan `product_alias`; identifier yang tidak dikenal atau product nonaktif menjadi blocking error. File legacy tanpa product tetap dapat dibaca, sedangkan Data Demo dan LO baru dari management selalu mengisi product canonical aktif.
+Loading Order workbook memuat `loading_order_no`, `shipment_start_datetime`, `spbu_no`, `product`, dan `order_quantity_kl`. Saat memilih Data Demo, user wajib menentukan tanggal Loading Order dan total KL. Setiap LO dibuat tepat 8 KL pada tanggal pilihan; jamnya tetap diturunkan dari shift snapshot model. Total demo harus habis dibagi 8 dan sistem menghasilkan `total KL / 8` baris LO. Product yang diisi dipetakan terhadap `master_product` dan `product_alias`; identifier yang tidak dikenal atau product nonaktif menjadi blocking error. File legacy tanpa product tetap dapat dibaca, sedangkan Data Demo dan LO baru dari management selalu mengisi product canonical aktif.
 
 Setelah upload manual atau pembuatan Data Demo divalidasi, UI membuka **Loading Order Management**. Tabel ini mendukung Add, Edit, Delete, pagination, filter per kolom—termasuk Product—dan sort per header. Pada form Add/Edit, nomor SPBU wajib dipilih dari dropdown Master SPBU aktif milik depot run dan Product wajib dipilih dari dropdown Master Product aktif; keduanya bukan free text. Mutation tidak hanya mengubah preview: backend membentuk ulang workbook LO aktif dan memvalidasinya kembali, sehingga snapshot yang dikirim ke Run Prediction selalu sama dengan isi terakhir tabel. Error hasil perubahan tetap memblokir Run Prediction melalui kontrak validator yang sama.
 
@@ -25,7 +25,7 @@ MT Availability tidak lagi diunggah manual atau dibuat melalui Data Demo. User m
 
 ## Grouping dan Exact Full-Load Assignment
 
-Algoritma `phase6.iterative_exact_capacity_assignment.v9` menjalankan empat tier secara berurutan:
+Algoritma `phase6.iterative_exact_capacity_assignment.v11` menjalankan empat tier secara berurutan:
 
 ```text
 32 KL = 4 LO = MT 4 kompartemen
@@ -34,7 +34,7 @@ Algoritma `phase6.iterative_exact_capacity_assignment.v9` menjalankan empat tier
  8 KL = 1 LO = MT 1 kompartemen
 ```
 
-Dalam setiap tier, `CAPACITY_TIME_ROUTE_SET_PACKING` menilai derived shift yang sama, maximum pairing gap, cluster dan historical pairing evidence, minimum confidence, master/tag compatibility, dan approximate route feasibility. MT harus lulus compatibility untuk seluruh SPBU dalam shipment.
+Dalam setiap tier, `CAPACITY_TIME_ROUTE_SET_PACKING` menilai derived shift yang sama, maximum pairing gap, cluster dan historical pairing evidence, minimum confidence, master/tag compatibility, rolling availability, dan approximate route feasibility. Optimizer hanya memilih grup dengan jumlah LO tepat sesuai tier dan yang mempunyai sedikitnya satu MT berkapasitas sama, compatible untuk seluruh SPBU, serta available dalam batas delay. Karena kelayakan armada masuk sebelum set-packing, grup yang tidak operasional tidak lagi menghalangi kombinasi alternatif pada tier yang sama.
 
 Hanya shipment berstatus `ASSIGNED` atau `ASSIGNED_WITH_DELAY` yang mengonsumsi LO. Jika kandidat 32 KL tidak menemukan MT 32 KL yang compatible dan available, grup dibongkar dan LO dicoba kembali pada tier 24 KL, kemudian 16 KL, lalu 8 KL. MT yang lebih besar tidak boleh menjalankan partial load.
 
@@ -78,6 +78,6 @@ Phase 6 mempertahankan `original_model_prediction` dan `final_dispatch_predictio
 ## Verifikasi
 
 - migration head: `0016_phase5_evidence_coverage`;
-- 65 backend tests dan 24 focused Phase 6 tests lulus;
+- focused Phase 6 regression suite berisi 31 tests dan seluruhnya lulus;
 - TypeScript dan Vite production build lulus;
 - API, worker, web, dan PostgreSQL berjalan sehat pada Docker Compose.

@@ -16,7 +16,7 @@ def evaluate_compatibility_entities(
     spbu_tag_ids: set[str] | None = None,
     tag_labels: dict[str, str] | None = None,
     product_id: str | None = None,
-    vehicle_mode: str = "EXACT_MATCH",
+    vehicle_mode: str = "MT_CAPACITY_LE_SPBU_LIMIT",
 ) -> dict:
     """Apply the canonical MT-SPBU rules to already-loaded master entities.
 
@@ -93,7 +93,13 @@ def evaluate_compatibility_entities(
     }
 
 
-def evaluate_mt_spbu_compatibility(db: Session, mt_id: str, spbu_id: str, product_id: str | None = None, vehicle_mode: str = "EXACT_MATCH") -> dict:
+def evaluate_mt_spbu_compatibility(
+    db: Session,
+    mt_id: str,
+    spbu_id: str,
+    product_id: str | None = None,
+    vehicle_mode: str = "MT_CAPACITY_LE_SPBU_LIMIT",
+) -> dict:
     mt = db.get(MasterMT, mt_id)
     spbu = db.get(MasterSPBU, spbu_id)
     mt_tag_ids = {row[0] for row in db.execute(select(BridgeMTTag.tag_id).where(BridgeMTTag.mt_id == mt_id)).all()}
@@ -111,7 +117,13 @@ def evaluate_mt_spbu_compatibility(db: Session, mt_id: str, spbu_id: str, produc
     )
 
 
-def build_depot_compatibility_matrix(db: Session, depot_id: str, *, vehicle_mode: str = "EXACT_MATCH", issue_limit: int = 25) -> dict:
+def build_depot_compatibility_matrix(
+    db: Session,
+    depot_id: str,
+    *,
+    vehicle_mode: str = "MT_CAPACITY_LE_SPBU_LIMIT",
+    issue_limit: int = 25,
+) -> dict:
     """Evaluate the active master assignment space for one depot in batched form."""
     mts = db.scalars(
         select(MasterMT).where(MasterMT.depot_id == depot_id, MasterMT.active_status == "ACTIVE").order_by(MasterMT.mt_id)

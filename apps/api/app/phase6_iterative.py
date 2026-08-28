@@ -1,15 +1,24 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 from time import perf_counter
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .config import get_settings
+from .compatibility import evaluate_compatibility_entities
 from .google_routes import GoogleRoutesError, get_google_routes_configuration
-from .models import MLBehavioralModel, MasterDepot, MasterMT, MasterSPBU, PredictionRun
-from .phase6_capacity import shipment_capacity
+from .models import (
+    BridgeMTTag,
+    BridgeSPBUTag,
+    MLBehavioralModel,
+    MasterDepot,
+    MasterMT,
+    MasterSPBU,
+    PredictionRun,
+)
+from .phase6_capacity import mt_compartment_profile, shipment_capacity
 from .phase6_inference import predict_mt_candidates, predict_shipments
 from .phase6_routing import Phase6RouteEstimationService
 
@@ -58,6 +67,36 @@ def build_iterative_capacity_plan(
         row.spbu_id: row
         for row in db.scalars(select(MasterSPBU).where(MasterSPBU.spbu_id.in_(spbu_ids))).all()
     } if spbu_ids else {}
+    mt_tags: dict[str, set[str]] = defaultdict(set)
+    spbu_tags: dict[str, set[str]] = defaultdict(set)
+    if vehicle_ids:
+        for mt_id, tag_id in db.execute(
+            select(BridgeMTTag.mt_id, BridgeMTTag.tag_id).where(BridgeMTTag.mt_id.in_(vehicle_ids))
+        ).all():
+            mt_tags[mt_id].add(tag_id)
+    if spbu_ids:
+        for spbu_id, tag_id in db.execute(
+            select(BridgeSPBUTag.spbu_id, BridgeSPBUTag.tag_id).where(BridgeSPBUTag.spbu_id.in_(spbu_ids))
+        ).all():
+            spbu_tags[spbu_id].add(tag_id)
+    mts_by_compartments: dict[int, list[MasterMT]] = defaultdict(list)
+    for mt in mts.values():
+        profile = mt_compartment_profile(mt)
+        if profile["valid"] and profile["effective_compartments"] is not None:
+            mts_by_compartments[int(profile["effective_compartments"])].append(mt)
+    for rows in mts_by_compartments.values():
+        rows.sort(key=lambda mt: (mt.vehicle_registration or mt.mt_id, mt.mt_id))
+    compatible_mt_ids_by_spbu: dict[str, set[str]] = defaultdict(set)
+    for spbu_id, spbu in spbus.items():
+        for mt in mts.values():
+            if evaluate_compatibility_entities(
+                mt,
+                spbu,
+                mt_tag_ids=mt_tags.get(mt.mt_id, set()),
+                spbu_tag_ids=spbu_tags.get(spbu_id, set()),
+                vehicle_mode=parameters["vehicle_compatibility_mode"],
+            )["compatible"]:
+                compatible_mt_ids_by_spbu[spbu_id].add(mt.mt_id)
     depot = db.get(MasterDepot, run.depot_id)
     configuration = get_google_routes_configuration(db)
     assert depot is not None and configuration is not None
@@ -95,7 +134,23 @@ def build_iterative_capacity_plan(
             continue
 
         considered_count = len(remaining)
-        tier_parameters = {**parameters, "maximum_shipment_compartments": tier}
+
+        def group_has_operational_mt(group_rows: list[dict]) -> bool:
+            planned = max(_utc(datetime.fromisoformat(row["shipment_start_datetime"])) for row in group_rows)
+            latest_eligible = planned + timedelta(minutes=allowed_delay if mode == "ALLOW_DELAY" else 0)
+            candidate_ids = {mt.mt_id for mt in mts_by_compartments.get(tier, [])}
+            for spbu_id in {row["spbu_id"] for row in group_rows}:
+                candidate_ids.intersection_update(compatible_mt_ids_by_spbu.get(spbu_id, set()))
+                if not candidate_ids:
+                    return False
+            return any(_utc(availability[mt_id]) <= latest_eligible for mt_id in candidate_ids)
+
+        tier_parameters = {
+            **parameters,
+            "maximum_shipment_compartments": tier,
+            "target_shipment_compartments": tier,
+            "_group_feasibility": group_has_operational_mt,
+        }
         started = perf_counter()
         partition = predict_shipments(list(remaining.values()), model, evidence, tier_parameters)
         shipment_prediction_seconds += perf_counter() - started
@@ -113,7 +168,7 @@ def build_iterative_capacity_plan(
             depot_id=run.depot_id,
             shipments=tier_predictions,
             availability=run.input_mt_availability_snapshot,
-            vehicle_compatibility_mode=get_settings().vehicle_compatibility_mode,
+            vehicle_compatibility_mode=parameters["vehicle_compatibility_mode"],
             require_full_utilization=True,
         )
         mt_prediction_seconds += perf_counter() - started

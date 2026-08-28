@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +48,7 @@ from .normalization import (
     resolve_sheet_name,
     source_int,
     source_number,
+    source_time,
     split_project_tags,
 )
 
@@ -277,6 +278,8 @@ class ImportProcessor:
                 "vehicle_type_tag": source_int(row.get("Vehicle Type tag")),
                 "project_tags": split_project_tags(row.get("Project tag")),
                 "depot_id": depot.depot_id if depot else None,
+                "official_window_start": source_time(row.get("Official Window Start"), time(0, 0)).isoformat(timespec="minutes"),
+                "official_window_end": source_time(row.get("Official Window End"), time(23, 59)).isoformat(timespec="minutes"),
             }
             status = "WARNING" if messages else "VALID"
             warnings += int(status == "WARNING")
@@ -306,6 +309,8 @@ class ImportProcessor:
                     "project_tag_raw": clean_str(row.get("Project tag")),
                     "primary_depot_id": depot.depot_id if depot else None,
                     "active_status": "ACTIVE",
+                    "official_window_start": source_time(row.get("Official Window Start"), time(0, 0)),
+                    "official_window_end": source_time(row.get("Official Window End"), time(23, 59)),
                     "source_import_id": audit.import_id,
                 },
             )

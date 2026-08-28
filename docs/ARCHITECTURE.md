@@ -39,6 +39,8 @@ Phase 6 run rows retain immutable input/model/routing/parameter/original-result 
 
 Phase 7 adds a depot/date-scoped operational control workspace without changing the Phase 6 source run. The selected completed Prediction Run is imported once: Phase 6 shipment, vehicle, pairing, and confidence remain immutable warm-start/soft-preference fields, while Phase 7 current shipment, vehicle, trip, compartment, stop, bay, and gate-out fields live in separate state/version tables.
 
+Phase 7 optimization endpoints use a short synchronous preflight followed by asynchronous execution. A successful Initial/Re-Optimize submission atomically sets `optimization_job.status=CALCULATING` and returns `202 Accepted`; FastAPI then runs matrix/solver/persistence as a background task with a fresh database session. The web app immediately returns to Job Management and polls calculating rows. Duplicate submissions and deletion are rejected while the reservation is active. Because this background executor is process-local rather than a durable external queue, API startup recovery converts orphaned `RUNNING`/`CALCULATING` work to auditable `FAILED/INTERRUPTED` state for an explicit retry.
+
 ```text
 Immutable Phase 6 run + current LO/MT/bay state + parameter snapshot
     → prebuilt Google Routes/master-fallback distance-time matrix

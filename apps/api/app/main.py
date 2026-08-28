@@ -9,7 +9,7 @@ import shutil
 import tempfile
 from collections import Counter
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, time
 from io import BytesIO, StringIO
 from pathlib import Path
 
@@ -50,12 +50,13 @@ from .models import (
     StgSPBU,
     TagAlias,
 )
-from .normalization import clean_str, infer_tag_type, make_id, normalize_key, normalize_product, parse_coordinate, parse_mt_name, source_int, source_number, split_project_tags
+from .normalization import clean_str, infer_tag_type, make_id, normalize_key, normalize_product, parse_coordinate, parse_mt_name, source_int, source_number, source_time, split_project_tags
 from .pairing_intelligence import build_pairing_date_availability, build_pairing_intelligence_payload
 from .phase5_behavioral import recover_interrupted_behavioral_training_runs
 from .phase5_routes import router as phase5_router
 from .phase6_routes import router as phase6_router
 from .phase7_routes import router as phase7_router
+from .phase7_service import recover_interrupted_phase7_optimizations
 from .google_routes_settings_routes import router as google_routes_settings_router
 from .tag_consistency import build_tag_consistency_payload, get_tag_consistency_detail
 
@@ -74,6 +75,13 @@ async def lifespan(_app: FastAPI):
         # Recovery must never turn a diagnostic cleanup into another app-load
         # failure. Normal endpoint database errors remain visible independently.
         logger.exception("Could not recover interrupted Phase 5 behavioral training runs during startup.")
+    try:
+        with SessionLocal() as db:
+            recovered = recover_interrupted_phase7_optimizations(db)
+        if recovered:
+            logger.warning("Recovered %s interrupted Phase 7 optimization job(s).", recovered)
+    except Exception:
+        logger.exception("Could not recover interrupted Phase 7 optimization runs during startup.")
     yield
 
 
@@ -136,7 +144,7 @@ class ShiftAnalysisRequest(BaseModel):
 
 IMPORT_TEMPLATE_COLUMNS = {
     "MOBIL_TANGKI": ["id", "name", "assignee", "hubId", "vehicleType tag", "project_tag", "numberOfCompartments", "Depot"],
-    "SPBU": ["Nama SPBU", "Address", "Kota", "Coordinate", "jarak_km", "waktu_menit", "Vehicle Type tag", "Project tag", "Depot"],
+    "SPBU": ["Nama SPBU", "Address", "Kota", "Coordinate", "jarak_km", "waktu_menit", "Vehicle Type tag", "Project tag", "Depot", "Official Window Start", "Official Window End"],
     "LOADING_ORDER": [
         "area_id",
         "area",
@@ -1182,6 +1190,8 @@ def crud_search_columns(domain: str) -> dict[str, object]:
             "vehicle_type_tag": MasterSPBU.vehicle_type_tag,
             "latitude": MasterSPBU.latitude,
             "longitude": MasterSPBU.longitude,
+            "official_window_start": MasterSPBU.official_window_start,
+            "official_window_end": MasterSPBU.official_window_end,
             "active_status": MasterSPBU.active_status,
         },
         "LOADING_ORDER": {
@@ -1205,6 +1215,8 @@ def crud_search_columns(domain: str) -> dict[str, object]:
             "longitude": MasterDepot.longitude,
             "region": MasterDepot.region,
             "timezone": MasterDepot.timezone,
+            "depot_operational_start": MasterDepot.depot_operational_start,
+            "depot_operational_end": MasterDepot.depot_operational_end,
             "active_status": MasterDepot.active_status,
         },
         "PRODUCT": {
@@ -1370,6 +1382,8 @@ def build_crud_record(domain: str, payload: dict):
             longitude=source_number(payload.get("longitude")),
             region=clean_str(payload.get("region")),
             timezone=clean_str(payload.get("timezone")) or "Asia/Jakarta",
+            depot_operational_start=source_time(payload.get("depot_operational_start"), time(0, 0)),
+            depot_operational_end=source_time(payload.get("depot_operational_end"), time(23, 59)),
             active_status=clean_str(payload.get("active_status")) or "ACTIVE",
         )
     if domain == "PRODUCT":
@@ -1430,6 +1444,8 @@ def build_crud_record(domain: str, payload: dict):
             project_tag_raw=clean_str(payload.get("project_tag_raw")),
             primary_depot_id=clean_str(payload.get("primary_depot_id")),
             active_status=clean_str(payload.get("active_status")) or "ACTIVE",
+            official_window_start=source_time(payload.get("official_window_start"), time(0, 0)),
+            official_window_end=source_time(payload.get("official_window_end"), time(23, 59)),
         )
     if domain == "LOADING_ORDER":
         source_depot_name = required_text(payload, "source_depot_name")
@@ -1454,12 +1470,12 @@ def build_crud_record(domain: str, payload: dict):
 
 def apply_crud_update(domain: str, record, payload: dict) -> None:
     allowed_fields = {
-        "DEPOT": ["depot_code", "depot_name", "latitude", "longitude", "region", "timezone", "active_status"],
+        "DEPOT": ["depot_code", "depot_name", "latitude", "longitude", "region", "timezone", "depot_operational_start", "depot_operational_end", "active_status"],
         "PRODUCT": ["product_name", "active_status"],
         "TAG_TYPE": ["code", "name", "description", "admin_editable"],
         "TAG": ["tag_type_id", "tag_value", "active_status"],
         "MOBIL_TANGKI": ["source_mt_id", "vehicle_name_raw", "vehicle_registration", "capacity_label", "vehicle_type_tag", "project_tag_raw", "number_of_compartments", "depot_id", "source_hub_id", "assignee", "active_status"],
-        "SPBU": ["spbu_code", "spbu_name", "address", "city", "latitude", "longitude", "source_coordinate", "master_distance_km", "master_travel_time_min", "vehicle_type_tag", "project_tag_raw", "primary_depot_id", "active_status"],
+        "SPBU": ["spbu_code", "spbu_name", "address", "city", "latitude", "longitude", "source_coordinate", "master_distance_km", "master_travel_time_min", "vehicle_type_tag", "project_tag_raw", "primary_depot_id", "official_window_start", "official_window_end", "active_status"],
         "LOADING_ORDER": ["shipment_id", "spbu_id", "spbu_mapping_status", "source_spbu_code", "shipto", "product_id", "source_product_name", "quantity", "status", "source_distance_km", "actual_km", "source_import_id"],
     }[domain]
     for field in allowed_fields:
@@ -1470,6 +1486,8 @@ def apply_crud_update(domain: str, record, payload: dict) -> None:
             value = source_number(value)
         elif field in {"number_of_compartments", "vehicle_type_tag"}:
             value = source_int(value)
+        elif field in {"official_window_start", "official_window_end", "depot_operational_start", "depot_operational_end"}:
+            value = source_time(value)
         elif field == "admin_editable":
             value = bool(value)
         else:
@@ -1978,6 +1996,8 @@ def build_spbu_export(db: Session, depot: MasterDepot) -> tuple[str, list[str], 
         "master_distance_km",
         "master_travel_time_min",
         "vehicle_type_tag",
+        "official_window_start",
+        "official_window_end",
         "active_status",
         "project_tags",
         "source_import_id",
@@ -1998,6 +2018,8 @@ def build_spbu_export(db: Session, depot: MasterDepot) -> tuple[str, list[str], 
             spbu.master_distance_km,
             spbu.master_travel_time_min,
             spbu.vehicle_type_tag,
+            spbu.official_window_start,
+            spbu.official_window_end,
             spbu.active_status,
             tag_lookup.get(spbu.spbu_id, ""),
             spbu.source_import_id,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 from io import BytesIO
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
@@ -57,6 +58,7 @@ class DemoLoadingOrderRequest(BaseModel):
     depot_id: str
     model_id: str
     total_order_kl: float = Field(gt=0, le=40000)
+    loading_order_date: date
 
 
 class DemoMTAvailabilityRequest(BaseModel):
@@ -175,6 +177,7 @@ def create_demo_loading_order_file(
         depot_id=request.depot_id,
         model=model,
         total_order_kl=request.total_order_kl,
+        loading_order_date=request.loading_order_date,
     )
     return _excel_response(content, filename)
 

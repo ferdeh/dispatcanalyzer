@@ -65,8 +65,9 @@ type CrudResponse = {
 type CrudField = {
   key: string;
   label: string;
-  kind?: "text" | "number" | "select" | "textarea" | "checkbox";
+  kind?: "text" | "number" | "select" | "textarea" | "checkbox" | "time";
   required?: boolean;
+  defaultValue?: string | number | boolean;
   readonlyOnEdit?: boolean;
   options?: Array<{ label: string; value: string }>;
 };
@@ -552,7 +553,7 @@ function crudConfigs(depots: Depot[], tagTypes: TagType[]): Record<string, CrudD
       idKey: "spbu_id",
       titleKey: "spbu_code",
       depotFilter: true,
-      columns: ["spbu_code", "city", "source_coordinate", "latitude", "longitude", ...spbuTagColumns, "active_status"],
+      columns: ["spbu_code", "city", "source_coordinate", "latitude", "longitude", "official_window_start", "official_window_end", ...spbuTagColumns, "active_status"],
       fields: [
         { key: "spbu_code", label: "SPBU Code", required: true },
         { key: "spbu_name", label: "Name" },
@@ -566,6 +567,8 @@ function crudConfigs(depots: Depot[], tagTypes: TagType[]): Record<string, CrudD
         { key: "vehicle_type_tag", label: "Tag Vehicle Class", kind: "number" },
         ...editableTagFields,
         { key: "primary_depot_id", label: "Depot", kind: "select", options: depotOptions },
+        { key: "official_window_start", label: "Official Window Start", kind: "time", required: true, defaultValue: "00:00" },
+        { key: "official_window_end", label: "Official Window End", kind: "time", required: true, defaultValue: "23:59" },
         { key: "active_status", label: "Status", kind: "select", options: statusOptions }
       ]
     },
@@ -594,7 +597,7 @@ function crudConfigs(depots: Depot[], tagTypes: TagType[]): Record<string, CrudD
       label: "Depot",
       idKey: "depot_id",
       titleKey: "depot_name",
-      columns: ["depot_code", "depot_name", "latitude", "longitude", "region", "timezone", "active_status"],
+      columns: ["depot_code", "depot_name", "latitude", "longitude", "region", "timezone", "depot_operational_start", "depot_operational_end", "active_status"],
       fields: [
         { key: "depot_code", label: "Depot Code" },
         { key: "depot_name", label: "Depot Name", required: true },
@@ -602,6 +605,8 @@ function crudConfigs(depots: Depot[], tagTypes: TagType[]): Record<string, CrudD
         { key: "longitude", label: "Longitude", kind: "number" },
         { key: "region", label: "Region" },
         { key: "timezone", label: "Timezone" },
+        { key: "depot_operational_start", label: "Operational Start", kind: "time", required: true, defaultValue: "00:00" },
+        { key: "depot_operational_end", label: "Operational End", kind: "time", required: true, defaultValue: "23:59" },
         { key: "active_status", label: "Status", kind: "select", options: statusOptions }
       ]
     },
@@ -1041,7 +1046,7 @@ function DepartureDatePicker({
 }
 
 function emptyCrudValues(config: CrudDomainConfig): Record<string, unknown> {
-  return Object.fromEntries(config.fields.map((field) => [field.key, field.kind === "checkbox" ? false : ""]));
+  return Object.fromEntries(config.fields.map((field) => [field.key, field.defaultValue ?? (field.kind === "checkbox" ? false : "")]));
 }
 
 function crudValuesFromRow(row: Record<string, unknown>, config: CrudDomainConfig): Record<string, unknown> {
@@ -3871,7 +3876,7 @@ function App() {
                               ) : (
                                 <input
                                   className="border border-line px-3 py-2 text-sm disabled:bg-slate-100"
-                                  type={field.kind === "number" ? "number" : "text"}
+                                  type={field.kind === "number" ? "number" : field.kind === "time" ? "time" : "text"}
                                   step={field.kind === "number" ? "any" : undefined}
                                   value={String(fieldValue)}
                                   disabled={fieldDisabled}

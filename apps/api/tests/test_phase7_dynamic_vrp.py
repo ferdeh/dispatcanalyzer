@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta, timezone
 
-from sqlalchemy import create_engine, select
+import pytest
+from fastapi import HTTPException
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -10,25 +12,49 @@ from app.models import (
     Base,
     LOOperationalState,
     MasterDepot,
+    MasterLoadingBay,
     MasterMT,
+    MasterProduct,
     MasterSPBU,
     OperationalStateSnapshot,
+    OptimizationBayAssignment,
+    OptimizationBayOperation,
     OptimizationJob,
     OptimizationParameterSnapshot,
+    OptimizationRun,
+    RouteAPIRequestLog,
+    RouteMatrixCache,
     RouteVersion,
     RouteVersionLOAssignment,
+    RouteVersionStop,
+    RouteVersionTrip,
     VehicleOperationalState,
 )
 from app.phase7_optimization import BayQueueOptimizationService, CompartmentAssignmentService, VRPOptimizationService
+from app.phase7_constants import constraint_catalog, constraint_is_hard, constraint_is_soft, constraint_limit_minutes, constraint_penalty, effective_parameters
 from app.phase7_matrix import RouteMatrixService
-from app.phase7_service import _comparison, _trip_cost_breakdowns, apply_freeze_rules, update_vehicle_states
+from app import phase7_service
+from app.phase7_service import (
+    _copy_frozen_plan,
+    _comparison,
+    _cost_breakdown,
+    _normalize_optimization_reference_time,
+    _trip_cost_breakdowns,
+    apply_freeze_rules,
+    delete_job,
+    delete_bay_configuration,
+    get_bay_configuration,
+    get_route_version,
+    recover_interrupted_phase7_optimizations,
+    update_vehicle_states,
+)
 
 
 DAY_START = datetime(2026, 8, 26, 0, 0, tzinfo=timezone.utc)
 
 
 def parameters(**overrides) -> dict:
-    return {
+    return effective_parameters({
         "objective": "MIN_TOTAL_DISTANCE",
         "default_spbu_service_minutes": 10,
         "optimization_time_limit": 1,
@@ -43,7 +69,196 @@ def parameters(**overrides) -> dict:
         "max_coordination_iterations": 3,
         "departure_time_tolerance_minutes": 5,
         **overrides,
-    }
+    })
+
+
+def constraint_override(constraint_id: str, *, enabled: bool = True, mode: str = "SOFT", penalty: float = 123_456) -> dict:
+    return {"constraint_rules": {constraint_id: {"enabled": enabled, "mode": mode, "penalty": penalty}}}
+
+
+def test_vehicle_working_time_limit_is_owned_by_the_constraint_rule() -> None:
+    configured = effective_parameters({
+        "default_vehicle_working_time_minutes": 999,
+        "constraint_rules": {
+            "vehicle_working_time": {
+                "enabled": True,
+                "mode": "HARD",
+                "penalty": 500_000,
+                "limit_minutes": 480,
+            }
+        },
+    })
+    assert "default_vehicle_working_time_minutes" not in configured
+    assert constraint_limit_minutes(configured, "vehicle_working_time") == 480
+
+
+def test_delete_job_cascades_workspace_and_preserves_detached_route_audit_log() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+
+    @event.listens_for(engine, "connect")
+    def enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as db:
+        db.add(MasterDepot(depot_id="D1", depot_name="Depot 1"))
+        db.flush()
+        db.add(OptimizationJob(job_id="JOB-DELETE", job_no="P7-JOB-DELETE", job_name="Delete Me", depot_id="D1", operating_date=date(2026, 8, 26)))
+        db.flush()
+        db.add(OperationalStateSnapshot(state_snapshot_id="SNAP-DELETE", job_id="JOB-DELETE", snapshot_reason="TEST"))
+        db.add(RouteAPIRequestLog(request_log_id="LOG-DELETE", job_id="JOB-DELETE", request_type="MATRIX", request_fingerprint="delete-test"))
+        db.commit()
+
+        result = delete_job(db, "JOB-DELETE")
+
+        assert result == {"job_id": "JOB-DELETE", "job_no": "P7-JOB-DELETE", "status": "DELETED"}
+        assert db.get(OptimizationJob, "JOB-DELETE") is None
+        assert db.get(OperationalStateSnapshot, "SNAP-DELETE") is None
+        assert db.get(RouteAPIRequestLog, "LOG-DELETE").job_id is None
+
+
+def test_delete_job_rejects_calculating_workspace() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as db:
+        db.add(MasterDepot(depot_id="D1", depot_name="Depot 1"))
+        db.add(OptimizationJob(job_id="JOB-RUNNING", job_no="P7-JOB-RUNNING", job_name="Running", depot_id="D1", operating_date=date(2026, 8, 26), status="CALCULATING"))
+        db.commit()
+
+        with pytest.raises(HTTPException) as raised:
+            delete_job(db, "JOB-RUNNING")
+
+        assert raised.value.status_code == 409
+        assert db.get(OptimizationJob, "JOB-RUNNING") is not None
+
+
+def test_route_version_exposes_canonical_product_name() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as db:
+        db.add(MasterDepot(depot_id="D1", depot_name="Depot 1"))
+        db.flush()
+        db.add_all([
+            MasterMT(mt_id="M1", vehicle_name_raw="MT 1", vehicle_registration="BK 1001 AA", depot_id="D1"),
+            MasterSPBU(spbu_id="S1", spbu_code="14200001", spbu_name="SPBU 1"),
+            MasterProduct(product_id="P-BIOSOLAR", product_name="Bio Solar", normalized_product="BIO SOLAR"),
+            OptimizationJob(job_id="JOB-PRODUCT", job_no="P7-JOB-PRODUCT", job_name="Product", depot_id="D1", operating_date=date(2026, 8, 26)),
+        ])
+        db.flush()
+        db.add_all([
+            OperationalStateSnapshot(state_snapshot_id="STATE-PRODUCT", job_id="JOB-PRODUCT", snapshot_reason="Initial"),
+            OptimizationParameterSnapshot(parameter_snapshot_id="PARAM-PRODUCT", job_id="JOB-PRODUCT", effective_parameters={}, parameter_checksum="product"),
+        ])
+        db.flush()
+        db.add(RouteVersion(route_version_id="VERSION-PRODUCT", job_id="JOB-PRODUCT", version_number=1, version_label="V1", reason="Initial", state_snapshot_id="STATE-PRODUCT", parameter_snapshot_id="PARAM-PRODUCT", objective="MIN_TOTAL_COST", solver_status="FEASIBLE"))
+        db.flush()
+        db.add(RouteVersionTrip(route_version_trip_id="TRIP-PRODUCT", route_version_id="VERSION-PRODUCT", vehicle_id="M1", trip_number=1, shipment_id="SHIP-1", vehicle_ready_at_depot=DAY_START, gate_out=DAY_START + timedelta(minutes=30), estimated_return_depot=DAY_START + timedelta(hours=2)))
+        db.flush()
+        db.add_all([
+            RouteVersionStop(route_version_stop_id="STOP-PRODUCT", route_version_trip_id="TRIP-PRODUCT", sequence_number=1, spbu_id="S1", loading_order_ids=["LO-1"], products=["P-BIOSOLAR"], volume_kl=8),
+            RouteVersionLOAssignment(route_version_lo_assignment_id="ASSIGN-PRODUCT", route_version_id="VERSION-PRODUCT", route_version_trip_id="TRIP-PRODUCT", loading_order_id="LO-1", vehicle_id="M1", trip_number=1, shipment_id="SHIP-1", compartment_id="C1", spbu_id="S1", product_id="P-BIOSOLAR", volume_kl=8, stop_sequence=1, assignment_status="PLANNED"),
+        ])
+        db.commit()
+
+        payload = get_route_version(db, "JOB-PRODUCT", "VERSION-PRODUCT")
+
+        assert payload["trips"][0]["loading_orders"][0]["product_id"] == "P-BIOSOLAR"
+        assert payload["trips"][0]["loading_orders"][0]["product_name"] == "Bio Solar"
+        assert payload["trips"][0]["stops"][0]["product_names"] == ["Bio Solar"]
+
+
+def test_enqueue_optimization_reserves_job_and_rejects_duplicate(monkeypatch: pytest.MonkeyPatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    monkeypatch.setattr(phase7_service, "validate_job", lambda *_args, **_kwargs: {"status": "READY", "messages": []})
+    with Session() as db:
+        db.add(MasterDepot(depot_id="D1", depot_name="Depot 1", timezone="Asia/Jakarta"))
+        db.add(OptimizationJob(job_id="JOB-ASYNC", job_no="P7-JOB-ASYNC", job_name="Async", depot_id="D1", operating_date=date(2026, 8, 26)))
+        db.commit()
+
+        accepted = phase7_service.enqueue_optimization(
+            db,
+            "JOB-ASYNC",
+            {"current_time": "2026-08-26T08:00:00", "parameters": {}},
+            reroute=False,
+        )
+
+        assert accepted["status"] == "CALCULATING"
+        assert accepted["run_type"] == "INITIAL"
+        assert accepted["optimization_reference_time"] == "2026-08-26T01:00:00+00:00"
+        assert db.get(OptimizationJob, "JOB-ASYNC").status == "CALCULATING"
+
+        with pytest.raises(HTTPException) as raised:
+            phase7_service.enqueue_optimization(
+                db,
+                "JOB-ASYNC",
+                {"current_time": "2026-08-26T08:01:00", "parameters": {}},
+                reroute=False,
+            )
+        assert raised.value.status_code == 409
+        assert raised.value.detail["code"] == "OPTIMIZATION_ALREADY_RUNNING"
+
+
+def test_delete_bay_soft_deletes_master_without_exposing_it_in_configuration() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as db:
+        db.add(MasterDepot(depot_id="D1", depot_name="Depot 1"))
+        db.flush()
+        db.add(MasterLoadingBay(master_bay_id="B1", depot_id="D1", bay_id="BAY-1", bay_name="Bay 1"))
+        db.commit()
+
+        result = delete_bay_configuration(db, "D1", "B1")
+
+        assert result == {"master_bay_id": "B1", "bay_id": "BAY-1", "status": "DELETED"}
+        assert db.get(MasterLoadingBay, "B1").active_status == "DELETED"
+        assert get_bay_configuration(db, "D1")["bays"] == []
+
+
+def test_constraint_registry_applies_penalty_only_to_enabled_soft_rules() -> None:
+    for definition in constraint_catalog():
+        assert definition["default_mode"] in {"HARD", "SOFT"}
+    soft = effective_parameters(constraint_override("vehicle_capacity", mode="SOFT", penalty=321_000))
+    assert constraint_is_soft(soft, "vehicle_capacity")
+    assert constraint_penalty(soft, "vehicle_capacity") == 321_000
+    hard = effective_parameters(constraint_override("vehicle_capacity", mode="HARD", penalty=321_000))
+    assert constraint_is_hard(hard, "vehicle_capacity")
+    assert constraint_penalty(hard, "vehicle_capacity") == 0
+    disabled = effective_parameters(constraint_override("vehicle_capacity", enabled=False, mode="SOFT", penalty=321_000))
+    assert not constraint_is_hard(disabled, "vehicle_capacity")
+    assert not constraint_is_soft(disabled, "vehicle_capacity")
+    assert constraint_penalty(disabled, "vehicle_capacity") == 0
+
+
+def test_compartment_product_constraint_can_be_soft_or_disabled() -> None:
+    loading_orders = [
+        {"loading_order_id": "LO-1", "product_id": "PERTALITE", "volume_kl": 4},
+        {"loading_order_id": "LO-2", "product_id": "BIOSOLAR", "volume_kl": 4},
+    ]
+    compartments = [{"compartment_id": "C1", "capacity_kl": 8}]
+    soft = CompartmentAssignmentService().assign(
+        loading_orders,
+        compartments,
+        parameters=parameters(**constraint_override("compartment_product_separation", mode="SOFT", penalty=777_000)),
+    )
+    assert soft["feasible"] is True
+    assert any(row["constraint_id"] == "compartment_product_separation" for row in soft["constraint_violations"])
+    assert soft["penalty_cost"] == 777_000
+    disabled = CompartmentAssignmentService().assign(
+        loading_orders,
+        compartments,
+        parameters=parameters(**constraint_override("compartment_product_separation", enabled=False, penalty=777_000)),
+    )
+    assert disabled["feasible"] is True
+    assert disabled["constraint_violations"] == []
+    assert disabled["penalty_cost"] == 0
 
 
 def vehicle(mt_id: str, *, eta_hour: int = 5, capacity: float = 8, compartments: int = 1) -> dict:
@@ -131,6 +346,59 @@ def test_d_vehicle_availability_prevents_early_departure() -> None:
     assert result["trips"][0]["gate_out"] >= DAY_START + timedelta(hours=10)
 
 
+def test_vehicle_availability_can_be_soft_or_disabled() -> None:
+    lo = loading_order("LO-1", "S1")
+    lo.update({"time_window_start_minutes": 0, "time_window_end_minutes": 120})
+    common = {
+        "loading_orders": [lo],
+        "vehicles": [vehicle("M1", eta_hour=10)],
+        "distance_matrix": [[0, 10_000], [10_000, 0]],
+        "time_matrix": [[0, 1_200], [1_200, 0]],
+        "day_start": DAY_START,
+        "depot_close": DAY_START + timedelta(hours=18),
+    }
+    soft = VRPOptimizationService().solve(
+        **common,
+        parameters=parameters(**constraint_override("vehicle_availability", mode="SOFT", penalty=1_000)),
+    )
+    assert soft["trips"][0]["vehicle_ready_at_depot"] < DAY_START + timedelta(hours=10)
+    assert any(row["constraint_id"] == "vehicle_availability" for row in soft["trips"][0]["constraint_violations"])
+    disabled = VRPOptimizationService().solve(
+        **common,
+        parameters=parameters(**constraint_override("vehicle_availability", enabled=False, penalty=1_000)),
+    )
+    assert disabled["trips"][0]["vehicle_ready_at_depot"] < DAY_START + timedelta(hours=10)
+    assert not any(row["constraint_id"] == "vehicle_availability" for row in disabled["trips"][0]["constraint_violations"])
+
+
+def test_vehicle_capacity_can_be_soft_or_disabled() -> None:
+    overloaded_vehicle = vehicle("M1", capacity=8)
+    overloaded_vehicle["compartments"] = [
+        {"compartment_id": "C1", "capacity_kl": 8},
+        {"compartment_id": "C2", "capacity_kl": 8},
+    ]
+    common = {
+        "loading_orders": [loading_order("LO-1", "S1"), loading_order("LO-2", "S2")],
+        "vehicles": [overloaded_vehicle],
+        "distance_matrix": [[0, 10_000, 12_000], [10_000, 0, 5_000], [12_000, 5_000, 0]],
+        "time_matrix": [[0, 1_200, 1_500], [1_200, 0, 600], [1_500, 600, 0]],
+        "day_start": DAY_START,
+        "depot_close": DAY_START + timedelta(hours=18),
+    }
+    soft = VRPOptimizationService().solve(
+        **common,
+        parameters=parameters(maximum_trips_per_mt=1, **constraint_override("vehicle_capacity", mode="SOFT", penalty=1_000)),
+    )
+    assert len(soft["trips"][0]["lo_assignments"]) == 2
+    assert any(row["constraint_id"] == "vehicle_capacity" for row in soft["trips"][0]["constraint_violations"])
+    disabled = VRPOptimizationService().solve(
+        **common,
+        parameters=parameters(maximum_trips_per_mt=1, **constraint_override("vehicle_capacity", enabled=False, penalty=1_000)),
+    )
+    assert len(disabled["trips"][0]["lo_assignments"]) == 2
+    assert not any(row["constraint_id"] == "vehicle_capacity" for row in disabled["trips"][0]["constraint_violations"])
+
+
 def lo_state(lo_id: str, *, status: str, gate_out: datetime | None = None) -> LOOperationalState:
     return LOOperationalState(
         lo_state_id=lo_id,
@@ -185,6 +453,34 @@ def test_h_bay_product_compatibility_is_hard() -> None:
         parameters=parameters(),
     )
     assert result["dropped_trip_indexes"] == [0]
+
+
+def test_bay_product_compatibility_can_be_soft_or_disabled() -> None:
+    trip = {
+        "vehicle_ready_at_depot": DAY_START + timedelta(hours=5),
+        "lo_assignments": [{"loading_order_id": "LO-1", "compartment_id": "C1", "product_id": "BIOSOLAR", "volume_kl": 8}],
+    }
+    common = {
+        "trips": [trip],
+        "bays": [{"master_bay_id": "B1", "all_products_allowed": False, "allowed_product_ids": ["PERTALITE"], "number_of_loading_arms": 1, "loading_mode": "SEQUENTIAL"}],
+        "actual_states": [],
+        "initial_queue": [],
+        "loading_durations": {"BIOSOLAR": 10},
+        "day_start": DAY_START,
+        "depot_close": DAY_START + timedelta(hours=18),
+    }
+    soft = BayQueueOptimizationService().schedule(
+        **common,
+        parameters=parameters(**constraint_override("bay_product_compatibility", mode="SOFT", penalty=654_000)),
+    )
+    assert soft["dropped_trip_indexes"] == []
+    assert any(row["constraint_id"] == "bay_product_compatibility" for row in soft["assignments"][0]["constraint_violations"])
+    disabled = BayQueueOptimizationService().schedule(
+        **common,
+        parameters=parameters(**constraint_override("bay_product_compatibility", enabled=False, penalty=654_000)),
+    )
+    assert disabled["dropped_trip_indexes"] == []
+    assert disabled["assignments"][0]["constraint_violations"] == []
 
 
 def test_i_initial_queue_delays_future_gate_out() -> None:
@@ -290,6 +586,55 @@ def test_n_final_route_geometry_materializes_depot_stop_depot_without_callback_e
         assert result["route_geometry_source"] == "MIXED_OR_MASTER_FALLBACK"
 
 
+def test_n2_final_route_geometry_uses_one_road_request_with_ordered_intermediates() -> None:
+    class StubRoadClient:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def compute_route(self, **kwargs):
+            self.calls.append(kwargs)
+            return {
+                "distance_meters": 25_000,
+                "duration_seconds": 2_400,
+                "route_geometry": [
+                    {"latitude": 3.59, "longitude": 98.67},
+                    {"latitude": 3.62, "longitude": 98.69},
+                    {"latitude": 3.65, "longitude": 98.72},
+                    {"latitude": 3.68, "longitude": 98.74},
+                    {"latitude": 3.59, "longitude": 98.67},
+                ],
+                "route_geometry_source": "GOOGLE_ROUTES_GEOJSON",
+            }
+
+    engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as db:
+        depot = MasterDepot(depot_id="D1", depot_name="Depot", latitude=3.59, longitude=98.67)
+        first = MasterSPBU(spbu_id="S1", spbu_code="S1", spbu_name="SPBU 1", latitude=3.65, longitude=98.72)
+        second = MasterSPBU(spbu_id="S2", spbu_code="S2", spbu_name="SPBU 2", latitude=3.68, longitude=98.74)
+        db.add_all([depot, first, second])
+        db.commit()
+        service = RouteMatrixService(db)
+        client = StubRoadClient()
+        service.client = client
+
+        result = service.build_route_geometry(
+            depot=depot,
+            ordered_spbus=[first, second],
+            departure=DAY_START + timedelta(hours=5),
+            parameters={"route_vehicle_mode": "GENERAL_VEHICLE", "traffic_aware": True, "route_geometry_google_request_budget": 1, "route_geometry_time_limit_seconds": 30},
+        )
+
+        assert result["route_geometry_source"] == "GOOGLE_ROUTES_GEOJSON"
+        assert result["geometry_strategy"] == "SINGLE_ROUTE_WITH_INTERMEDIATES"
+        assert result["google_request_count"] == 1
+        assert len(client.calls) == 1
+        assert client.calls[0]["origin"] == (3.59, 98.67)
+        assert client.calls[0]["intermediates"] == [(3.65, 98.72), (3.68, 98.74)]
+        assert client.calls[0]["destination"] == (3.59, 98.67)
+
+
 def test_o_new_trip_numbers_continue_after_copied_frozen_trip_number() -> None:
     mt = vehicle("M1")
     mt["completed_trip_count"] = 2
@@ -376,3 +721,346 @@ def test_r_plan_stability_counts_material_gate_out_changes() -> None:
         assert comparison["route_sequence_changes"] == 1
         assert comparison["gate_out_changes"] == 1
         assert comparison["plan_adherence_pct"] == 0
+
+
+def test_s_matrix_build_deduplicates_lo_locations_and_batches_google_elements() -> None:
+    class StubGoogleRoutesClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[int, int]] = []
+
+        def compute_route_matrix_batch(self, *, origins, destinations, departure_datetime):
+            self.calls.append((len(origins), len(destinations)))
+            return [
+                {
+                    "originIndex": origin_index,
+                    "destinationIndex": destination_index,
+                    "condition": "ROUTE_EXISTS",
+                    "distanceMeters": 10_000 + origin_index * 100 + destination_index,
+                    "duration": "1200s",
+                    "status": {},
+                }
+                for origin_index in range(len(origins))
+                for destination_index in range(len(destinations))
+            ]
+
+    engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as db:
+        depot = MasterDepot(depot_id="D1", depot_name="Depot", latitude=3.59, longitude=98.67)
+        spbus = {
+            "S1": MasterSPBU(spbu_id="S1", spbu_code="S1", spbu_name="SPBU 1", latitude=3.65, longitude=98.72),
+            "S2": MasterSPBU(spbu_id="S2", spbu_code="S2", spbu_name="SPBU 2", latitude=3.70, longitude=98.77),
+        }
+        db.add_all([depot, *spbus.values()])
+        db.commit()
+        service = RouteMatrixService(db)
+        client = StubGoogleRoutesClient()
+        service.client = client
+        progress: list[dict] = []
+        result = service.build(
+            depot=depot,
+            loading_orders=[{"loading_order_id": f"LO-{index}", "spbu_id": "S1" if index % 2 else "S2"} for index in range(1, 101)],
+            spbus=spbus,
+            departure=DAY_START + timedelta(hours=5),
+            parameters={
+                "route_matrix_cache_enabled": True,
+                "route_matrix_cache_ttl_minutes": 60,
+                "route_vehicle_mode": "GENERAL_VEHICLE",
+                "traffic_aware": True,
+                "route_matrix_time_limit_seconds": 90,
+                "route_matrix_google_element_budget": 2500,
+            },
+            progress_callback=progress.append,
+        )
+        db.commit()
+        assert result["metadata"]["location_count"] == 101
+        assert result["metadata"]["unique_location_count"] == 3
+        assert result["metadata"]["unique_pair_count"] == 6
+        assert result["metadata"]["google_batch_request_count"] == 1
+        assert client.calls == [(3, 3)]
+        assert result["distance_matrix"][1][3] == 0  # Both LO nodes point to S1.
+        assert db.query(RouteMatrixCache).count() == 6
+        assert progress[-1]["completed_unique_pairs"] == 6
+
+
+def test_t_cost_breakdown_treats_missing_phase6_mt_as_no_change() -> None:
+    result = {
+        "trips": [
+            {
+                "vehicle_id": "M1",
+                "distance_meters": 10_000,
+                "operating_minutes": 60,
+                "queue_minutes": 0,
+                "loading_minutes": 8,
+                "lo_assignments": [{"volume_kl": 8, "phase6_predicted_vehicle_id": None}],
+            }
+        ],
+        "dropped": [],
+    }
+    costs = _cost_breakdown(
+        result,
+        [vehicle("M1")],
+        parameters(queue_cost=0, loading_cost=0, overtime_cost=0),
+    )
+    assert costs["penalty_cost"] == 0
+    assert costs["total_cost"] > 0
+
+
+def test_u_startup_recovery_unlocks_interrupted_phase7_job() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as db:
+        db.add(MasterDepot(depot_id="D1", depot_name="Depot"))
+        db.add(OptimizationJob(job_id="JOB-1", job_no="P7-JOB-1", job_name="Job", depot_id="D1", operating_date=date(2026, 8, 26), status="CALCULATING"))
+        db.add(OperationalStateSnapshot(state_snapshot_id="STATE-1", job_id="JOB-1", snapshot_reason="Initial"))
+        db.add(OptimizationParameterSnapshot(parameter_snapshot_id="PARAM-1", job_id="JOB-1", effective_parameters={}, parameter_checksum="a"))
+        db.flush()
+        db.add(
+            OptimizationRun(
+                optimization_run_id="RUN-1",
+                job_id="JOB-1",
+                run_type="INITIAL",
+                status="RUNNING",
+                state_snapshot_id="STATE-1",
+                parameter_snapshot_id="PARAM-1",
+                start_time=DAY_START,
+                solver_status="PENDING",
+                objective="MIN_TOTAL_COST",
+                solver_metadata={"stage": "BUILDING_MATRIX", "progress_pct": 20},
+            )
+        )
+        db.commit()
+        assert recover_interrupted_phase7_optimizations(db) == 1
+        run = db.get(OptimizationRun, "RUN-1")
+        job = db.get(OptimizationJob, "JOB-1")
+        assert run.status == "FAILED"
+        assert run.error_code == "PHASE7_PROCESS_INTERRUPTED"
+        assert run.solver_metadata["stage"] == "INTERRUPTED"
+        assert job.status == "FAILED"
+
+
+def test_v_copy_frozen_plan_flushes_parent_trip_and_bay_before_dependents() -> None:
+    engine = create_engine(
+        "sqlite+pysqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+
+    @event.listens_for(engine, "connect")
+    def enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, autoflush=False)
+    with Session() as db:
+        db.add(MasterDepot(depot_id="D1", depot_name="Depot"))
+        db.flush()
+        db.add_all(
+            [
+                MasterMT(mt_id="M1", vehicle_name_raw="MT 1", vehicle_registration="BL 1", depot_id="D1"),
+                MasterSPBU(spbu_id="S1", spbu_code="S1", spbu_name="SPBU"),
+                MasterLoadingBay(master_bay_id="B1", depot_id="D1", bay_id="BAY-1", bay_name="Bay 1"),
+                OptimizationJob(
+                    job_id="JOB-1",
+                    job_no="P7-JOB-1",
+                    job_name="Job",
+                    depot_id="D1",
+                    operating_date=date(2026, 8, 26),
+                    depot_operational_start=time(5),
+                    depot_operational_end=time(22),
+                ),
+            ]
+        )
+        db.flush()
+        db.add_all(
+            [
+                OperationalStateSnapshot(state_snapshot_id="STATE-1", job_id="JOB-1", snapshot_reason="Initial"),
+                OperationalStateSnapshot(state_snapshot_id="STATE-2", job_id="JOB-1", snapshot_reason="Retry"),
+                OptimizationParameterSnapshot(parameter_snapshot_id="PARAM-1", job_id="JOB-1", effective_parameters={}, parameter_checksum="a"),
+                OptimizationParameterSnapshot(parameter_snapshot_id="PARAM-2", job_id="JOB-1", effective_parameters={}, parameter_checksum="b"),
+            ]
+        )
+        db.flush()
+        v1 = RouteVersion(route_version_id="V1", job_id="JOB-1", version_number=1, version_label="V1", reason="Initial", state_snapshot_id="STATE-1", parameter_snapshot_id="PARAM-1", objective="MIN_TOTAL_COST", solver_status="FEASIBLE")
+        v2 = RouteVersion(route_version_id="V2", job_id="JOB-1", version_number=2, version_label="V2", reason="Retry", state_snapshot_id="STATE-2", parameter_snapshot_id="PARAM-2", objective="MIN_TOTAL_COST", solver_status="FEASIBLE")
+        db.add_all([v1, v2])
+        db.flush()
+        trip = RouteVersionTrip(
+            route_version_trip_id="TRIP-1",
+            route_version_id="V1",
+            vehicle_id="M1",
+            trip_number=1,
+            shipment_id="SHIP-1",
+            vehicle_ready_at_depot=DAY_START,
+            queue_start=DAY_START,
+            loading_start=DAY_START + timedelta(minutes=5),
+            loading_finish=DAY_START + timedelta(minutes=13),
+            gate_out=DAY_START + timedelta(minutes=18),
+            estimated_return_depot=DAY_START + timedelta(hours=1),
+        )
+        db.add(trip)
+        db.flush()
+        db.add(
+            RouteVersionLOAssignment(
+                route_version_lo_assignment_id="LOA-1",
+                route_version_id="V1",
+                route_version_trip_id="TRIP-1",
+                loading_order_id="LO-1",
+                vehicle_id="M1",
+                trip_number=1,
+                shipment_id="SHIP-1",
+                compartment_id="C1",
+                spbu_id="S1",
+                volume_kl=8,
+                assignment_status="PLANNED",
+            )
+        )
+        db.add(
+            OptimizationBayAssignment(
+                bay_assignment_id="BA-1",
+                route_version_id="V1",
+                route_version_trip_id="TRIP-1",
+                master_bay_id="B1",
+                vehicle_ready_at_depot=DAY_START,
+                queue_start=DAY_START,
+                loading_start=DAY_START + timedelta(minutes=5),
+                loading_finish=DAY_START + timedelta(minutes=13),
+                gate_out=DAY_START + timedelta(minutes=18),
+                queue_minutes=5,
+                loading_minutes=8,
+            )
+        )
+        db.flush()
+        db.add(
+            OptimizationBayOperation(
+                bay_operation_id="BO-1",
+                bay_assignment_id="BA-1",
+                master_bay_id="B1",
+                compartment_id="C1",
+                loading_start=DAY_START + timedelta(minutes=5),
+                loading_finish=DAY_START + timedelta(minutes=13),
+                duration_minutes=8,
+                loading_mode="SEQUENTIAL",
+            )
+        )
+        job = db.get(OptimizationJob, "JOB-1")
+        job.current_route_version_id = "V1"
+        db.commit()
+
+        frozen = lo_state("LO-1", status="PLANNED")
+        frozen.frozen = True
+        copied_trips, copied_ids = _copy_frozen_plan(db, job, v2, [frozen])
+        db.flush()
+
+        assert copied_ids == {"LO-1"}
+        assert len(copied_trips) == 1
+        copied_trip_id = copied_trips[0].route_version_trip_id
+        assert db.get(RouteVersionTrip, copied_trip_id) is not None
+        copied_bay = db.scalar(
+            select(OptimizationBayAssignment).where(
+                OptimizationBayAssignment.route_version_trip_id == copied_trip_id
+            )
+        )
+        assert copied_bay is not None
+        assert db.scalar(
+            select(OptimizationBayOperation).where(
+                OptimizationBayOperation.bay_assignment_id == copied_bay.bay_assignment_id
+            )
+        ) is not None
+
+
+def test_w_initial_optimization_reference_time_uses_depot_timezone() -> None:
+    depot = MasterDepot(depot_id="D1", depot_name="Depot", timezone="Asia/Jakarta")
+    job = OptimizationJob(
+        job_id="JOB-1",
+        job_no="P7-JOB-1",
+        job_name="Job",
+        depot_id="D1",
+        operating_date=date(2026, 8, 26),
+        depot_operational_start=time(5),
+        depot_operational_end=time(22),
+    )
+
+    reference = _normalize_optimization_reference_time(
+        job,
+        depot,
+        "2026-08-26T09:30:00",
+        reroute=False,
+    )
+
+    assert reference == datetime(2026, 8, 26, 2, 30, tzinfo=timezone.utc)
+
+
+def test_x_initial_optimization_reference_date_must_match_job_date() -> None:
+    depot = MasterDepot(depot_id="D1", depot_name="Depot", timezone="Asia/Jakarta")
+    job = OptimizationJob(
+        job_id="JOB-1",
+        job_no="P7-JOB-1",
+        job_name="Job",
+        depot_id="D1",
+        operating_date=date(2026, 8, 26),
+        depot_operational_start=time(5),
+        depot_operational_end=time(22),
+    )
+
+    with pytest.raises(HTTPException) as captured:
+        _normalize_optimization_reference_time(
+            job,
+            depot,
+            "2026-08-27T09:30:00",
+            reroute=False,
+        )
+
+    assert captured.value.status_code == 422
+    assert captured.value.detail["code"] == "OPTIMIZATION_DATE_MISMATCH"
+
+
+def test_y_reroute_date_is_locked_and_time_cannot_move_backwards() -> None:
+    depot = MasterDepot(depot_id="D1", depot_name="Depot", timezone="Asia/Jakarta")
+    job = OptimizationJob(
+        job_id="JOB-1",
+        job_no="P7-JOB-1",
+        job_name="Job",
+        depot_id="D1",
+        operating_date=date(2026, 8, 26),
+        depot_operational_start=time(5),
+        depot_operational_end=time(22),
+    )
+    initial_reference = datetime(2026, 8, 26, 2, 30, tzinfo=timezone.utc)
+    latest_reference = datetime(2026, 8, 26, 4, 0, tzinfo=timezone.utc)
+
+    with pytest.raises(HTTPException) as wrong_date:
+        _normalize_optimization_reference_time(
+            job,
+            depot,
+            "2026-08-27T11:30:00",
+            reroute=True,
+            initial_reference_time=initial_reference,
+            latest_reference_time=latest_reference,
+        )
+    assert wrong_date.value.detail["code"] == "REROUTE_DATE_LOCKED"
+
+    with pytest.raises(HTTPException) as backwards:
+        _normalize_optimization_reference_time(
+            job,
+            depot,
+            "2026-08-26T10:30:00",
+            reroute=True,
+            initial_reference_time=initial_reference,
+            latest_reference_time=latest_reference,
+        )
+    assert backwards.value.detail["code"] == "OPTIMIZATION_TIME_BEFORE_LAST_RUN"
+
+    accepted = _normalize_optimization_reference_time(
+        job,
+        depot,
+        "2026-08-26T11:30:00",
+        reroute=True,
+        initial_reference_time=initial_reference,
+        latest_reference_time=latest_reference,
+    )
+    assert accepted == datetime(2026, 8, 26, 4, 30, tzinfo=timezone.utc)

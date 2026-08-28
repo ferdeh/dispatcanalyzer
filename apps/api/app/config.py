@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./dispatch_intelligence.db"
     cors_origins: str = "http://localhost:3000,http://localhost:5173"
     example_data_dir: Path = Path("example data")
-    vehicle_compatibility_mode: str = "EXACT_MATCH"
+    vehicle_compatibility_mode: str = "MT_CAPACITY_LE_SPBU_LIMIT"
     default_geofence_radius_m: float = 125.0
     minimum_gps_dwell_minutes: float = 5.0
     minimum_gps_event_count: int = 2

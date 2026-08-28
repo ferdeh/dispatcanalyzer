@@ -74,6 +74,23 @@ def source_int(value: Any) -> int | None:
     return int(number) if number is not None and float(number).is_integer() else None
 
 
+def source_time(value: Any, default: time | None = None) -> time | None:
+    """Normalize Excel/JSON time values to a minute-precision SQL time."""
+    value = clean_value(value)
+    if value is None or value == "":
+        return default
+    if isinstance(value, time):
+        return value.replace(second=0, microsecond=0)
+    text = str(value).strip()
+    try:
+        return time.fromisoformat(text).replace(second=0, microsecond=0)
+    except ValueError:
+        try:
+            return datetime.fromisoformat(text).time().replace(second=0, microsecond=0)
+        except ValueError:
+            return default
+
+
 def mt_capacity_kl(capacity_label: Any, vehicle_type_tag: Any) -> float | None:
     """Resolve an MT capacity in KL from canonical master fields.
 

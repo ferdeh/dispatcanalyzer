@@ -287,6 +287,7 @@ class GoogleRoutesClient:
         departure_datetime: datetime | None,
         routing_mode: str,
         routing_preference: str,
+        intermediates: list[tuple[float, float]] | None = None,
     ) -> dict:
         if routing_mode not in SUPPORTED_ROUTING_MODES:
             raise GoogleRoutesError(
@@ -302,6 +303,8 @@ class GoogleRoutesClient:
             "polylineQuality": "OVERVIEW",
             "polylineEncoding": "GEO_JSON_LINESTRING",
         }
+        if intermediates:
+            payload["intermediates"] = [self._waypoint(latitude, longitude) for latitude, longitude in intermediates]
         departure = self._future_departure(departure_datetime)
         if departure:
             payload["departureTime"] = departure
@@ -331,9 +334,41 @@ class GoogleRoutesClient:
         destination: tuple[float, float],
         departure_datetime: datetime | None,
     ) -> dict:
+        rows = self.compute_route_matrix_batch(
+            origins=[origin],
+            destinations=[destination],
+            departure_datetime=departure_datetime,
+        )
+        if not rows or rows[0].get("condition") not in {None, "ROUTE_EXISTS"}:
+            raise GoogleRoutesError("GOOGLE_ROUTE_NOT_FOUND", "Google Route Matrix returned no route.", status_code=404)
+        return rows[0]
+
+    def compute_route_matrix_batch(
+        self,
+        *,
+        origins: list[tuple[float, float]],
+        destinations: list[tuple[float, float]],
+        departure_datetime: datetime | None,
+    ) -> list[dict]:
+        """Return one matrix element per origin/destination combination.
+
+        Google accepts at most 625 non-transit elements in one request.  Keep
+        that guard next to the HTTP client so every caller receives the same
+        fail-fast contract instead of accidentally creating thousands of
+        single-pair requests.
+        """
+        if not origins or not destinations:
+            return []
+        element_count = len(origins) * len(destinations)
+        if element_count > 625:
+            raise GoogleRoutesError(
+                "GOOGLE_MATRIX_ELEMENT_LIMIT",
+                "Google Route Matrix requests support at most 625 elements.",
+                status_code=422,
+            )
         payload: dict[str, Any] = {
-            "origins": [{"waypoint": self._waypoint(*origin)}],
-            "destinations": [{"waypoint": self._waypoint(*destination)}],
+            "origins": [{"waypoint": self._waypoint(*origin)} for origin in origins],
+            "destinations": [{"waypoint": self._waypoint(*destination)} for destination in destinations],
             "travelMode": "DRIVE",
             "routingPreference": "TRAFFIC_AWARE",
         }
@@ -345,10 +380,7 @@ class GoogleRoutesClient:
             payload,
             "originIndex,destinationIndex,status,condition,distanceMeters,duration,staticDuration",
         )
-        rows = response if isinstance(response, list) else []
-        if not rows or rows[0].get("condition") not in {None, "ROUTE_EXISTS"}:
-            raise GoogleRoutesError("GOOGLE_ROUTE_NOT_FOUND", "Google Route Matrix returned no route.", status_code=404)
-        return rows[0]
+        return response if isinstance(response, list) else []
 
 
 def test_google_routes_connection(db: Session, *, tested_by: str) -> dict:

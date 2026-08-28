@@ -14,7 +14,6 @@ from openpyxl import Workbook
 from sqlalchemy import delete, desc, select
 from sqlalchemy.orm import Session, defer
 
-from .config import get_settings
 from .google_routes import GoogleRoutesError, configuration_snapshot, get_google_routes_configuration
 from .models import (
     MLBehavioralModel,
@@ -37,7 +36,11 @@ from .phase6_jobs import (
     prediction_job_payload,
 )
 from .phase5_registry import _model_summary
-from .phase6_constants import DEFAULT_PREDICTION_PARAMETERS, PHASE6_ALGORITHM_VERSION
+from .phase6_constants import (
+    DEFAULT_PREDICTION_PARAMETERS,
+    PHASE6_ALGORITHM_VERSION,
+    PHASE6_VEHICLE_COMPATIBILITY_MODE,
+)
 from .phase6_capacity import mt_compartment_profile, shipment_capacity
 from .phase6_inference import load_model_inference_evidence, predict_mt_candidates, predict_shipments
 from .phase6_iterative import build_iterative_capacity_plan
@@ -285,9 +288,13 @@ def _parameters(overrides: dict | None) -> dict:
             raise HTTPException(status_code=400, detail={"code": "INVALID_PARAMETER", "message": f"{field} must be an integer."}) from exc
         if not minimum <= parameters[field] <= maximum:
             raise HTTPException(status_code=400, detail={"code": "INVALID_PARAMETER", "message": f"{field} must be between {minimum} and {maximum}."})
-    # Phase 6 v9 only dispatches a fully utilized MT: 4/3/2/1 LO must use an
+    # Phase 6 only dispatches a fully utilized MT: 4/3/2/1 LO must use an
     # MT with exactly 4/3/2/1 compartments respectively.
     parameters["require_full_mt_utilization"] = True
+    # Vehicle class on an SPBU is its maximum admitted MT capacity, not an
+    # exact class. Keep this invariant in the immutable run snapshot so worker
+    # retries and later recalculation cannot drift with process configuration.
+    parameters["vehicle_compatibility_mode"] = PHASE6_VEHICLE_COMPATIBILITY_MODE
     return parameters
 
 
@@ -1535,7 +1542,10 @@ def _rebuild_candidates_and_timeline(db: Session, run: PredictionRun) -> None:
         depot_id=run.depot_id,
         shipments=payload,
         availability=run.input_mt_availability_snapshot,
-        vehicle_compatibility_mode=get_settings().vehicle_compatibility_mode,
+        vehicle_compatibility_mode=run.parameter_snapshot.get(
+            "vehicle_compatibility_mode",
+            PHASE6_VEHICLE_COMPATIBILITY_MODE,
+        ),
         require_full_utilization=True,
     )
     if shipment_ids:

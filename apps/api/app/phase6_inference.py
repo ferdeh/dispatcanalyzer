@@ -6,7 +6,7 @@ import math
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from fastapi import HTTPException
 from sqlalchemy import select
@@ -236,6 +236,7 @@ def _group_metrics(
     )
     return {
         "capacity_valid": bool(capacity["valid"] and capacity["required_compartments"] <= maximum_compartments),
+        "required_compartments": int(capacity["required_compartments"]),
         "model_score": round(model_score, 6),
         "pair_coverage": round(pair_coverage, 6),
         "time_span_minutes": round(span_seconds / 60, 3),
@@ -255,6 +256,8 @@ def _optimized_capacity_time_route_groups(
     maximum_gap_seconds: int,
     maximum_compartments: int,
     maximum_detour_ratio: float,
+    target_compartments: int | None = None,
+    group_feasibility: Callable[[list[dict]], bool] | None = None,
 ) -> tuple[list[list[int]], dict[frozenset[int], dict], str]:
     """Select disjoint multi-LO groups through binary set-packing optimization.
 
@@ -269,6 +272,7 @@ def _optimized_capacity_time_route_groups(
         adjacency[right].add(left)
 
     candidate_metrics: dict[frozenset[int], dict] = {}
+    selectable_groups: set[frozenset[int]] = set()
     beam_width = 48
     for seed in range(len(rows)):
         frontier = [frozenset((seed,))]
@@ -305,6 +309,20 @@ def _optimized_capacity_time_route_groups(
                         continue
                     candidate_metrics[combined] = metrics
                     expanded.add(combined)
+                    is_target_capacity = (
+                        target_compartments is None
+                        or metrics["required_compartments"] == target_compartments
+                    )
+                    operationally_feasible = bool(
+                        is_target_capacity
+                        and (
+                            group_feasibility is None
+                            or group_feasibility([rows[index] for index in sorted(combined)])
+                        )
+                    )
+                    metrics["operational_mt_feasible"] = operationally_feasible
+                    if operationally_feasible:
+                        selectable_groups.add(combined)
             frontier = sorted(
                 expanded,
                 key=lambda group: (-candidate_metrics[group]["optimizer_value"], tuple(sorted(group))),
@@ -313,7 +331,7 @@ def _optimized_capacity_time_route_groups(
                 break
 
     candidates = sorted(
-        candidate_metrics,
+        selectable_groups,
         key=lambda group: (-candidate_metrics[group]["optimizer_value"], tuple(sorted(group))),
     )[:10_000]
     selected: list[frozenset[int]] = []
@@ -377,6 +395,9 @@ def predict_shipments(
     maximum_gap_seconds = int(parameters.get("maximum_pairing_time_gap_minutes", 90)) * 60
     maximum_compartments = int(parameters.get("maximum_shipment_compartments", 4))
     maximum_detour_ratio = float(parameters.get("maximum_group_route_detour_ratio", 2.0))
+    target_compartments = parameters.get("target_shipment_compartments")
+    target_compartments = int(target_compartments) if target_compartments is not None else None
+    group_feasibility = parameters.get("_group_feasibility")
     routing_context = evidence.get("routing_context") or {}
     for shift_id in sorted(by_shift):
         rows = sorted(by_shift[shift_id], key=lambda row: (row["shipment_start_datetime"], row["spbu_no"], row["loading_order_no"]))
@@ -419,6 +440,8 @@ def predict_shipments(
             maximum_gap_seconds=maximum_gap_seconds,
             maximum_compartments=maximum_compartments,
             maximum_detour_ratio=maximum_detour_ratio,
+            target_compartments=target_compartments,
+            group_feasibility=group_feasibility,
         )
         groups.sort(key=lambda group: (max(rows[index]["shipment_start_datetime"] for index in group), min(rows[index]["loading_order_no"] for index in group)))
         for number, group in enumerate(groups, start=1):
