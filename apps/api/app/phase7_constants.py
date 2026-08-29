@@ -3,12 +3,12 @@ from __future__ import annotations
 import math
 
 
-PHASE7_ALGORITHM_VERSION = "phase7.dynamic_multitrip_vrp_bay.v1"
+PHASE7_ALGORITHM_VERSION = "phase7.dynamic_multitrip_vrp_bay.v2"
 
 JOB_STATUSES = {"DRAFT", "READY", "CALCULATING", "COMPLETED", "ACTIVE", "CLOSED", "FAILED"}
 LO_STATUSES = {"PLANNED", "ONGOING", "DONE"}
 MT_STATUSES = {"READY", "ON_TRIP", "RETURNING", "QUEUEING", "LOADING", "UNAVAILABLE"}
-SOLVER_STATUSES = {"OPTIMAL", "FEASIBLE", "PARTIAL", "INFEASIBLE", "TIME_LIMIT", "FAILED"}
+SOLVER_STATUSES = {"OPTIMAL", "FEASIBLE", "PARTIAL", "INFEASIBLE", "UNKNOWN", "TIMEOUT", "TIME_LIMIT", "FAILED"}
 OBJECTIVES = {"MIN_TOTAL_COST", "MIN_TOTAL_DISTANCE", "MIN_TOTAL_OPERATING_TIME"}
 CONSTRAINT_MODES = {"HARD", "SOFT"}
 DROPPED_REASON_CODES = {
@@ -85,7 +85,7 @@ CONSTRAINT_DEFINITIONS: dict[str, dict] = {
     "depot_operating_window": {
         "label": "Depot Operating Window",
         "category": "TIME",
-        "description": "Trip return and bay gate-out must stay inside depot operating hours.",
+        "description": "Bay loading and gate-out must stay inside depot operating hours; MT return is governed by working time.",
         "default_mode": "HARD",
         "default_penalty": 500_000.0,
         "legacy_penalty": "overtime_penalty",
@@ -263,7 +263,13 @@ DEFAULT_PHASE7_PARAMETERS: dict = {
     "objective": "MIN_TOTAL_COST",
     "freeze_window_minutes": 60,
     "reoptimization_interval_minutes": 60,
+    # ``optimization_time_limit`` remains as a legacy profile field. New and
+    # normalized profiles use separate route and bay budgets so one engine
+    # cannot consume the other engine's search time.
     "optimization_time_limit": 30,
+    "route_optimization_time_limit": 30,
+    "bay_optimization_time_limit": 30,
+    "bay_cp_sat_workers": 8,
     "max_coordination_iterations": 5,
     "departure_time_tolerance_minutes": 5,
     "return_time_tolerance_minutes": 5,
@@ -320,6 +326,13 @@ DEFAULT_PARAMETER_PROFILES = (
 def effective_parameters(overrides: dict | None = None) -> dict:
     overrides = overrides or {}
     parameters = {**DEFAULT_PHASE7_PARAMETERS, **overrides}
+    legacy_time_limit = int(parameters.get("optimization_time_limit", 30))
+    # Old saved profiles only contain ``optimization_time_limit``. Preserve
+    # their operational meaning while exposing independent limits from now on.
+    if "route_optimization_time_limit" not in overrides:
+        parameters["route_optimization_time_limit"] = legacy_time_limit
+    if "bay_optimization_time_limit" not in overrides:
+        parameters["bay_optimization_time_limit"] = legacy_time_limit
     # Removed legacy duplicate: the MT work limit now lives only on the
     # vehicle_working_time constraint rule.
     parameters.pop("default_vehicle_working_time_minutes", None)
@@ -377,6 +390,9 @@ def effective_parameters(overrides: dict | None = None) -> dict:
         "freeze_window_minutes": (0, 1440),
         "reoptimization_interval_minutes": (1, 1440),
         "optimization_time_limit": (1, 3600),
+        "route_optimization_time_limit": (1, 3600),
+        "bay_optimization_time_limit": (1, 3600),
+        "bay_cp_sat_workers": (1, 64),
         "max_coordination_iterations": (1, 20),
         "departure_time_tolerance_minutes": (0, 240),
         "return_time_tolerance_minutes": (0, 240),

@@ -44,6 +44,8 @@ The Job Management card owns the Create New Job action, free-text search, per-co
 
 Initial and reroute requests do not hold the browser open until OR-Tools finishes. The API completes validation, atomically reserves the Job as `CALCULATING`, returns HTTP `202 Accepted`, and schedules the optimization as an in-process background task with an independent SQLAlchemy session. The UI closes the reference-time dialog, navigates back to Job Management, and polls the depot-scoped Job list every two seconds while at least one row is calculating. A calculating row shows a spinner and cannot be deleted or submitted again. Terminal worker results change the Job to `ACTIVE`/`CLOSED` or `FAILED`; opening the Job remains available for progress and error inspection.
 
+The durable run metadata distinguishes `BUILDING_MATRIX`, `SOLVING_ROUTES`, and `PERSISTING_RESULT` before the terminal `COMPLETED`/`FAILED` stage. Every checkpoint carries `progress_pct` and `stage_updated_at`. `PERSISTING_RESULT` includes final route-geometry acquisition and relational trip/stop/LO/bay persistence, so the Job correctly remains `CALCULATING` after OR-Tools has returned. A provider `403` or `429` is not a solver failure: the geometry guard eventually selects the visibly labelled cache/master fallback and persistence continues. Wall-clock elapsed time can include a suspended laptop/Docker VM, whereas `solve_duration_ms` records active optimization work; investigate a stuck run only when stage timestamps, process/database activity, and terminal recovery evidence are all absent.
+
 LO Management and MT Management both provide free-text search, sorting on every data header, selectable page size, and Previous/Next pagination. LO select-all is page-scoped so bulk operational updates remain explicit. MT ETA/status edits remain in the page draft while filtering, sorting, or changing pages.
 
 Bay Management provides Delete Bay on every persisted bay card. Deletion is a confirmed soft-delete from the active depot configuration and clears mutable current occupancy/queue rows for that bay; historical state snapshots, route versions, and bay assignments remain auditable. Newly added unsaved bay cards can be removed locally without an API mutation. Product loading speed is shown as a responsive product-card grid with a dedicated numeric duration and a separate `min / compartment` unit label.
@@ -92,7 +94,7 @@ effective ETA at depot
   → next routing round for the same physical MT
 ```
 
-The next trip is eligible only when it starts before depot close, the MT has working time remaining, compatible LO remains, and its capacity/compartments can hold that trip. Bay-induced gate-out delay is propagated to return time and the next trip; coordination repeats until the departure delta is within tolerance or `max_coordination_iterations` is reached.
+The next trip is eligible only when its loading/gate-out can occur before depot close, the MT has working time remaining, compatible LO remains, and its capacity/compartments can hold that trip. Bay-induced gate-out delay is propagated to return time and the next trip; coordination repeats until the departure delta is within tolerance or `max_coordination_iterations` is reached. A prior trip may return after depot close, but that MT cannot start another depot loading/gate-out after close. Route search uses `route_optimization_time_limit` and reserves a fair share for every remaining trip round, so Trip 1 cannot consume the entire multi-trip budget.
 
 ## Compartment assignment
 
@@ -149,16 +151,22 @@ The registry covers MT–SPBU compatibility, vehicle/compartment capacity, produ
 
 `vehicle_working_time.limit_minutes` is the single source of the MT working-time limit; the former top-level `default_vehicle_working_time_minutes` no longer exists. Working time is cumulative per physical MT, from vehicle use through bay queue, loading, driving, SPBU service, and final return to the depot. HARD rejects the trip that crosses the limit, SOFT retains it with the configured penalty, and disabled ignores the limit and penalty.
 
+`depot_operating_window` has dispatch semantics: loading cannot start before depot open and gate-out cannot occur after depot close. It does not require the dispatched MT to return before close. Return remains constrained by `vehicle_working_time`, vehicle availability for a later trip, and the SPBU receiving window. Depot Operation Span is `last gate-out - first loading start`, not `last return - first departure`.
+
 `DONE`/`ONGOING` execution state, one persisted assignment identity per LO, relational integrity, and append-only route-version history remain non-configurable structural safeguards. The configurable `freeze_window` applies to near-term `PLANNED` work.
 
 ## Bay CP-SAT
 
-For each preliminary trip, CP-SAT creates a loading start/end and optional interval for every eligible bay. Exactly one eligible bay must be selected. `NoOverlap` protects bay capacity.
+For each preliminary trip, CP-SAT creates a `served` variable plus loading start/end and an optional interval for every eligible bay. With `serve_loading_order=HARD`, every trip must select exactly one eligible bay. With `serve_loading_order=SOFT`, CP-SAT may retain the best feasible subset and charges the configured penalty per omitted LO. A later trip on the same physical MT cannot be retained when its earlier trip is omitted. `NoOverlap` protects bay capacity.
+
+Bay search has its own `bay_optimization_time_limit` and `bay_cp_sat_workers` (default 8). It does not consume the route budget. `UNKNOWN` and elapsed-limit `TIMEOUT` are preserved as solver termination states and are never rewritten as physical `INFEASIBLE`.
 
 Before new intervals, each bay is blocked by:
 
 1. actual current occupancy and remaining loading time;
 2. actual queue rows in queue-position order.
+
+`state_effective_at` for both facts is aligned to the dispatcher-entered Initial/Re-optimize timestamp. It never defaults to the API server's current date/time. Before the first run, a saved state uses Job day start; once a run exists it uses the latest optimization reference until the next submitted timestamp replaces it.
 
 Bay eligibility requires every trip product to be allowed or `all_products_allowed=true`. Sequential loading duration is the sum of configured minutes for every used compartment. Parallel mode uses loading arms and reserves a conservative parallel duration. Gate-out is:
 
@@ -166,7 +174,7 @@ Bay eligibility requires every trip product to be allowed or `all_products_allow
 loading finish + gate_process_time
 ```
 
-The result persists vehicle-ready, queue start, loading start/finish, gate-out, bay assignment, and per-compartment bay operations.
+The result persists vehicle-ready, queue start, loading start/finish, gate-out, bay assignment, and per-compartment bay operations. Readiness is enforced only for a served trip; with soft service, a later trip whose MT returns after depot close is omitted without making the entire bay model infeasible.
 
 ## Freeze and reroute
 
@@ -239,9 +247,11 @@ The solver still receives one node per LO, but matrix acquisition is deduplicate
 
 - `route_matrix_time_limit_seconds=90`;
 - `route_matrix_google_element_budget=2500`, below the default Google limit of 3,000 matrix elements per minute;
-- `route_geometry_time_limit_seconds=30` and `route_geometry_google_request_budget=20` for final selected-leg geometry.
+- `route_geometry_time_limit_seconds=120` and `route_geometry_google_request_budget=500` for final selected-leg geometry.
 
 Pairs beyond the time/element budget use the visible Master/Haversine fallback. Completed matrix/cache batches are committed before OR-Tools starts, so a later solver or persistence failure does not discard expensive matrix work. The active run exposes `BUILDING_MATRIX`, `SOLVING_ROUTES`, `PERSISTING_RESULT`, and terminal progress through the Job response. An API restart marks orphaned in-process runs `FAILED/INTERRUPTED`, allowing an auditable retry instead of leaving the Job permanently `CALCULATING`.
+
+Final geometry has its own wall-clock and logical-request guards. An invalid key (`403`) or rate limit (`429`) is logged as provider evidence but does not discard the OR-Tools plan. Once the guard is exhausted, remaining routes are persisted as `MIXED_OR_MASTER_FALLBACK`. Profiles may lower these two geometry values when fast completion is more important than attempting road geometry for every selected trip.
 
 `GENERAL_VEHICLE` is the default. `TRUCK` is opt-in. If an account/region does not provide a supported truck road response, fallback/provider metadata must remain visible; a fallback must never be labelled as Google truck geometry.
 
@@ -263,7 +273,12 @@ Every optimization stores the selected reference timestamp, exact effective para
 
 ## Solver result and dropped LO
 
-Result statuses are `OPTIMAL`, `FEASIBLE`, `PARTIAL`, `INFEASIBLE`, `TIME_LIMIT`, and `FAILED`. Best feasible output is retained when available. A failed solver updates the Job to `FAILED` and stores run error details instead of crashing the application process.
+Result statuses are `OPTIMAL`, `FEASIBLE`, `PARTIAL`, `INFEASIBLE`, `UNKNOWN`, `TIMEOUT`, legacy `TIME_LIMIT`, and `FAILED`. `PARTIAL` means a feasible subset was retained. `INFEASIBLE` is used only when the model proved that no required solution exists; it is not used for an interrupted or exhausted search. Best feasible output is retained when available. A failed solver updates the Job to `FAILED` and stores run error details instead of crashing the application process.
+
+Bay drop reasons distinguish cause:
+
+- `BAY_PRODUCT_CONSTRAINT`: no structurally eligible bay passes an active hard product/loading-duration/bay-stability rule;
+- `BAY_CONGESTION`: the trip is structurally eligible, but available bay time/capacity cannot serve it relative to the `serve_loading_order` penalty.
 
 Unserved reason codes include:
 

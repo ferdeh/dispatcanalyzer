@@ -187,6 +187,32 @@ def _job_day(job: OptimizationJob, depot: MasterDepot) -> tuple[datetime, dateti
     return day_start, operational_start, operational_end
 
 
+def _default_bay_state_reference_time(db: Session, job: OptimizationJob) -> datetime:
+    """Use operational time, never the API server clock, for bay state."""
+    _, latest_reference = _optimization_reference_context(db, job)
+    if latest_reference:
+        return latest_reference
+    depot = db.get(MasterDepot, job.depot_id)
+    assert depot is not None
+    day_start, _, _ = _job_day(job, depot)
+    return day_start
+
+
+def _align_bay_state_reference_time(db: Session, job: OptimizationJob, reference_time: datetime) -> None:
+    """Make saved actual bay/queue facts effective at the dispatcher's run time."""
+    normalized = _utc(reference_time)
+    db.execute(
+        update(ActualBayState)
+        .where(ActualBayState.job_id == job.job_id)
+        .values(state_effective_at=normalized)
+    )
+    db.execute(
+        update(OptimizationInitialQueue)
+        .where(OptimizationInitialQueue.job_id == job.job_id)
+        .values(state_effective_at=normalized)
+    )
+
+
 def _job_number(operating_date: date) -> str:
     return f"P7-JOB-{operating_date:%Y%m%d}-{uuid.uuid4().hex[:5].upper()}"
 
@@ -870,6 +896,7 @@ def get_bay_configuration(db: Session, depot_id: str) -> dict:
 
 def update_actual_bay_state(db: Session, job_id: str, states: list[dict], queue: list[dict], *, actor: str = "local-user") -> dict:
     job = _require_job(db, job_id)
+    default_reference_time = _default_bay_state_reference_time(db, job)
     allowed_bays = {row.master_bay_id: row for row in db.scalars(select(MasterLoadingBay).where(MasterLoadingBay.depot_id == job.depot_id)).all()}
     for payload in states:
         bay_id = str(payload.get("master_bay_id") or "")
@@ -877,14 +904,14 @@ def update_actual_bay_state(db: Session, job_id: str, states: list[dict], queue:
             raise HTTPException(status_code=422, detail={"code": "BAY_DEPOT_MISMATCH", "message": "Bay does not belong to the Job depot."})
         state = db.scalar(select(ActualBayState).where(ActualBayState.job_id == job.job_id, ActualBayState.master_bay_id == bay_id))
         if not state:
-            state = ActualBayState(actual_bay_state_id=uuid.uuid4().hex, job_id=job.job_id, master_bay_id=bay_id, state_effective_at=datetime.now(timezone.utc))
+            state = ActualBayState(actual_bay_state_id=uuid.uuid4().hex, job_id=job.job_id, master_bay_id=bay_id, state_effective_at=default_reference_time)
             db.add(state)
         state.current_vehicle_id = payload.get("current_vehicle_id") or None
         state.current_compartment_id = payload.get("current_compartment_id") or None
         state.current_product_id = payload.get("current_product_id") or None
         state.remaining_loading_minutes = max(0, int(payload.get("remaining_loading_minutes") or 0))
         state.actual_queue_length = max(0, int(payload.get("actual_queue_length") or 0))
-        state.state_effective_at = datetime.fromisoformat(str(payload["state_effective_at"]).replace("Z", "+00:00")) if payload.get("state_effective_at") else datetime.now(timezone.utc)
+        state.state_effective_at = datetime.fromisoformat(str(payload["state_effective_at"]).replace("Z", "+00:00")) if payload.get("state_effective_at") else default_reference_time
         state.source = "USER"
         state.updated_by = actor
     # Queue replacement is an explicit actual-state update scoped to this Job.
@@ -906,7 +933,7 @@ def update_actual_bay_state(db: Session, job_id: str, states: list[dict], queue:
                 compartment_id=payload.get("compartment_id") or None,
                 product_id=payload.get("product_id") or None,
                 estimated_loading_duration_minutes=max(1, int(payload.get("estimated_loading_duration_minutes") or 1)),
-                state_effective_at=datetime.fromisoformat(str(payload["state_effective_at"]).replace("Z", "+00:00")) if payload.get("state_effective_at") else datetime.now(timezone.utc),
+                state_effective_at=datetime.fromisoformat(str(payload["state_effective_at"]).replace("Z", "+00:00")) if payload.get("state_effective_at") else default_reference_time,
             )
         )
     db.commit()
@@ -1289,8 +1316,8 @@ def _solver_inputs(db: Session, job: OptimizationJob, parameters: dict, *, curre
         "vehicles": vehicles,
         "spbus": spbus,
         "bays": bays,
-        "actual_bay_states": [{"master_bay_id": row.master_bay_id, "state_effective_at": row.state_effective_at, "remaining_loading_minutes": row.remaining_loading_minutes, "actual_queue_length": row.actual_queue_length, "current_vehicle_id": row.current_vehicle_id} for row in actual],
-        "initial_queue": [{"master_bay_id": row.master_bay_id, "queue_position": row.queue_position, "vehicle_id": row.vehicle_id, "compartment_id": row.compartment_id, "product_id": row.product_id, "estimated_loading_duration_minutes": row.estimated_loading_duration_minutes, "state_effective_at": row.state_effective_at} for row in queue],
+        "actual_bay_states": [{"master_bay_id": row.master_bay_id, "state_effective_at": _utc(current_time), "remaining_loading_minutes": row.remaining_loading_minutes, "actual_queue_length": row.actual_queue_length, "current_vehicle_id": row.current_vehicle_id} for row in actual],
+        "initial_queue": [{"master_bay_id": row.master_bay_id, "queue_position": row.queue_position, "vehicle_id": row.vehicle_id, "compartment_id": row.compartment_id, "product_id": row.product_id, "estimated_loading_duration_minutes": row.estimated_loading_duration_minutes, "state_effective_at": _utc(current_time)} for row in queue],
         "loading_durations": {row["product_id"]: row["duration_minutes_per_compartment"] for row in bay_config["loading_durations"] if row["active_status"] == "ACTIVE"},
     }
 
@@ -1700,6 +1727,7 @@ def enqueue_optimization(db: Session, job_id: str, payload: dict, *, reroute: bo
     """Validate and reserve one Job before returning HTTP 202 to the UI."""
     prepared = _prepare_optimization(db, job_id, payload, reroute=reroute, lock_job=True)
     job = prepared["job"]
+    _align_bay_state_reference_time(db, job, prepared["current_time"])
     job.status = "CALCULATING"
     job.error_message = None
     db.commit()
@@ -1735,6 +1763,7 @@ def run_optimization(
     profile_id = prepared["profile_id"]
     parameters = prepared["parameters"]
     reason = prepared["reason"]
+    _align_bay_state_reference_time(db, job, current_time)
     job.status = "CALCULATING"
     job.error_message = None
     db.commit()
@@ -1942,9 +1971,11 @@ def run_optimization(
             state.working_time_remaining_minutes = max(0, state.working_time_limit_minutes - state.working_time_used_minutes)
             db.add(RouteVersionVehicleAssignment(route_version_vehicle_assignment_id=uuid.uuid4().hex, route_version_id=route_version.route_version_id, vehicle_id=mt_id, used=bool(mt_trips), trip_count=len(mt_trips), delivered_kl=delivered, total_distance_meters=sum(trip.distance_meters for trip in mt_trips), total_operating_minutes=used_minutes, working_time_remaining_minutes=state.working_time_remaining_minutes, activation_cost=OptimizationCoordinatorService().vrp._vehicle_cost(parameters, next((row for row in inputs["vehicles"] if row["mt_id"] == mt_id), {"vehicle_class": state.vehicle_class, "tags": state.tag_snapshot})), system_eta_depot=last_return))
         gateouts = [trip.gate_out for trip in all_version_trips]
+        loading_starts = [trip.loading_start for trip in all_version_trips if trip.loading_start]
         route_version.first_gate_out = min(gateouts) if gateouts else None
         route_version.last_gate_out = max(gateouts) if gateouts else None
-        route_version.depot_dispatch_span_minutes = round((route_version.last_gate_out - route_version.first_gate_out).total_seconds() / 60) if route_version.first_gate_out and route_version.last_gate_out else 0
+        depot_operation_start = min(loading_starts) if loading_starts else route_version.first_gate_out
+        route_version.depot_dispatch_span_minutes = round((route_version.last_gate_out - depot_operation_start).total_seconds() / 60) if depot_operation_start and route_version.last_gate_out else 0
         route_version.summary_snapshot = _summary(result, inputs["all_lo_rows"], frozen_trips, costs)
         bay_assignments = db.scalars(
             select(OptimizationBayAssignment).where(
@@ -2106,7 +2137,13 @@ def get_route_version(db: Session, job_id: str, version_id: str | None = None) -
     snapshot = db.get(OperationalStateSnapshot, version.state_snapshot_id)
     parameters = db.get(OptimizationParameterSnapshot, version.parameter_snapshot_id)
     optimization_run = db.scalar(select(OptimizationRun).where(OptimizationRun.route_version_id == version.route_version_id))
-    return {"route_version_id": version.route_version_id, "version_number": version.version_number, "version_label": version.version_label, "created_at": _iso(version.created_at), "created_by": version.created_by, "reason": version.reason, "objective": version.objective, "solver_status": version.solver_status, "objective_value": version.objective_value, "optimization_reference_time": _iso(optimization_run.optimization_reference_time or optimization_run.start_time) if optimization_run else None, "first_gate_out": _iso(version.first_gate_out), "last_gate_out": _iso(version.last_gate_out), "depot_dispatch_span_minutes": version.depot_dispatch_span_minutes, "summary": version.summary_snapshot, "cost": version.cost_snapshot, "comparison": version.comparison_snapshot, "audit_events": snapshot.audit_events if snapshot else [], "parameter_snapshot": parameters.effective_parameters if parameters else {}, "parameter_checksum": parameters.parameter_checksum if parameters else None, "trips": trip_payload, "dropped_lo": dropped}
+    first_loading_start = min((trip.loading_start for trip in trips if trip.loading_start), default=None)
+    depot_operation_span_minutes = (
+        round((version.last_gate_out - first_loading_start).total_seconds() / 60)
+        if first_loading_start and version.last_gate_out
+        else version.depot_dispatch_span_minutes
+    )
+    return {"route_version_id": version.route_version_id, "version_number": version.version_number, "version_label": version.version_label, "created_at": _iso(version.created_at), "created_by": version.created_by, "reason": version.reason, "objective": version.objective, "solver_status": version.solver_status, "objective_value": version.objective_value, "optimization_reference_time": _iso(optimization_run.optimization_reference_time or optimization_run.start_time) if optimization_run else None, "first_loading_start": _iso(first_loading_start), "first_gate_out": _iso(version.first_gate_out), "last_gate_out": _iso(version.last_gate_out), "depot_dispatch_span_minutes": depot_operation_span_minutes, "summary": version.summary_snapshot, "cost": version.cost_snapshot, "comparison": version.comparison_snapshot, "audit_events": snapshot.audit_events if snapshot else [], "parameter_snapshot": parameters.effective_parameters if parameters else {}, "parameter_checksum": parameters.parameter_checksum if parameters else None, "trips": trip_payload, "dropped_lo": dropped}
 
 
 def get_trip_details(db: Session, job_id: str, version_id: str, trip_id: str) -> dict:
@@ -2132,7 +2169,7 @@ def get_simulation_data(db: Session, job_id: str, version_id: str | None = None)
     for hour in sorted(hourly):
         cumulative += hourly[hour]["gate_out_kl"]
         rows.append({"hour": hour, **hourly[hour], "cumulative_gate_out_kl": round(cumulative, 3)})
-    return {"route_version_id": version["route_version_id"], "version_label": version["version_label"], "hourly": rows, "kpis": version["summary"], "first_gate_out": version["first_gate_out"], "last_gate_out": version["last_gate_out"], "depot_dispatch_span_minutes": version["depot_dispatch_span_minutes"]}
+    return {"route_version_id": version["route_version_id"], "version_label": version["version_label"], "hourly": rows, "kpis": version["summary"], "first_loading_start": version["first_loading_start"], "first_gate_out": version["first_gate_out"], "last_gate_out": version["last_gate_out"], "depot_dispatch_span_minutes": version["depot_dispatch_span_minutes"]}
 
 
 def get_map_route(db: Session, job_id: str, version_id: str | None = None, *, vehicle_id: str | None = None, trip_number: int | None = None) -> dict:

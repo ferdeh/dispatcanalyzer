@@ -9,6 +9,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.models import (
+    ActualBayState,
     Base,
     LOOperationalState,
     MasterDepot,
@@ -19,6 +20,7 @@ from app.models import (
     OperationalStateSnapshot,
     OptimizationBayAssignment,
     OptimizationBayOperation,
+    OptimizationInitialQueue,
     OptimizationJob,
     OptimizationParameterSnapshot,
     OptimizationRun,
@@ -30,7 +32,8 @@ from app.models import (
     RouteVersionTrip,
     VehicleOperationalState,
 )
-from app.phase7_optimization import BayQueueOptimizationService, CompartmentAssignmentService, VRPOptimizationService
+from app.phase7_optimization import BayQueueOptimizationService, CompartmentAssignmentService, OptimizationCoordinatorService, VRPOptimizationService, _cp_sat_result_status
+from app import phase7_optimization
 from app.phase7_constants import constraint_catalog, constraint_is_hard, constraint_is_soft, constraint_limit_minutes, constraint_penalty, effective_parameters
 from app.phase7_matrix import RouteMatrixService
 from app import phase7_service
@@ -90,6 +93,40 @@ def test_vehicle_working_time_limit_is_owned_by_the_constraint_rule() -> None:
     })
     assert "default_vehicle_working_time_minutes" not in configured
     assert constraint_limit_minutes(configured, "vehicle_working_time") == 480
+
+
+def test_legacy_time_limit_populates_independent_route_and_bay_budgets() -> None:
+    legacy = effective_parameters({"optimization_time_limit": 17})
+    assert legacy["route_optimization_time_limit"] == 17
+    assert legacy["bay_optimization_time_limit"] == 17
+
+    configured = effective_parameters({
+        "optimization_time_limit": 17,
+        "route_optimization_time_limit": 23,
+        "bay_optimization_time_limit": 41,
+        "bay_cp_sat_workers": 6,
+    })
+    assert configured["route_optimization_time_limit"] == 23
+    assert configured["bay_optimization_time_limit"] == 41
+    assert configured["bay_cp_sat_workers"] == 6
+
+
+def test_cp_sat_unknown_and_timeout_are_not_reported_as_infeasible() -> None:
+    assert _cp_sat_result_status(
+        phase7_optimization.cp_model.UNKNOWN,
+        elapsed_seconds=1,
+        time_limit_seconds=30,
+    ) == "UNKNOWN"
+    assert _cp_sat_result_status(
+        phase7_optimization.cp_model.UNKNOWN,
+        elapsed_seconds=30,
+        time_limit_seconds=30,
+    ) == "TIMEOUT"
+    assert _cp_sat_result_status(
+        phase7_optimization.cp_model.INFEASIBLE,
+        elapsed_seconds=1,
+        time_limit_seconds=30,
+    ) == "INFEASIBLE"
 
 
 def test_delete_job_cascades_workspace_and_preserves_detached_route_audit_log() -> None:
@@ -155,9 +192,9 @@ def test_route_version_exposes_canonical_product_name() -> None:
             OptimizationParameterSnapshot(parameter_snapshot_id="PARAM-PRODUCT", job_id="JOB-PRODUCT", effective_parameters={}, parameter_checksum="product"),
         ])
         db.flush()
-        db.add(RouteVersion(route_version_id="VERSION-PRODUCT", job_id="JOB-PRODUCT", version_number=1, version_label="V1", reason="Initial", state_snapshot_id="STATE-PRODUCT", parameter_snapshot_id="PARAM-PRODUCT", objective="MIN_TOTAL_COST", solver_status="FEASIBLE"))
+        db.add(RouteVersion(route_version_id="VERSION-PRODUCT", job_id="JOB-PRODUCT", version_number=1, version_label="V1", reason="Initial", state_snapshot_id="STATE-PRODUCT", parameter_snapshot_id="PARAM-PRODUCT", objective="MIN_TOTAL_COST", solver_status="FEASIBLE", first_gate_out=DAY_START + timedelta(minutes=30), last_gate_out=DAY_START + timedelta(minutes=30), depot_dispatch_span_minutes=0))
         db.flush()
-        db.add(RouteVersionTrip(route_version_trip_id="TRIP-PRODUCT", route_version_id="VERSION-PRODUCT", vehicle_id="M1", trip_number=1, shipment_id="SHIP-1", vehicle_ready_at_depot=DAY_START, gate_out=DAY_START + timedelta(minutes=30), estimated_return_depot=DAY_START + timedelta(hours=2)))
+        db.add(RouteVersionTrip(route_version_trip_id="TRIP-PRODUCT", route_version_id="VERSION-PRODUCT", vehicle_id="M1", trip_number=1, shipment_id="SHIP-1", vehicle_ready_at_depot=DAY_START, loading_start=DAY_START + timedelta(minutes=10), loading_finish=DAY_START + timedelta(minutes=25), gate_out=DAY_START + timedelta(minutes=30), estimated_return_depot=DAY_START + timedelta(hours=2)))
         db.flush()
         db.add_all([
             RouteVersionStop(route_version_stop_id="STOP-PRODUCT", route_version_trip_id="TRIP-PRODUCT", sequence_number=1, spbu_id="S1", loading_order_ids=["LO-1"], products=["P-BIOSOLAR"], volume_kl=8),
@@ -170,6 +207,8 @@ def test_route_version_exposes_canonical_product_name() -> None:
         assert payload["trips"][0]["loading_orders"][0]["product_id"] == "P-BIOSOLAR"
         assert payload["trips"][0]["loading_orders"][0]["product_name"] == "Bio Solar"
         assert payload["trips"][0]["stops"][0]["product_names"] == ["Bio Solar"]
+        assert payload["first_loading_start"] == (DAY_START + timedelta(minutes=10)).isoformat()
+        assert payload["depot_dispatch_span_minutes"] == 20
 
 
 def test_enqueue_optimization_reserves_job_and_rejects_duplicate(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -179,7 +218,27 @@ def test_enqueue_optimization_reserves_job_and_rejects_duplicate(monkeypatch: py
     monkeypatch.setattr(phase7_service, "validate_job", lambda *_args, **_kwargs: {"status": "READY", "messages": []})
     with Session() as db:
         db.add(MasterDepot(depot_id="D1", depot_name="Depot 1", timezone="Asia/Jakarta"))
+        db.add(MasterMT(mt_id="M-ASYNC", vehicle_name_raw="MT Async", vehicle_registration="BK 1000 AA", depot_id="D1"))
+        db.add(MasterLoadingBay(master_bay_id="B-ASYNC", depot_id="D1", bay_id="BAY-1", bay_name="Bay 1"))
         db.add(OptimizationJob(job_id="JOB-ASYNC", job_no="P7-JOB-ASYNC", job_name="Async", depot_id="D1", operating_date=date(2026, 8, 26)))
+        db.flush()
+        db.add(ActualBayState(
+            actual_bay_state_id="STATE-ASYNC",
+            job_id="JOB-ASYNC",
+            master_bay_id="B-ASYNC",
+            remaining_loading_minutes=12,
+            actual_queue_length=1,
+            state_effective_at=datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc),
+        ))
+        db.add(OptimizationInitialQueue(
+            initial_queue_id="QUEUE-ASYNC",
+            job_id="JOB-ASYNC",
+            master_bay_id="B-ASYNC",
+            queue_position=1,
+            vehicle_id="M-ASYNC",
+            estimated_loading_duration_minutes=10,
+            state_effective_at=datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc),
+        ))
         db.commit()
 
         accepted = phase7_service.enqueue_optimization(
@@ -193,6 +252,10 @@ def test_enqueue_optimization_reserves_job_and_rejects_duplicate(monkeypatch: py
         assert accepted["run_type"] == "INITIAL"
         assert accepted["optimization_reference_time"] == "2026-08-26T01:00:00+00:00"
         assert db.get(OptimizationJob, "JOB-ASYNC").status == "CALCULATING"
+        actual_state = db.get(ActualBayState, "STATE-ASYNC")
+        queued = db.get(OptimizationInitialQueue, "QUEUE-ASYNC")
+        assert phase7_service._iso(actual_state.state_effective_at) == accepted["optimization_reference_time"]
+        assert phase7_service._iso(queued.state_effective_at) == accepted["optimization_reference_time"]
 
         with pytest.raises(HTTPException) as raised:
             phase7_service.enqueue_optimization(
@@ -346,6 +409,30 @@ def test_d_vehicle_availability_prevents_early_departure() -> None:
     assert result["trips"][0]["gate_out"] >= DAY_START + timedelta(hours=10)
 
 
+def test_depot_window_limits_dispatch_but_allows_return_after_close() -> None:
+    mt = vehicle("M1", eta_hour=17)
+    mt["effective_eta_depot"] = DAY_START + timedelta(hours=17, minutes=30)
+    result = VRPOptimizationService().solve(
+        loading_orders=[loading_order("LO-1", "S1")],
+        vehicles=[mt],
+        distance_matrix=[[0, 10_000], [10_000, 0]],
+        # The MT can reach the SPBU before close, but the long return leg ends
+        # after depot operating hours.
+        time_matrix=[[0, 15 * 60], [90 * 60, 0]],
+        day_start=DAY_START,
+        depot_close=DAY_START + timedelta(hours=18),
+        parameters=parameters(),
+    )
+
+    assert len(result["trips"]) == 1
+    assert result["trips"][0]["gate_out"] <= DAY_START + timedelta(hours=18)
+    assert result["trips"][0]["estimated_return_depot"] > DAY_START + timedelta(hours=18)
+    assert not any(
+        violation["constraint_id"] == "depot_operating_window"
+        for violation in result["trips"][0]["constraint_violations"]
+    )
+
+
 def test_vehicle_availability_can_be_soft_or_disabled() -> None:
     lo = loading_order("LO-1", "S1")
     lo.update({"time_window_start_minutes": 0, "time_window_end_minutes": 120})
@@ -481,6 +568,231 @@ def test_bay_product_compatibility_can_be_soft_or_disabled() -> None:
     )
     assert disabled["dropped_trip_indexes"] == []
     assert disabled["assignments"][0]["constraint_violations"] == []
+
+
+def test_bay_solver_keeps_feasible_subset_and_labels_congestion() -> None:
+    trips = [
+        {
+            "vehicle_id": f"MT-{index}",
+            "trip_number": 1,
+            "vehicle_ready_at_depot": DAY_START,
+            "lo_assignments": [{"loading_order_id": f"LO-{index}", "compartment_id": "C1", "product_id": "P1", "volume_kl": 8}],
+        }
+        for index in (1, 2)
+    ]
+    result = BayQueueOptimizationService().schedule(
+        trips=trips,
+        bays=[{
+            "master_bay_id": "B1",
+            "all_products_allowed": True,
+            "allowed_product_ids": [],
+            "number_of_loading_arms": 1,
+            "loading_mode": "SEQUENTIAL",
+            "operational_start_minutes": 0,
+            "operational_end_minutes": 15,
+        }],
+        actual_states=[],
+        initial_queue=[],
+        loading_durations={"P1": 10},
+        day_start=DAY_START,
+        depot_close=DAY_START + timedelta(hours=18),
+        parameters=parameters(),
+    )
+
+    assert result["solver_status"] == "PARTIAL"
+    assert len(result["assignments"]) == 1
+    assert len(result["dropped_trip_indexes"]) == 1
+    dropped_index = result["dropped_trip_indexes"][0]
+    assert result["dropped_trip_reasons"][dropped_index] == "BAY_CONGESTION"
+    assert result["num_search_workers"] == 8
+
+
+def test_soft_bay_service_drops_only_later_trip_ready_after_depot_close() -> None:
+    trips = [
+        {
+            "vehicle_id": "MT-1",
+            "trip_number": 1,
+            "vehicle_ready_at_depot": DAY_START + timedelta(hours=17),
+            "lo_assignments": [{"loading_order_id": "LO-1", "compartment_id": "C1", "product_id": "P1", "volume_kl": 8}],
+        },
+        {
+            "vehicle_id": "MT-1",
+            "trip_number": 2,
+            "vehicle_ready_at_depot": DAY_START + timedelta(hours=19),
+            "lo_assignments": [{"loading_order_id": "LO-2", "compartment_id": "C1", "product_id": "P1", "volume_kl": 8}],
+        },
+    ]
+    result = BayQueueOptimizationService().schedule(
+        trips=trips,
+        bays=[{
+            "master_bay_id": "B1",
+            "all_products_allowed": True,
+            "allowed_product_ids": [],
+            "number_of_loading_arms": 1,
+            "loading_mode": "SEQUENTIAL",
+            "operational_start_minutes": 0,
+            "operational_end_minutes": 18 * 60,
+        }],
+        actual_states=[],
+        initial_queue=[],
+        loading_durations={"P1": 10},
+        day_start=DAY_START,
+        depot_close=DAY_START + timedelta(hours=18),
+        parameters=parameters(),
+    )
+
+    assert result["solver_status"] == "PARTIAL"
+    assert [row["trip_index"] for row in result["assignments"]] == [0]
+    assert result["dropped_trip_indexes"] == [1]
+    assert result["dropped_trip_reasons"] == {1: "BAY_CONGESTION"}
+
+
+def test_hard_serve_loading_order_keeps_all_or_reports_infeasible() -> None:
+    trips = [
+        {
+            "vehicle_id": f"MT-{index}",
+            "trip_number": 1,
+            "vehicle_ready_at_depot": DAY_START,
+            "lo_assignments": [{"loading_order_id": f"LO-{index}", "compartment_id": "C1", "product_id": "P1", "volume_kl": 8}],
+        }
+        for index in (1, 2)
+    ]
+    result = BayQueueOptimizationService().schedule(
+        trips=trips,
+        bays=[{
+            "master_bay_id": "B1",
+            "all_products_allowed": True,
+            "allowed_product_ids": [],
+            "number_of_loading_arms": 1,
+            "loading_mode": "SEQUENTIAL",
+            "operational_start_minutes": 0,
+            "operational_end_minutes": 15,
+        }],
+        actual_states=[],
+        initial_queue=[],
+        loading_durations={"P1": 10},
+        day_start=DAY_START,
+        depot_close=DAY_START + timedelta(hours=18),
+        parameters=parameters(**constraint_override("serve_loading_order", mode="HARD")),
+    )
+
+    assert result["solver_status"] == "INFEASIBLE"
+    assert result["assignments"] == []
+    assert result["dropped_trip_indexes"] == [0, 1]
+    assert set(result["dropped_trip_reasons"].values()) == {"BAY_CONGESTION"}
+
+
+def test_coordinator_persists_partial_bay_congestion_instead_of_product_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    trips = [
+        {
+            "vehicle_id": f"MT-{index}",
+            "trip_number": 1,
+            "vehicle_ready_at_depot": DAY_START,
+            "gate_out": DAY_START,
+            "estimated_return_depot": DAY_START + timedelta(hours=1),
+            "operating_minutes": 60,
+            "constraint_violations": [],
+            "constraint_penalty_cost": 0,
+            "lo_assignments": [{"loading_order_id": f"LO-{index}", "compartment_id": "C1", "product_id": "P1", "volume_kl": 8}],
+        }
+        for index in (1, 2)
+    ]
+    coordinator = OptimizationCoordinatorService()
+    monkeypatch.setattr(coordinator.vrp, "solve", lambda **_kwargs: {
+        "solver_status": "FEASIBLE",
+        "objective_value": 0,
+        "trips": trips,
+        "dropped": [],
+        "vehicle_state": [],
+        "solver_metadata": {},
+    })
+    result = coordinator.optimize(
+        loading_orders=[],
+        vehicles=[
+            {"mt_id": "MT-1", "working_time_limit_minutes": 600, "working_time_used_minutes": 0},
+            {"mt_id": "MT-2", "working_time_limit_minutes": 600, "working_time_used_minutes": 0},
+        ],
+        distance_matrix=[[0]],
+        time_matrix=[[0]],
+        bays=[{
+            "master_bay_id": "B1",
+            "all_products_allowed": True,
+            "allowed_product_ids": [],
+            "number_of_loading_arms": 1,
+            "loading_mode": "SEQUENTIAL",
+            "operational_start_minutes": 0,
+            "operational_end_minutes": 15,
+        }],
+        actual_bay_states=[],
+        initial_queue=[],
+        loading_durations={"P1": 10},
+        day_start=DAY_START,
+        depot_close=DAY_START + timedelta(hours=18),
+        parameters=parameters(max_coordination_iterations=1),
+    )
+
+    assert result["solver_status"] == "PARTIAL"
+    assert len(result["trips"]) == 1
+    assert len(result["dropped"]) == 1
+    assert result["dropped"][0]["reason_code"] == "BAY_CONGESTION"
+    assert result["solver_metadata"]["bay_served_trip_count"] == 1
+    assert result["solver_metadata"]["bay_dropped_trip_count"] == 1
+
+
+def test_coordinator_keeps_trip_that_gates_out_before_close_and_returns_after(monkeypatch: pytest.MonkeyPatch) -> None:
+    trip = {
+        "vehicle_id": "MT-1",
+        "trip_number": 1,
+        "vehicle_ready_at_depot": DAY_START + timedelta(hours=17, minutes=40),
+        "preliminary_gate_out": DAY_START + timedelta(hours=17, minutes=40),
+        "gate_out": DAY_START + timedelta(hours=17, minutes=40),
+        "estimated_return_depot": DAY_START + timedelta(hours=18, minutes=40),
+        "distance_meters": 10_000,
+        "driving_seconds": 3_600,
+        "service_seconds": 0,
+        "operating_minutes": 60,
+        "stops": [],
+        "lo_assignments": [{"loading_order_id": "LO-1", "compartment_id": "C1", "product_id": "P1", "volume_kl": 8}],
+        "constraint_violations": [],
+        "constraint_penalty_cost": 0,
+    }
+    coordinator = OptimizationCoordinatorService()
+    monkeypatch.setattr(coordinator.vrp, "solve", lambda **_kwargs: {
+        "solver_status": "FEASIBLE",
+        "objective_value": 0,
+        "trips": [trip],
+        "dropped": [],
+        "vehicle_state": [],
+        "solver_metadata": {},
+    })
+
+    result = coordinator.optimize(
+        loading_orders=[],
+        vehicles=[{"mt_id": "MT-1", "working_time_limit_minutes": 600, "working_time_used_minutes": 0}],
+        distance_matrix=[[0]],
+        time_matrix=[[0]],
+        bays=[{
+            "master_bay_id": "B1",
+            "all_products_allowed": True,
+            "allowed_product_ids": [],
+            "number_of_loading_arms": 1,
+            "loading_mode": "SEQUENTIAL",
+            "operational_start_minutes": 0,
+            "operational_end_minutes": 18 * 60,
+        }],
+        actual_bay_states=[],
+        initial_queue=[],
+        loading_durations={"P1": 10},
+        day_start=DAY_START,
+        depot_close=DAY_START + timedelta(hours=18),
+        parameters=parameters(),
+    )
+
+    assert result["solver_status"] == "FEASIBLE"
+    assert len(result["trips"]) == 1
+    assert result["trips"][0]["gate_out"] <= DAY_START + timedelta(hours=18)
+    assert result["trips"][0]["estimated_return_depot"] > DAY_START + timedelta(hours=18)
+    assert result["dropped"] == []
 
 
 def test_i_initial_queue_delays_future_gate_out() -> None:

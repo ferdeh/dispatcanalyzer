@@ -28,6 +28,21 @@ def _minutes_between(start: datetime, end: datetime) -> int:
     return max(0, math.ceil((_utc(end) - _utc(start)).total_seconds() / 60))
 
 
+def _cp_sat_result_status(status: int, *, elapsed_seconds: float, time_limit_seconds: int) -> str:
+    """Translate CP-SAT termination without calling UNKNOWN infeasible."""
+    if status == cp_model.OPTIMAL:
+        return "OPTIMAL"
+    if status == cp_model.FEASIBLE:
+        return "FEASIBLE"
+    if status == cp_model.INFEASIBLE:
+        return "INFEASIBLE"
+    if status == cp_model.MODEL_INVALID:
+        return "FAILED"
+    if status == cp_model.UNKNOWN and elapsed_seconds >= max(0.01, time_limit_seconds * 0.95):
+        return "TIMEOUT"
+    return "UNKNOWN"
+
+
 class CompartmentAssignmentService:
     """Assign complete LOs to compartments with one product per compartment."""
 
@@ -138,7 +153,7 @@ class CompartmentAssignmentService:
         )
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = float(max(1, time_limit_seconds))
-        solver.parameters.num_search_workers = 1
+        solver.parameters.num_search_workers = max(1, int(parameters.get("bay_cp_sat_workers", 8)))
         status = solver.solve(model)
         if status not in {cp_model.OPTIMAL, cp_model.FEASIBLE}:
             return {"feasible": False, "assignments": [], "reason": "COMPARTMENT_INFEASIBLE", "engine": "OR_TOOLS_CP_SAT", "constraint_violations": [], "penalty_cost": 0}
@@ -236,7 +251,15 @@ class VRPOptimizationService:
             return math.ceil(time_matrix[source][target] / 60) + (service_minutes if source else 0)
 
         minute_index = routing.RegisterTransitCallback(minute_callback)
-        time_horizon = max(depot_close_minutes + 24 * 60, 1)
+        # Depot operating hours govern loading/gate-out, not the vehicle's
+        # eventual return.  Keep enough route horizon after depot close for a
+        # dispatched MT to finish its delivery and return, while the bay model
+        # remains responsible for the actual gate-out cutoff.
+        maximum_working_minutes = max(
+            (int(vehicle.get("working_time_remaining_minutes") or 0) for vehicle in vehicles),
+            default=0,
+        )
+        time_horizon = max(depot_close_minutes + max(24 * 60, maximum_working_minutes), 1)
         routing.AddDimension(minute_index, 24 * 60, time_horizon, False, "Time")
         time_dimension = routing.GetDimensionOrDie("Time")
 
@@ -322,12 +345,13 @@ class VRPOptimizationService:
                 available_minutes if constraint_is_hard(parameters, "vehicle_availability") else 0,
                 depot_open_minutes if constraint_is_hard(parameters, "depot_operating_window") else 0,
             )
-            hard_end_limits = [time_horizon]
-            if constraint_is_hard(parameters, "depot_operating_window"):
-                hard_end_limits.append(depot_close_minutes)
-            maximum_end = min(hard_end_limits)
-            time_dimension.CumulVar(routing.Start(vehicle_index)).SetRange(start_minimum, maximum_end)
-            time_dimension.CumulVar(routing.End(vehicle_index)).SetRange(start_minimum, maximum_end)
+            maximum_start = (
+                depot_close_minutes
+                if constraint_is_hard(parameters, "depot_operating_window")
+                else time_horizon
+            )
+            time_dimension.CumulVar(routing.Start(vehicle_index)).SetRange(start_minimum, maximum_start)
+            time_dimension.CumulVar(routing.End(vehicle_index)).SetRange(start_minimum, time_horizon)
             if constraint_is_hard(parameters, "vehicle_working_time"):
                 time_dimension.SetSpanUpperBoundForVehicle(int(vehicle["working_time_remaining_minutes"]), vehicle_index)
             elif constraint_is_soft(parameters, "vehicle_working_time"):
@@ -347,13 +371,15 @@ class VRPOptimizationService:
                 soft_bound = max(bound for bound, _ in soft_start_bounds)
                 soft_penalty = sum(penalty for bound, penalty in soft_start_bounds if bound == soft_bound)
                 time_dimension.SetCumulVarSoftLowerBound(routing.Start(vehicle_index), soft_bound, max(1, soft_penalty))
-            soft_end_bounds = []
+            soft_gate_out_bounds = []
             if constraint_is_soft(parameters, "depot_operating_window"):
-                soft_end_bounds.append((depot_close_minutes, constraint_penalty(parameters, "depot_operating_window")))
-            if soft_end_bounds:
-                soft_bound = min(bound for bound, _ in soft_end_bounds)
-                soft_penalty = sum(penalty for bound, penalty in soft_end_bounds if bound == soft_bound)
-                time_dimension.SetCumulVarSoftUpperBound(routing.End(vehicle_index), soft_bound, max(1, soft_penalty))
+                soft_gate_out_bounds.append((depot_close_minutes, constraint_penalty(parameters, "depot_operating_window")))
+            if soft_gate_out_bounds:
+                soft_bound = min(bound for bound, _ in soft_gate_out_bounds)
+                soft_penalty = sum(penalty for bound, penalty in soft_gate_out_bounds if bound == soft_bound)
+                # Routing.Start is the preliminary dispatch time. Bay CP-SAT
+                # later replaces it with the authoritative loading/gate-out.
+                time_dimension.SetCumulVarSoftUpperBound(routing.Start(vehicle_index), soft_bound, max(1, soft_penalty))
             if constraint_is_soft(parameters, "vehicle_capacity"):
                 capacity_dimension.SetCumulVarSoftUpperBound(
                     routing.End(vehicle_index),
@@ -434,7 +460,9 @@ class VRPOptimizationService:
         search = pywrapcp.DefaultRoutingSearchParameters()
         search.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PARALLEL_CHEAPEST_INSERTION
         search.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-        search.time_limit.FromSeconds(int(parameters.get("optimization_time_limit", 30)))
+        search.time_limit.FromSeconds(
+            int(parameters.get("route_round_time_limit", parameters.get("route_optimization_time_limit", 30)))
+        )
         search.log_search = False
 
         warm_routes: list[list[int]] = [[] for _ in vehicles]
@@ -445,7 +473,14 @@ class VRPOptimizationService:
         warm_assignment = routing.ReadAssignmentFromRoutes(warm_routes, True) if any(warm_routes) else None
         solution = routing.SolveFromAssignmentWithParameters(warm_assignment, search) if warm_assignment else routing.SolveWithParameters(search)
         if solution is None:
-            return [], set(), "INFEASIBLE", 0.0
+            routing_status = routing.status()
+            if routing_status == getattr(routing_enums_pb2.RoutingSearchStatus, "ROUTING_FAIL_TIMEOUT", None):
+                solver_status = "TIMEOUT"
+            elif routing_status == routing_enums_pb2.RoutingSearchStatus.ROUTING_NOT_SOLVED:
+                solver_status = "UNKNOWN"
+            else:
+                solver_status = "INFEASIBLE"
+            return [], set(), solver_status, 0.0
         routes: list[dict] = []
         served: set[int] = set()
         for vehicle_index in range(len(vehicles)):
@@ -474,7 +509,7 @@ class VRPOptimizationService:
         parameters: dict,
     ) -> dict:
         solve_started = perf_counter()
-        solve_time_limit = max(1, int(parameters.get("optimization_time_limit", 30)))
+        solve_time_limit = max(1, int(parameters.get("route_optimization_time_limit", parameters.get("optimization_time_limit", 30))))
         solve_deadline = solve_started + solve_time_limit
         time_limit_reached = False
         remaining = [dict(row) for row in loading_orders]
@@ -497,6 +532,11 @@ class VRPOptimizationService:
                 time_limit_reached = True
                 break
             remaining_seconds = max(1, math.ceil(remaining_budget))
+            remaining_rounds = max(1, max_trips - trip_round + 1)
+            # Reserve search time for later physical-trip rounds. Previously
+            # round 1 could consume the entire route budget and prevent the
+            # multi-trip loop from ever starting round 2.
+            round_time_limit = max(1, remaining_seconds // remaining_rounds)
             active_vehicles = [
                 row for row in vehicle_state.values()
                 if (row.get("operational_status") != "UNAVAILABLE" or not constraint_is_hard(parameters, "vehicle_availability"))
@@ -523,7 +563,7 @@ class VRPOptimizationService:
                 time_matrix=round_time,
                 day_start=day_start,
                 depot_close_minutes=depot_close_minutes,
-                parameters={**parameters, "optimization_time_limit": max(1, min(solve_time_limit, remaining_seconds))},
+                parameters={**parameters, "route_round_time_limit": round_time_limit},
             )
             solver_statuses.append(status)
             objective_value += round_objective
@@ -570,7 +610,7 @@ class VRPOptimizationService:
                 distance_meters = sum(int(stop["leg_distance_meters"]) for stop in stops) + int(distance_matrix[previous][0])
                 operating_minutes = _minutes_between(ready, preliminary_return)
                 if (
-                    constraint_is_hard(parameters, "depot_operating_window") and preliminary_return > _utc(depot_close)
+                    constraint_is_hard(parameters, "depot_operating_window") and ready > _utc(depot_close)
                 ) or (
                     constraint_is_hard(parameters, "vehicle_working_time") and operating_minutes > int(vehicle["working_time_remaining_minutes"])
                 ):
@@ -587,7 +627,7 @@ class VRPOptimizationService:
                     constraint_violations.append({"constraint_id": "depot_operating_window", "penalty": constraint_penalty(parameters, "depot_operating_window"), "entity": vehicle["mt_id"]})
                 if operating_minutes > int(vehicle["working_time_remaining_minutes"]) and constraint_is_soft(parameters, "vehicle_working_time"):
                     constraint_violations.append({"constraint_id": "vehicle_working_time", "penalty": constraint_penalty(parameters, "vehicle_working_time"), "entity": vehicle["mt_id"]})
-                if preliminary_return > _utc(depot_close) and constraint_is_soft(parameters, "depot_operating_window"):
+                if ready > _utc(depot_close) and constraint_is_soft(parameters, "depot_operating_window"):
                     constraint_violations.append({"constraint_id": "depot_operating_window", "penalty": constraint_penalty(parameters, "depot_operating_window"), "entity": vehicle["mt_id"]})
                 for lo in route_los:
                     for constraint_id in (lo.get("constraint_violations_by_vehicle") or {}).get(vehicle["mt_id"], []):
@@ -675,7 +715,11 @@ class VRPOptimizationService:
         elif trips:
             final_status = "OPTIMAL" if solver_statuses and all(status == "OPTIMAL" for status in solver_statuses) else "FEASIBLE"
         else:
-            final_status = "INFEASIBLE"
+            terminal_status = next(
+                (status for status in reversed(solver_statuses) if status in {"TIMEOUT", "UNKNOWN"}),
+                None,
+            )
+            final_status = terminal_status or "INFEASIBLE"
         return {
             "solver_status": final_status,
             "objective_value": objective_value,
@@ -686,7 +730,9 @@ class VRPOptimizationService:
                 "engine": "OR_TOOLS_ROUTING" if ORTOOLS_AVAILABLE else "DETERMINISTIC_FALLBACK",
                 "round_statuses": solver_statuses,
                 "multi_trip_rounds": max((trip["trip_number"] for trip in trips), default=0),
+                "route_time_limit_seconds": solve_time_limit,
                 "time_limit_seconds": solve_time_limit,
+                "route_time_limit_reached": time_limit_reached,
                 "time_limit_reached": time_limit_reached,
                 "duration_ms": round((perf_counter() - solve_started) * 1000),
                 "constraint_violation_count": sum(len(trip.get("constraint_violations") or []) for trip in trips),
@@ -731,7 +777,7 @@ class BayQueueOptimizationService:
         parameters: dict,
     ) -> dict:
         if not trips:
-            return {"solver_status": "FEASIBLE", "assignments": [], "dropped_trip_indexes": [], "engine": "OR_TOOLS_CP_SAT"}
+            return {"solver_status": "FEASIBLE", "assignments": [], "dropped_trip_indexes": [], "dropped_trip_reasons": {}, "engine": "OR_TOOLS_CP_SAT"}
         if not ORTOOLS_AVAILABLE:
             return self._fallback_schedule(
                 trips=trips, bays=bays, actual_states=actual_states, initial_queue=initial_queue,
@@ -769,6 +815,7 @@ class BayQueueOptimizationService:
         model = cp_model.CpModel()
         starts: dict[int, Any] = {}
         ends: dict[int, Any] = {}
+        served: dict[int, Any] = {}
         presences: dict[tuple[int, int], Any] = {}
         intervals_by_bay: dict[int, list[Any]] = defaultdict(list)
         duration_by_trip_bay: dict[tuple[int, int], int] = {}
@@ -777,10 +824,14 @@ class BayQueueOptimizationService:
         violation_vars: dict[tuple[str, int, int | None], Any] = {}
         gate_process = int(parameters.get("gate_process_time", 5))
         for trip_index, trip in enumerate(trips):
+            served[trip_index] = model.new_bool_var(f"trip_{trip_index}_served")
             starts[trip_index] = model.new_int_var(0, horizon, f"trip_{trip_index}_start")
             ends[trip_index] = model.new_int_var(0, horizon, f"trip_{trip_index}_end")
             ready = _minutes_between(day_start, trip["vehicle_ready_at_depot"])
-            model.add(starts[trip_index] >= ready)
+            # An omitted soft-service trip must not make the whole model
+            # infeasible merely because its MT becomes ready after depot close.
+            # Readiness is operationally relevant only when the trip is served.
+            model.add(starts[trip_index] >= ready).only_enforce_if(served[trip_index])
             trip_products = {str(row.get("product_id") or "UNKNOWN") for row in trip.get("lo_assignments") or []}
             current_bays = {str(row["current_bay_id"]) for row in trip.get("lo_assignments") or [] if row.get("current_bay_id")}
             for bay_index, bay in enumerate(bays):
@@ -846,15 +897,37 @@ class BayQueueOptimizationService:
                     objective_terms.append(constraint_penalty(parameters, "bay_actual_queue") * violation)
                     violation_vars["bay_actual_queue", trip_index, bay_index] = violation
             if eligible_by_trip[trip_index]:
-                model.add(sum(presences[trip_index, bay_index] for bay_index in eligible_by_trip[trip_index]) == 1)
+                model.add(
+                    sum(presences[trip_index, bay_index] for bay_index in eligible_by_trip[trip_index])
+                    == served[trip_index]
+                )
+            else:
+                model.add(served[trip_index] == 0)
+            if constraint_is_hard(parameters, "serve_loading_order"):
+                model.add(served[trip_index] == 1)
+            elif constraint_is_soft(parameters, "serve_loading_order"):
+                lo_count = max(1, len(trip.get("lo_assignments") or []))
+                objective_terms.append(
+                    constraint_penalty(parameters, "serve_loading_order") * lo_count * (1 - served[trip_index])
+                )
             if constraint_is_hard(parameters, "depot_operating_window"):
-                model.add(ends[trip_index] + gate_process <= depot_close_minutes)
+                model.add(ends[trip_index] + gate_process <= depot_close_minutes).only_enforce_if(served[trip_index])
             elif constraint_is_soft(parameters, "depot_operating_window"):
                 violation = model.new_bool_var(f"depot_window_violation_{trip_index}")
                 model.add(ends[trip_index] + gate_process <= depot_close_minutes + horizon * violation)
                 model.add(ends[trip_index] + gate_process >= depot_close_minutes + 1).only_enforce_if(violation)
+                model.add(violation <= served[trip_index])
                 objective_terms.append(constraint_penalty(parameters, "depot_operating_window") * violation)
                 violation_vars["depot_operating_window", trip_index, None] = violation
+        # Later trips of one physical MT cannot be kept if an earlier trip is
+        # omitted from the loading sequence.
+        trip_indexes_by_vehicle: dict[str, list[int]] = defaultdict(list)
+        for trip_index, trip in enumerate(trips):
+            trip_indexes_by_vehicle[str(trip.get("vehicle_id") or "")].append(trip_index)
+        for indexes in trip_indexes_by_vehicle.values():
+            indexes.sort(key=lambda index: int(trips[index].get("trip_number") or index + 1))
+            for previous, current in zip(indexes, indexes[1:]):
+                model.add(served[current] <= served[previous])
         if constraint_is_hard(parameters, "bay_no_overlap"):
             for intervals in intervals_by_bay.values():
                 model.add_no_overlap(intervals)
@@ -879,16 +952,49 @@ class BayQueueOptimizationService:
                         violation_vars["bay_no_overlap", left, right * 10_000 + bay_index] = violation
         schedulable = [index for index in range(len(trips)) if eligible_by_trip[index]]
         if not schedulable:
-            return {"solver_status": "INFEASIBLE", "assignments": [], "dropped_trip_indexes": list(range(len(trips))), "engine": "OR_TOOLS_CP_SAT"}
+            dropped = list(range(len(trips)))
+            return {
+                "solver_status": "INFEASIBLE",
+                "assignments": [],
+                "dropped_trip_indexes": dropped,
+                "dropped_trip_reasons": {index: "BAY_PRODUCT_CONSTRAINT" for index in dropped},
+                "engine": "OR_TOOLS_CP_SAT",
+            }
         model.minimize(sum(ends[index] for index in schedulable) + sum(objective_terms))
         solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = float(max(1, int(parameters.get("optimization_time_limit", 30))))
-        solver.parameters.num_search_workers = 1
+        time_limit_seconds = max(1, int(parameters.get("bay_optimization_time_limit", parameters.get("optimization_time_limit", 30))))
+        worker_count = max(1, int(parameters.get("bay_cp_sat_workers", 8)))
+        solver.parameters.max_time_in_seconds = float(time_limit_seconds)
+        solver.parameters.num_search_workers = worker_count
+        solve_started = perf_counter()
         status = solver.solve(model)
+        solve_elapsed = perf_counter() - solve_started
+        translated_status = _cp_sat_result_status(
+            status,
+            elapsed_seconds=solve_elapsed,
+            time_limit_seconds=time_limit_seconds,
+        )
         if status not in {cp_model.OPTIMAL, cp_model.FEASIBLE}:
-            return {"solver_status": "INFEASIBLE", "assignments": [], "dropped_trip_indexes": list(range(len(trips))), "engine": "OR_TOOLS_CP_SAT"}
+            dropped = list(range(len(trips))) if translated_status == "INFEASIBLE" else []
+            return {
+                "solver_status": translated_status,
+                "assignments": [],
+                "dropped_trip_indexes": dropped,
+                "dropped_trip_reasons": {
+                    index: ("BAY_PRODUCT_CONSTRAINT" if not eligible_by_trip[index] else "BAY_CONGESTION")
+                    for index in dropped
+                },
+                "engine": "OR_TOOLS_CP_SAT",
+                "raw_solver_status": solver.status_name(status),
+                "time_limit_seconds": time_limit_seconds,
+                "time_limit_reached": translated_status == "TIMEOUT",
+                "num_search_workers": worker_count,
+                "duration_ms": round(solve_elapsed * 1000),
+            }
         assignments = []
         for trip_index in schedulable:
+            if not solver.value(served[trip_index]):
+                continue
             bay_index = next(index for index in eligible_by_trip[trip_index] if solver.value(presences[trip_index, index]))
             trip = trips[trip_index]
             start_minutes = solver.value(starts[trip_index])
@@ -914,11 +1020,23 @@ class BayQueueOptimizationService:
                     ],
                 }
             )
+        served_indexes = {row["trip_index"] for row in assignments}
+        dropped = [index for index in range(len(trips)) if index not in served_indexes]
+        dropped_reasons = {
+            index: ("BAY_PRODUCT_CONSTRAINT" if not eligible_by_trip[index] else "BAY_CONGESTION")
+            for index in dropped
+        }
         return {
-            "solver_status": "OPTIMAL" if status == cp_model.OPTIMAL else "FEASIBLE",
+            "solver_status": "PARTIAL" if assignments and dropped else translated_status,
             "assignments": assignments,
-            "dropped_trip_indexes": [index for index in range(len(trips)) if index not in schedulable],
+            "dropped_trip_indexes": dropped,
+            "dropped_trip_reasons": dropped_reasons,
             "engine": "OR_TOOLS_CP_SAT",
+            "raw_solver_status": solver.status_name(status),
+            "time_limit_seconds": time_limit_seconds,
+            "time_limit_reached": False,
+            "num_search_workers": worker_count,
+            "duration_ms": round(solve_elapsed * 1000),
         }
 
     def _fallback_schedule(
@@ -941,10 +1059,12 @@ class BayQueueOptimizationService:
             value += timedelta(minutes=sum(int(row.get("estimated_loading_duration_minutes") or 0) for row in queue_rows))
             available[bay["master_bay_id"]] = value
         assignments, dropped = [], []
+        dropped_reasons: dict[int, str] = {}
         for trip_index, trip in sorted(enumerate(trips), key=lambda item: _utc(item[1]["vehicle_ready_at_depot"])):
             products = {str(row.get("product_id") or "UNKNOWN") for row in trip.get("lo_assignments") or []}
             current_bays = {str(row["current_bay_id"]) for row in trip.get("lo_assignments") or [] if row.get("current_bay_id")}
             candidates = []
+            structurally_eligible = False
             for bay in bays:
                 product_violation = not bay.get("all_products_allowed") and not products.issubset(set(bay.get("allowed_product_ids") or []))
                 if product_violation and constraint_is_hard(parameters, "bay_product_compatibility"):
@@ -956,6 +1076,7 @@ class BayQueueOptimizationService:
                     duration = self.loading_minutes(trip, loading_durations, loading_mode=str(bay.get("loading_mode") or "SEQUENTIAL"), arms=int(bay.get("number_of_loading_arms") or 1), parameters=parameters)
                 except ValueError:
                     continue
+                structurally_eligible = True
                 ready = _utc(trip["vehicle_ready_at_depot"])
                 blocked = available[bay["master_bay_id"]]
                 bay_open = _utc(day_start) + timedelta(minutes=int(bay.get("operational_start_minutes") or 0))
@@ -985,12 +1106,14 @@ class BayQueueOptimizationService:
                 candidates.append((sum(float(row["penalty"]) for row in violations), start, bay, duration, violations))
             if not candidates:
                 dropped.append(trip_index)
+                dropped_reasons[trip_index] = "BAY_CONGESTION" if structurally_eligible else "BAY_PRODUCT_CONSTRAINT"
                 continue
             _, start, bay, duration, violations = min(candidates, key=lambda row: (row[0], row[1], row[2]["master_bay_id"]))
             finish = start + timedelta(minutes=duration)
             gate_out = finish + timedelta(minutes=int(parameters.get("gate_process_time", 5)))
             if gate_out > _utc(depot_close) and constraint_is_hard(parameters, "depot_operating_window"):
                 dropped.append(trip_index)
+                dropped_reasons[trip_index] = "BAY_CONGESTION"
                 continue
             if gate_out > _utc(depot_close) and constraint_is_soft(parameters, "depot_operating_window"):
                 violations.append({"constraint_id": "depot_operating_window", "penalty": constraint_penalty(parameters, "depot_operating_window"), "entity": bay["master_bay_id"]})
@@ -998,7 +1121,27 @@ class BayQueueOptimizationService:
             if constraint_rule(parameters, "bay_no_overlap").get("enabled", True):
                 available[bay["master_bay_id"]] = max(available[bay["master_bay_id"]], finish)
             assignments.append({"trip_index": trip_index, "master_bay_id": bay["master_bay_id"], "vehicle_ready_at_depot": ready, "queue_start": ready, "loading_start": start, "loading_finish": finish, "gate_out": gate_out, "queue_minutes": _minutes_between(ready, start), "loading_minutes": duration, "constraint_violations": violations})
-        return {"solver_status": "FEASIBLE" if assignments else "INFEASIBLE", "assignments": assignments, "dropped_trip_indexes": dropped, "engine": "DETERMINISTIC_FALLBACK"}
+        if dropped and constraint_is_hard(parameters, "serve_loading_order"):
+            assignments = []
+            dropped = list(range(len(trips)))
+            dropped_reasons = {
+                index: dropped_reasons.get(index, "BAY_CONGESTION")
+                for index in dropped
+            }
+            solver_status = "INFEASIBLE"
+        elif assignments and dropped:
+            solver_status = "PARTIAL"
+        else:
+            solver_status = "FEASIBLE" if assignments else "INFEASIBLE"
+        return {
+            "solver_status": solver_status,
+            "assignments": assignments,
+            "dropped_trip_indexes": dropped,
+            "dropped_trip_reasons": dropped_reasons,
+            "engine": "DETERMINISTIC_FALLBACK",
+            "num_search_workers": 0,
+            "time_limit_reached": False,
+        }
 
 
 class OptimizationCoordinatorService:
@@ -1031,19 +1174,22 @@ class OptimizationCoordinatorService:
             parameters=parameters,
         )
         coordination_started = perf_counter()
-        coordination_time_limit = max(1, int(parameters.get("optimization_time_limit", 30)))
+        coordination_time_limit = max(1, int(parameters.get("bay_optimization_time_limit", parameters.get("optimization_time_limit", 30))))
         coordination_deadline = coordination_started + coordination_time_limit
         coordination_time_limit_reached = False
         trips = vrp_result["trips"]
         iterations = 0
         previous_gateouts: list[datetime] = []
-        bay_result = {"solver_status": "FEASIBLE", "assignments": [], "dropped_trip_indexes": [], "engine": "OR_TOOLS_CP_SAT"}
-        for iterations in range(1, int(parameters.get("max_coordination_iterations", 5)) + 1):
+        bay_result = {"solver_status": "FEASIBLE", "assignments": [], "dropped_trip_indexes": [], "dropped_trip_reasons": {}, "engine": "OR_TOOLS_CP_SAT"}
+        max_iterations = int(parameters.get("max_coordination_iterations", 5))
+        for iterations in range(1, max_iterations + 1):
             remaining_budget = coordination_deadline - perf_counter()
             if remaining_budget <= 0:
                 coordination_time_limit_reached = True
                 break
             remaining_seconds = max(1, math.ceil(remaining_budget))
+            remaining_iterations = max(1, max_iterations - iterations + 1)
+            iteration_time_limit = max(1, remaining_seconds // remaining_iterations)
             # Propagate the previous trip's return so one physical MT cannot
             # overlap itself after bay waiting shifts a gate-out.
             last_return: dict[str, datetime] = {}
@@ -1059,7 +1205,7 @@ class OptimizationCoordinatorService:
                 loading_durations=loading_durations,
                 day_start=day_start,
                 depot_close=depot_close,
-                parameters={**parameters, "optimization_time_limit": max(1, min(coordination_time_limit, remaining_seconds))},
+                parameters={**parameters, "bay_optimization_time_limit": iteration_time_limit},
             )
             assignment_by_trip = {row["trip_index"]: row for row in bay_result["assignments"]}
             current_gateouts = []
@@ -1081,22 +1227,42 @@ class OptimizationCoordinatorService:
                 if delta <= float(parameters.get("departure_time_tolerance_minutes", 5)):
                     break
             previous_gateouts = current_gateouts
+            if bay_result["solver_status"] in {"TIMEOUT", "UNKNOWN", "FAILED", "INFEASIBLE"}:
+                coordination_time_limit_reached = bay_result["solver_status"] == "TIMEOUT"
+                break
 
         bay_dropped = set(bay_result.get("dropped_trip_indexes") or [])
+        bay_drop_reason_codes = {
+            int(index): reason
+            for index, reason in (bay_result.get("dropped_trip_reasons") or {}).items()
+        }
+        terminal_bay_status = bay_result.get("solver_status") if bay_result.get("solver_status") in {"TIMEOUT", "UNKNOWN", "FAILED"} else None
+        terminal_solver_status = terminal_bay_status or (
+            vrp_result.get("solver_status")
+            if vrp_result.get("solver_status") in {"TIMEOUT", "UNKNOWN", "FAILED"}
+            else None
+        )
+        if terminal_bay_status and not bay_result.get("assignments"):
+            bay_dropped.update(range(len(trips)))
+            for index in bay_dropped:
+                bay_drop_reason_codes.setdefault(index, "BAY_CONGESTION")
+        reason_descriptions = {
+            "BAY_PRODUCT_CONSTRAINT": "No eligible loading bay satisfies the active hard product, loading-duration, or bay-stability constraints.",
+            "BAY_CONGESTION": "The bay scheduler omitted this otherwise eligible trip because available bay capacity/time was insufficient relative to the Serve Loading Order penalty.",
+        }
         hard_drop_reasons = {
-            index: ("BAY_PRODUCT_CONSTRAINT", "No eligible loading bay satisfies the active hard bay constraints.")
+            index: (
+                bay_drop_reason_codes.get(index, "BAY_CONGESTION"),
+                reason_descriptions[bay_drop_reason_codes.get(index, "BAY_CONGESTION")],
+            )
             for index in bay_dropped
         }
         tolerance = int(parameters.get("departure_time_tolerance_minutes", 5))
         working_limit_by_vehicle = {row["mt_id"]: int(row["working_time_limit_minutes"]) for row in vehicles}
         cumulative_working_minutes = {row["mt_id"]: int(row.get("working_time_used_minutes") or 0) for row in vehicles}
         for trip_index, trip in enumerate(trips):
-            if trip["estimated_return_depot"] > _utc(depot_close):
-                if constraint_is_hard(parameters, "depot_operating_window"):
-                    bay_dropped.add(trip_index)
-                    hard_drop_reasons[trip_index] = ("DEPOT_TIME_EXHAUSTED", "Trip would return after the active hard depot operating window.")
-                elif constraint_is_soft(parameters, "depot_operating_window") and not any(row.get("constraint_id") == "depot_operating_window" for row in trip.get("constraint_violations") or []):
-                    trip.setdefault("constraint_violations", []).append({"constraint_id": "depot_operating_window", "penalty": constraint_penalty(parameters, "depot_operating_window"), "entity": trip["vehicle_id"]})
+            if trip_index in bay_dropped:
+                continue
             vehicle_id = trip["vehicle_id"]
             working_before_trip = cumulative_working_minutes.get(vehicle_id, 0)
             projected_working_minutes = working_before_trip + int(trip["operating_minutes"])
@@ -1138,7 +1304,14 @@ class OptimizationCoordinatorService:
                     extra_dropped.append({**lo, "reason_code": reason_code, "reason_description": reason_description})
             trips = kept
             vrp_result["dropped"].extend(extra_dropped)
-        solver_status = "PARTIAL" if trips and vrp_result["dropped"] else ("FEASIBLE" if trips else "INFEASIBLE")
+        if trips and vrp_result["dropped"]:
+            solver_status = "PARTIAL"
+        elif trips:
+            solver_status = "FEASIBLE"
+        elif terminal_solver_status:
+            solver_status = terminal_solver_status
+        else:
+            solver_status = "INFEASIBLE"
         final_violation_count = sum(len(trip.get("constraint_violations") or []) for trip in trips)
         final_constraint_penalty = sum(float(trip.get("constraint_penalty_cost") or 0) for trip in trips)
         return {
@@ -1150,6 +1323,12 @@ class OptimizationCoordinatorService:
                 **vrp_result["solver_metadata"],
                 "bay_engine": bay_result["engine"],
                 "bay_solver_status": bay_result["solver_status"],
+                "bay_raw_solver_status": bay_result.get("raw_solver_status"),
+                "bay_time_limit_seconds": coordination_time_limit,
+                "bay_time_limit_reached": bool(bay_result.get("time_limit_reached") or coordination_time_limit_reached),
+                "bay_cp_sat_workers": bay_result.get("num_search_workers", parameters.get("bay_cp_sat_workers", 8)),
+                "bay_served_trip_count": len(bay_result.get("assignments") or []),
+                "bay_dropped_trip_count": len(bay_dropped),
                 "coordination_time_limit_reached": coordination_time_limit_reached,
                 "coordination_duration_ms": round((perf_counter() - coordination_started) * 1000),
                 "constraint_violation_count": final_violation_count,
