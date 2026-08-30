@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 
 
-PHASE7_ALGORITHM_VERSION = "phase7.dynamic_multitrip_vrp_bay.v2"
+PHASE7_ALGORITHM_VERSION = "phase7.dynamic_multitrip_vrp_bay.v4"
 
 JOB_STATUSES = {"DRAFT", "READY", "CALCULATING", "COMPLETED", "ACTIVE", "CLOSED", "FAILED"}
 LO_STATUSES = {"PLANNED", "ONGOING", "DONE"}
@@ -20,6 +20,8 @@ DROPPED_REASON_CODES = {
     "SPBU_TIME_WINDOW",
     "BAY_PRODUCT_CONSTRAINT",
     "BAY_CONGESTION",
+    "BAY_WINDOW_EXHAUSTED",
+    "POST_BAY_REASSIGNMENT_TIMEOUT",
     "NO_FEASIBLE_ROUTE",
     "USER_CANCELLED",
     "UNSERVED_END_OF_DAY",
@@ -269,6 +271,7 @@ DEFAULT_PHASE7_PARAMETERS: dict = {
     "optimization_time_limit": 30,
     "route_optimization_time_limit": 30,
     "bay_optimization_time_limit": 30,
+    "bay_scheduler_strategy": "FIFO_BALANCED",
     "bay_cp_sat_workers": 8,
     "max_coordination_iterations": 5,
     "departure_time_tolerance_minutes": 5,
@@ -386,6 +389,11 @@ def effective_parameters(overrides: dict | None = None) -> dict:
     parameters["loading_mode"] = str(parameters.get("loading_mode", "SEQUENTIAL")).upper()
     if parameters["loading_mode"] not in {"SEQUENTIAL", "PARALLEL"}:
         raise ValueError("loading_mode must be SEQUENTIAL or PARALLEL")
+    parameters["bay_scheduler_strategy"] = str(
+        parameters.get("bay_scheduler_strategy", "FIFO_BALANCED")
+    ).upper()
+    if parameters["bay_scheduler_strategy"] not in {"FIFO_BALANCED", "CP_SAT"}:
+        raise ValueError("bay_scheduler_strategy must be FIFO_BALANCED or CP_SAT")
     integer_bounds = {
         "freeze_window_minutes": (0, 1440),
         "reoptimization_interval_minutes": (1, 1440),

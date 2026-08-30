@@ -18,6 +18,7 @@ from .phase7_service import (
     get_cost_analysis,
     get_dropped_lo,
     get_job,
+    get_map_road_geometry,
     get_map_route,
     get_parameter_profile,
     get_route_version,
@@ -68,7 +69,6 @@ class LOOperationalUpdateRequest(BaseModel):
 class VehicleStateUpdate(BaseModel):
     mt_id: str
     planned_eta_depot: datetime | None = None
-    user_eta_override: datetime | None = None
     operational_status: str | None = None
     working_time_limit_minutes: int | None = Field(default=None, ge=1, le=2880)
 
@@ -129,6 +129,12 @@ class ParameterProfileRequest(BaseModel):
     description: str | None = None
     parameters: dict = Field(default_factory=dict)
     is_default: bool = False
+
+
+class MapRoadGeometryRequest(BaseModel):
+    version_id: str
+    vehicle_ids: list[str] = Field(min_length=1, max_length=25)
+    trip_number: int | None = Field(default=None, ge=1)
 
 
 class OptimizationRequest(BaseModel):
@@ -281,6 +287,17 @@ def phase7_simulation(job_id: str, version_id: str | None = None, db: Session = 
 @router.get("/jobs/{job_id}/map")
 def phase7_map(job_id: str, version_id: str | None = None, vehicle_id: str | None = None, trip_number: int | None = None, db: Session = Depends(get_db)) -> dict:
     return get_map_route(db, job_id, version_id, vehicle_id=vehicle_id, trip_number=trip_number)
+
+
+@router.post("/jobs/{job_id}/map/road-geometry")
+def phase7_map_road_geometry(job_id: str, request: MapRoadGeometryRequest, db: Session = Depends(get_db)) -> dict:
+    return get_map_road_geometry(
+        db,
+        job_id,
+        request.version_id,
+        vehicle_ids=request.vehicle_ids,
+        trip_number=request.trip_number,
+    )
 
 
 @router.get("/jobs/{job_id}/cost-analysis")

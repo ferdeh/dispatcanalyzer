@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 import math
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -742,7 +743,7 @@ class VRPOptimizationService:
 
 
 class BayQueueOptimizationService:
-    """CP-SAT loading-bay scheduler with actual occupancy and queue blocks."""
+    """Operational FIFO scheduler with an opt-in legacy CP-SAT strategy."""
 
     @staticmethod
     def loading_minutes(trip: dict, durations: dict[str, int], *, loading_mode: str, arms: int = 1, parameters: dict | None = None) -> int:
@@ -765,6 +766,370 @@ class BayQueueOptimizationService:
         return sum(values)
 
     def schedule(
+        self,
+        *,
+        trips: list[dict],
+        bays: list[dict],
+        actual_states: list[dict],
+        initial_queue: list[dict],
+        loading_durations: dict[str, int],
+        day_start: datetime,
+        depot_close: datetime,
+        parameters: dict,
+    ) -> dict:
+        strategy = str(parameters.get("bay_scheduler_strategy") or "FIFO_BALANCED").upper()
+        if strategy == "CP_SAT":
+            return self._cp_sat_schedule(
+                trips=trips,
+                bays=bays,
+                actual_states=actual_states,
+                initial_queue=initial_queue,
+                loading_durations=loading_durations,
+                day_start=day_start,
+                depot_close=depot_close,
+                parameters=parameters,
+            )
+        return self._fifo_balanced_schedule(
+            trips=trips,
+            bays=bays,
+            actual_states=actual_states,
+            initial_queue=initial_queue,
+            loading_durations=loading_durations,
+            day_start=day_start,
+            depot_close=depot_close,
+            parameters=parameters,
+        )
+
+    def _fifo_balanced_schedule(
+        self,
+        *,
+        trips: list[dict],
+        bays: list[dict],
+        actual_states: list[dict],
+        initial_queue: list[dict],
+        loading_durations: dict[str, int],
+        day_start: datetime,
+        depot_close: datetime,
+        parameters: dict,
+    ) -> dict:
+        """Assign ready MT trips FIFO to the earliest compatible balanced bay."""
+        schedule_started = perf_counter()
+        if not trips:
+            return {
+                "solver_status": "FEASIBLE",
+                "assignments": [],
+                "dropped_trip_indexes": [],
+                "dropped_trip_reasons": {},
+                "engine": "FIFO_BALANCED",
+                "raw_solver_status": "DETERMINISTIC",
+                "num_search_workers": 0,
+                "time_limit_reached": False,
+                "duration_ms": 0,
+                "scheduler_metadata": {
+                    "strategy": "FIFO_BALANCED",
+                    "trip_count": 0,
+                    "bay_count": len(bays),
+                    "candidate_evaluation_count": 0,
+                },
+            }
+
+        active_bays = [
+            dict(bay) for bay in bays
+            if str(bay.get("active_status") or "ACTIVE").upper() == "ACTIVE"
+        ]
+        if not active_bays:
+            dropped = list(range(len(trips)))
+            return {
+                "solver_status": "INFEASIBLE",
+                "assignments": [],
+                "dropped_trip_indexes": dropped,
+                "dropped_trip_reasons": {index: "BAY_PRODUCT_CONSTRAINT" for index in dropped},
+                "engine": "FIFO_BALANCED",
+                "raw_solver_status": "DETERMINISTIC",
+                "num_search_workers": 0,
+                "time_limit_reached": False,
+                "duration_ms": round((perf_counter() - schedule_started) * 1000),
+                "scheduler_metadata": {
+                    "strategy": "FIFO_BALANCED",
+                    "trip_count": len(trips),
+                    "bay_count": 0,
+                    "candidate_evaluation_count": 0,
+                },
+            }
+
+        state_by_bay = {str(row["master_bay_id"]): row for row in actual_states}
+        queue_by_bay: dict[str, list[dict]] = defaultdict(list)
+        for row in initial_queue:
+            queue_by_bay[str(row["master_bay_id"])].append(row)
+        reference_time = min((_utc(trip["vehicle_ready_at_depot"]) for trip in trips), default=_utc(day_start))
+        bay_state: dict[str, dict] = {}
+        for bay in active_bays:
+            bay_id = str(bay["master_bay_id"])
+            actual = state_by_bay.get(bay_id)
+            queue_rows = sorted(queue_by_bay[bay_id], key=lambda row: int(row.get("queue_position") or 0))
+            bay_open = _utc(day_start) + timedelta(minutes=int(bay.get("operational_start_minutes") or 0))
+            available_at = max(reference_time, bay_open)
+            if actual:
+                available_at = max(
+                    available_at,
+                    _utc(actual.get("state_effective_at") or reference_time)
+                    + timedelta(minutes=int(actual.get("remaining_loading_minutes") or 0)),
+                )
+            for queue_row in queue_rows:
+                if queue_row.get("state_effective_at"):
+                    available_at = max(available_at, _utc(queue_row["state_effective_at"]))
+                available_at += timedelta(minutes=int(queue_row.get("estimated_loading_duration_minutes") or 0))
+            bay_state[bay_id] = {
+                "available_at": available_at,
+                "assigned_trip_count": 0,
+                "assigned_loading_minutes": 0,
+                "initial_queue_count": len(queue_rows),
+            }
+
+        trips_by_vehicle: dict[str, list[int]] = defaultdict(list)
+        for trip_index, trip in enumerate(trips):
+            trips_by_vehicle[str(trip.get("vehicle_id") or "")].append(trip_index)
+        for indexes in trips_by_vehicle.values():
+            indexes.sort(key=lambda index: (int(trips[index].get("trip_number") or 0), index))
+
+        trip_position_by_vehicle: dict[str, int] = {vehicle_id: 0 for vehicle_id in trips_by_vehicle}
+        ready_heap: list[tuple[datetime, datetime, int, str, str, int]] = []
+
+        def push_trip(trip_index: int, ready_at: datetime) -> None:
+            trip = trips[trip_index]
+            lo_identity = min(
+                (str(row.get("loading_order_id") or "") for row in trip.get("lo_assignments") or []),
+                default="",
+            )
+            heapq.heappush(
+                ready_heap,
+                (
+                    _utc(ready_at),
+                    _utc(trip.get("preliminary_gate_out") or trip.get("gate_out") or ready_at),
+                    int(trip.get("trip_number") or 0),
+                    str(trip.get("vehicle_id") or ""),
+                    lo_identity,
+                    trip_index,
+                ),
+            )
+
+        for vehicle_id, indexes in trips_by_vehicle.items():
+            first_index = indexes[0]
+            push_trip(first_index, _utc(trips[first_index]["vehicle_ready_at_depot"]))
+
+        assignments: list[dict] = []
+        dropped: list[int] = []
+        dropped_reasons: dict[int, str] = {}
+        candidate_evaluation_count = 0
+        fifo_sequence = 0
+        total_bay_workload_before = sum(
+            max(0, _minutes_between(reference_time, state["available_at"]))
+            for state in bay_state.values()
+        )
+
+        while ready_heap:
+            ready_at, _, _, vehicle_id, _, trip_index = heapq.heappop(ready_heap)
+            trip = trips[trip_index]
+            trip_products = {
+                str(row.get("product_id") or "UNKNOWN")
+                for row in trip.get("lo_assignments") or []
+            }
+            current_bays = {
+                str(row["current_bay_id"])
+                for row in trip.get("lo_assignments") or []
+                if row.get("current_bay_id")
+            }
+            candidates: list[tuple[tuple, dict]] = []
+            structurally_eligible = False
+            window_exhausted = False
+            eligible_bay_ids: list[str] = []
+
+            for bay in active_bays:
+                candidate_evaluation_count += 1
+                bay_id = str(bay["master_bay_id"])
+                allowed_products = set(str(value) for value in bay.get("allowed_product_ids") or [])
+                product_violation = not bool(bay.get("all_products_allowed")) and not trip_products.issubset(allowed_products)
+                if product_violation and constraint_is_hard(parameters, "bay_product_compatibility"):
+                    continue
+                bay_change_violation = bool(current_bays) and bay_id not in current_bays
+                if bay_change_violation and constraint_is_hard(parameters, "bay_change_stability"):
+                    continue
+                try:
+                    loading_minutes = self.loading_minutes(
+                        trip,
+                        loading_durations,
+                        loading_mode=str(bay.get("loading_mode") or parameters.get("loading_mode", "SEQUENTIAL")),
+                        arms=int(bay.get("number_of_loading_arms") or 1),
+                        parameters=parameters,
+                    )
+                except ValueError:
+                    continue
+                structurally_eligible = True
+                eligible_bay_ids.append(bay_id)
+                state = bay_state[bay_id]
+                bay_open = _utc(day_start) + timedelta(minutes=int(bay.get("operational_start_minutes") or 0))
+                bay_close = _utc(day_start) + timedelta(
+                    minutes=int(bay.get("operational_end_minutes") or _minutes_between(day_start, depot_close))
+                )
+                start = ready_at
+                if constraint_rule(parameters, "bay_operating_window").get("enabled", True):
+                    start = max(start, bay_open)
+                if constraint_rule(parameters, "bay_actual_queue").get("enabled", True) or constraint_rule(parameters, "bay_no_overlap").get("enabled", True):
+                    start = max(start, _utc(state["available_at"]))
+                finish = start + timedelta(minutes=loading_minutes)
+                gate_out = finish + timedelta(minutes=int(parameters.get("gate_process_time", 5)))
+                if (
+                    constraint_is_hard(parameters, "bay_operating_window") and gate_out > bay_close
+                ) or (
+                    constraint_is_hard(parameters, "depot_operating_window") and gate_out > _utc(depot_close)
+                ):
+                    window_exhausted = True
+                    continue
+
+                violations: list[dict] = []
+                if product_violation and constraint_is_soft(parameters, "bay_product_compatibility"):
+                    violations.append({
+                        "constraint_id": "bay_product_compatibility",
+                        "penalty": constraint_penalty(parameters, "bay_product_compatibility"),
+                        "entity": bay_id,
+                    })
+                if bay_change_violation and constraint_is_soft(parameters, "bay_change_stability"):
+                    violations.append({
+                        "constraint_id": "bay_change_stability",
+                        "penalty": constraint_penalty(parameters, "bay_change_stability"),
+                        "entity": bay_id,
+                    })
+                if gate_out > bay_close and constraint_is_soft(parameters, "bay_operating_window"):
+                    violations.append({
+                        "constraint_id": "bay_operating_window",
+                        "penalty": constraint_penalty(parameters, "bay_operating_window"),
+                        "entity": bay_id,
+                    })
+                if gate_out > _utc(depot_close) and constraint_is_soft(parameters, "depot_operating_window"):
+                    violations.append({
+                        "constraint_id": "depot_operating_window",
+                        "penalty": constraint_penalty(parameters, "depot_operating_window"),
+                        "entity": bay_id,
+                    })
+                penalty_cost = sum(float(row.get("penalty") or 0) for row in violations)
+                flexibility = 1_000_000 if bay.get("all_products_allowed") else len(allowed_products)
+                projected_workload = int(state["assigned_loading_minutes"]) + loading_minutes
+                score = (
+                    penalty_cost,
+                    gate_out,
+                    projected_workload,
+                    int(state["assigned_trip_count"]),
+                    flexibility,
+                    str(bay.get("bay_id") or bay_id),
+                    bay_id,
+                )
+                candidates.append((score, {
+                    "bay": bay,
+                    "loading_start": start,
+                    "loading_finish": finish,
+                    "gate_out": gate_out,
+                    "loading_minutes": loading_minutes,
+                    "violations": violations,
+                }))
+
+            if not candidates:
+                reason = "BAY_WINDOW_EXHAUSTED" if structurally_eligible and window_exhausted else "BAY_PRODUCT_CONSTRAINT"
+                dropped.append(trip_index)
+                dropped_reasons[trip_index] = reason
+                # Preserve physical trip order: a later trip cannot use the MT
+                # when an earlier trip never loaded/gated out.
+                indexes = trips_by_vehicle[vehicle_id]
+                position = trip_position_by_vehicle[vehicle_id]
+                for later_index in indexes[position + 1:]:
+                    if later_index not in dropped:
+                        dropped.append(later_index)
+                        dropped_reasons[later_index] = "BAY_CONGESTION"
+                trip_position_by_vehicle[vehicle_id] = len(indexes)
+                continue
+
+            _, selected = min(candidates, key=lambda row: row[0])
+            bay = selected["bay"]
+            bay_id = str(bay["master_bay_id"])
+            state = bay_state[bay_id]
+            fifo_sequence += 1
+            queue_position = int(state["initial_queue_count"]) + int(state["assigned_trip_count"]) + 1
+            workload_before = int(state["assigned_loading_minutes"])
+            state["available_at"] = selected["loading_finish"]
+            state["assigned_trip_count"] = int(state["assigned_trip_count"]) + 1
+            state["assigned_loading_minutes"] = workload_before + int(selected["loading_minutes"])
+            assignments.append({
+                "trip_index": trip_index,
+                "master_bay_id": bay_id,
+                "vehicle_ready_at_depot": ready_at,
+                "queue_start": ready_at,
+                "loading_start": selected["loading_start"],
+                "loading_finish": selected["loading_finish"],
+                "gate_out": selected["gate_out"],
+                "queue_minutes": _minutes_between(ready_at, selected["loading_start"]),
+                "loading_minutes": int(selected["loading_minutes"]),
+                "constraint_violations": selected["violations"],
+                "fifo_sequence": fifo_sequence,
+                "bay_queue_position": queue_position,
+                "eligible_bay_ids": sorted(set(eligible_bay_ids)),
+                "bay_workload_minutes_before": workload_before,
+                "bay_workload_minutes_after": int(state["assigned_loading_minutes"]),
+                "selection_reason": "EARLIEST_COMPATIBLE_BALANCED_GATE_OUT",
+            })
+
+            original_gate_out = _utc(trip.get("gate_out") or ready_at)
+            original_return = _utc(trip.get("estimated_return_depot") or original_gate_out)
+            actual_return = selected["gate_out"] + max(timedelta(0), original_return - original_gate_out)
+            indexes = trips_by_vehicle[vehicle_id]
+            position = trip_position_by_vehicle[vehicle_id]
+            next_position = position + 1
+            trip_position_by_vehicle[vehicle_id] = next_position
+            if next_position < len(indexes):
+                next_index = indexes[next_position]
+                next_ready = max(_utc(trips[next_index]["vehicle_ready_at_depot"]), actual_return)
+                push_trip(next_index, next_ready)
+
+        dropped = sorted(set(dropped))
+        if dropped and constraint_is_hard(parameters, "serve_loading_order"):
+            blocking_reason = dropped_reasons.get(dropped[0], "BAY_CONGESTION")
+            assignments = []
+            dropped = list(range(len(trips)))
+            dropped_reasons = {index: blocking_reason for index in dropped}
+            solver_status = "INFEASIBLE"
+        elif assignments and dropped:
+            solver_status = "PARTIAL"
+        else:
+            solver_status = "FEASIBLE" if assignments else "INFEASIBLE"
+        workload_by_bay = {
+            bay_id: {
+                "assigned_trip_count": int(state["assigned_trip_count"]),
+                "assigned_loading_minutes": int(state["assigned_loading_minutes"]),
+                "initial_queue_count": int(state["initial_queue_count"]),
+                "available_at": _utc(state["available_at"]).isoformat(),
+            }
+            for bay_id, state in bay_state.items()
+        }
+        return {
+            "solver_status": solver_status,
+            "assignments": assignments,
+            "dropped_trip_indexes": dropped,
+            "dropped_trip_reasons": dropped_reasons,
+            "engine": "FIFO_BALANCED",
+            "raw_solver_status": "DETERMINISTIC",
+            "time_limit_seconds": 0,
+            "time_limit_reached": False,
+            "num_search_workers": 0,
+            "duration_ms": round((perf_counter() - schedule_started) * 1000),
+            "scheduler_metadata": {
+                "strategy": "FIFO_BALANCED",
+                "trip_count": len(trips),
+                "bay_count": len(active_bays),
+                "candidate_evaluation_count": candidate_evaluation_count,
+                "initial_blocked_workload_minutes": total_bay_workload_before,
+                "workload_by_bay": workload_by_bay,
+            },
+        }
+
+    def _cp_sat_schedule(
         self,
         *,
         trips: list[dict],
@@ -1149,6 +1514,237 @@ class OptimizationCoordinatorService:
         self.vrp = VRPOptimizationService()
         self.bay = BayQueueOptimizationService()
 
+    def _schedule_bays(
+        self,
+        *,
+        trips: list[dict],
+        bays: list[dict],
+        actual_bay_states: list[dict],
+        initial_queue: list[dict],
+        loading_durations: dict[str, int],
+        day_start: datetime,
+        depot_close: datetime,
+        parameters: dict,
+        deadline: float,
+    ) -> tuple[dict, int, bool]:
+        """Schedule every retained/retried trip together so bay intervals remain global."""
+        previous_gateouts: list[datetime] = []
+        time_limit_reached = False
+        iterations = 0
+        result = {
+            "solver_status": "FEASIBLE",
+            "assignments": [],
+            "dropped_trip_indexes": [],
+            "dropped_trip_reasons": {},
+            "engine": str(parameters.get("bay_scheduler_strategy") or "FIFO_BALANCED"),
+        }
+        scheduler_strategy = str(parameters.get("bay_scheduler_strategy") or "FIFO_BALANCED").upper()
+        # FIFO_BALANCED propagates the actual return of each physical MT to its
+        # next trip inside one event-driven pass. CP-SAT retains the legacy
+        # iterative route/bay coordination behavior.
+        max_iterations = 1 if scheduler_strategy == "FIFO_BALANCED" else int(parameters.get("max_coordination_iterations", 5))
+        for iterations in range(1, max_iterations + 1):
+            remaining_budget = deadline - perf_counter()
+            if remaining_budget <= 0:
+                time_limit_reached = True
+                break
+            remaining_seconds = max(1, math.ceil(remaining_budget))
+            remaining_iterations = max(1, max_iterations - iterations + 1)
+            iteration_time_limit = max(1, remaining_seconds // remaining_iterations)
+            last_return: dict[str, datetime] = {}
+            for trip in sorted(trips, key=lambda row: (row["vehicle_id"], row["trip_number"])):
+                if trip["vehicle_id"] in last_return:
+                    trip["vehicle_ready_at_depot"] = max(
+                        _utc(trip["vehicle_ready_at_depot"]),
+                        last_return[trip["vehicle_id"]],
+                    )
+                last_return[trip["vehicle_id"]] = _utc(trip["estimated_return_depot"])
+            result = self.bay.schedule(
+                trips=trips,
+                bays=bays,
+                actual_states=actual_bay_states,
+                initial_queue=initial_queue,
+                loading_durations=loading_durations,
+                day_start=day_start,
+                depot_close=depot_close,
+                parameters={**parameters, "bay_optimization_time_limit": iteration_time_limit},
+            )
+            assignment_by_trip = {row["trip_index"]: row for row in result["assignments"]}
+            current_gateouts: list[datetime] = []
+            for trip_index, trip in enumerate(trips):
+                schedule = assignment_by_trip.get(trip_index)
+                if not schedule:
+                    continue
+                route_violations = list(trip.get("constraint_violations") or [])
+                bay_violations = list(schedule.get("constraint_violations") or [])
+                shift = _utc(schedule["gate_out"]) - _utc(trip["gate_out"])
+                trip.update({key: value for key, value in schedule.items() if key != "constraint_violations"})
+                trip["constraint_violations"] = [*route_violations, *bay_violations]
+                trip["constraint_penalty_cost"] = sum(
+                    float(row.get("penalty") or 0) for row in trip["constraint_violations"]
+                )
+                trip["estimated_return_depot"] = _utc(trip["estimated_return_depot"]) + shift
+                trip["operating_minutes"] = _minutes_between(
+                    trip["vehicle_ready_at_depot"], trip["estimated_return_depot"]
+                )
+                current_gateouts.append(_utc(trip["gate_out"]))
+            if previous_gateouts and len(previous_gateouts) == len(current_gateouts):
+                delta = max(
+                    (
+                        abs((current - previous).total_seconds()) / 60
+                        for current, previous in zip(current_gateouts, previous_gateouts, strict=True)
+                    ),
+                    default=0,
+                )
+                if delta <= float(parameters.get("departure_time_tolerance_minutes", 5)):
+                    break
+            previous_gateouts = current_gateouts
+            if result["solver_status"] in {"TIMEOUT", "UNKNOWN", "FAILED", "INFEASIBLE"}:
+                time_limit_reached = result["solver_status"] == "TIMEOUT"
+                break
+        return result, iterations, time_limit_reached
+
+    @staticmethod
+    def _post_bay_failures(
+        *,
+        trips: list[dict],
+        bay_result: dict,
+        vehicles: list[dict],
+        parameters: dict,
+        day_start: datetime,
+    ) -> tuple[set[int], dict[int, tuple[str, str]], set[int]]:
+        """Apply hard checks after authoritative bay shifts and identify retryable trips."""
+        dropped = set(bay_result.get("dropped_trip_indexes") or [])
+        bay_drop_reason_codes = {
+            int(index): reason
+            for index, reason in (bay_result.get("dropped_trip_reasons") or {}).items()
+        }
+        reason_descriptions = {
+            "BAY_PRODUCT_CONSTRAINT": "No eligible loading bay satisfies the active hard product, loading-duration, or bay-stability constraints.",
+            "BAY_CONGESTION": "The bay scheduler omitted this otherwise eligible trip because available bay capacity/time was insufficient relative to the Serve Loading Order penalty.",
+            "BAY_WINDOW_EXHAUSTED": "Every compatible FIFO bay would gate this trip out after the active bay or depot operating window.",
+        }
+        reasons = {
+            index: (
+                bay_drop_reason_codes.get(index, "BAY_CONGESTION"),
+                reason_descriptions[bay_drop_reason_codes.get(index, "BAY_CONGESTION")],
+            )
+            for index in dropped
+        }
+        retryable_time_failures: set[int] = set()
+        tolerance = int(parameters.get("departure_time_tolerance_minutes", 5))
+        working_limit = {row["mt_id"]: int(row["working_time_limit_minutes"]) for row in vehicles}
+        cumulative_working = {row["mt_id"]: int(row.get("working_time_used_minutes") or 0) for row in vehicles}
+        ordered_indexes = sorted(
+            range(len(trips)),
+            key=lambda index: (trips[index]["vehicle_id"], int(trips[index]["trip_number"])),
+        )
+        for trip_index in ordered_indexes:
+            trip = trips[trip_index]
+            if trip_index in dropped:
+                continue
+            vehicle_id = trip["vehicle_id"]
+            projected = cumulative_working.get(vehicle_id, 0) + int(trip["operating_minutes"])
+            if projected > working_limit.get(vehicle_id, 0):
+                if constraint_is_hard(parameters, "vehicle_working_time"):
+                    dropped.add(trip_index)
+                    retryable_time_failures.add(trip_index)
+                    reasons[trip_index] = (
+                        "VEHICLE_TIME_EXHAUSTED",
+                        "The assigned MT exceeded its hard working-time limit after bay scheduling; alternative compatible MT will be attempted before final drop.",
+                    )
+                    continue
+                if constraint_is_soft(parameters, "vehicle_working_time") and not any(
+                    row.get("constraint_id") == "vehicle_working_time"
+                    for row in trip.get("constraint_violations") or []
+                ):
+                    trip.setdefault("constraint_violations", []).append({
+                        "constraint_id": "vehicle_working_time",
+                        "penalty": constraint_penalty(parameters, "vehicle_working_time"),
+                        "entity": vehicle_id,
+                    })
+            cumulative_working[vehicle_id] = projected
+            previous_gateouts = [
+                int(lo["current_planned_gate_out_minutes"])
+                for lo in trip.get("lo_assignments") or []
+                if lo.get("current_planned_gate_out_minutes") is not None
+            ]
+            trip["constraint_penalty_cost"] = sum(
+                float(row.get("penalty") or 0) for row in trip.get("constraint_violations") or []
+            )
+            if not previous_gateouts:
+                continue
+            new_gateout = _minutes_between(day_start, trip["gate_out"])
+            if all(abs(new_gateout - previous) <= tolerance for previous in previous_gateouts):
+                continue
+            if constraint_is_hard(parameters, "gateout_stability"):
+                dropped.add(trip_index)
+                reasons[trip_index] = (
+                    "NO_FEASIBLE_ROUTE",
+                    "Trip would violate the active hard gate-out stability constraint.",
+                )
+            elif constraint_is_soft(parameters, "gateout_stability"):
+                trip.setdefault("constraint_violations", []).append({
+                    "constraint_id": "gateout_stability",
+                    "penalty": constraint_penalty(parameters, "gateout_stability"),
+                    "entity": vehicle_id,
+                })
+            if constraint_is_soft(parameters, "freeze_window") and any(
+                lo.get("freeze_window_candidate") for lo in trip.get("lo_assignments") or []
+            ):
+                trip.setdefault("constraint_violations", []).append({
+                    "constraint_id": "freeze_window",
+                    "penalty": constraint_penalty(parameters, "freeze_window"),
+                    "entity": vehicle_id,
+                })
+            trip["constraint_penalty_cost"] = sum(
+                float(row.get("penalty") or 0) for row in trip.get("constraint_violations") or []
+            )
+        return dropped, reasons, retryable_time_failures
+
+    @staticmethod
+    def _vehicles_after_retained_trips(vehicles: list[dict], trips: list[dict]) -> list[dict]:
+        """Build retry availability/working state from trips that survived post-bay checks."""
+        by_vehicle: dict[str, list[dict]] = defaultdict(list)
+        for trip in trips:
+            by_vehicle[trip["vehicle_id"]].append(trip)
+        retry_vehicles: list[dict] = []
+        for source in vehicles:
+            vehicle = dict(source)
+            retained = sorted(by_vehicle.get(vehicle["mt_id"], []), key=lambda row: int(row["trip_number"]))
+            used = int(source.get("working_time_used_minutes") or 0) + sum(
+                int(trip.get("operating_minutes") or 0) for trip in retained
+            )
+            limit = int(source.get("working_time_limit_minutes") or 0)
+            vehicle["working_time_used_minutes"] = used
+            vehicle["working_time_remaining_minutes"] = max(0, limit - used)
+            vehicle["completed_trip_count"] = max(
+                [int(source.get("completed_trip_count") or 0), *[int(trip["trip_number"]) for trip in retained]],
+            )
+            if retained:
+                latest_return = max(_utc(trip["estimated_return_depot"]) for trip in retained)
+                vehicle["availability_eta_depot"] = latest_return
+                vehicle["effective_eta_depot"] = latest_return
+            retry_vehicles.append(vehicle)
+        return retry_vehicles
+
+    @staticmethod
+    def _retry_matrix(
+        loading_orders: list[dict],
+        retry_orders: list[dict],
+        distance_matrix: list[list[int]],
+        time_matrix: list[list[int]],
+    ) -> tuple[list[list[int]], list[list[int]]]:
+        original_index = {
+            str(row["loading_order_id"]): index
+            for index, row in enumerate(loading_orders, start=1)
+        }
+        indexes = [0, *[original_index[str(row["loading_order_id"])] for row in retry_orders]]
+        return (
+            [[distance_matrix[source][target] for target in indexes] for source in indexes],
+            [[time_matrix[source][target] for target in indexes] for source in indexes],
+        )
+
     def optimize(
         self,
         *,
@@ -1178,64 +1774,20 @@ class OptimizationCoordinatorService:
         coordination_deadline = coordination_started + coordination_time_limit
         coordination_time_limit_reached = False
         trips = vrp_result["trips"]
-        iterations = 0
-        previous_gateouts: list[datetime] = []
-        bay_result = {"solver_status": "FEASIBLE", "assignments": [], "dropped_trip_indexes": [], "dropped_trip_reasons": {}, "engine": "OR_TOOLS_CP_SAT"}
-        max_iterations = int(parameters.get("max_coordination_iterations", 5))
-        for iterations in range(1, max_iterations + 1):
-            remaining_budget = coordination_deadline - perf_counter()
-            if remaining_budget <= 0:
-                coordination_time_limit_reached = True
-                break
-            remaining_seconds = max(1, math.ceil(remaining_budget))
-            remaining_iterations = max(1, max_iterations - iterations + 1)
-            iteration_time_limit = max(1, remaining_seconds // remaining_iterations)
-            # Propagate the previous trip's return so one physical MT cannot
-            # overlap itself after bay waiting shifts a gate-out.
-            last_return: dict[str, datetime] = {}
-            for trip in sorted(trips, key=lambda row: (row["vehicle_id"], row["trip_number"])):
-                if trip["vehicle_id"] in last_return:
-                    trip["vehicle_ready_at_depot"] = max(_utc(trip["vehicle_ready_at_depot"]), last_return[trip["vehicle_id"]])
-                last_return[trip["vehicle_id"]] = _utc(trip["estimated_return_depot"])
-            bay_result = self.bay.schedule(
-                trips=trips,
-                bays=bays,
-                actual_states=actual_bay_states,
-                initial_queue=initial_queue,
-                loading_durations=loading_durations,
-                day_start=day_start,
-                depot_close=depot_close,
-                parameters={**parameters, "bay_optimization_time_limit": iteration_time_limit},
-            )
-            assignment_by_trip = {row["trip_index"]: row for row in bay_result["assignments"]}
-            current_gateouts = []
-            for trip_index, trip in enumerate(trips):
-                schedule = assignment_by_trip.get(trip_index)
-                if not schedule:
-                    continue
-                route_violations = list(trip.get("constraint_violations") or [])
-                bay_violations = list(schedule.pop("constraint_violations", []) or [])
-                shift = _utc(schedule["gate_out"]) - _utc(trip["gate_out"])
-                trip.update(schedule)
-                trip["constraint_violations"] = [*route_violations, *bay_violations]
-                trip["constraint_penalty_cost"] = sum(float(row.get("penalty") or 0) for row in trip["constraint_violations"])
-                trip["estimated_return_depot"] = _utc(trip["estimated_return_depot"]) + shift
-                trip["operating_minutes"] = _minutes_between(trip["vehicle_ready_at_depot"], trip["estimated_return_depot"])
-                current_gateouts.append(_utc(trip["gate_out"]))
-            if previous_gateouts and len(previous_gateouts) == len(current_gateouts):
-                delta = max(abs((current - previous).total_seconds()) / 60 for current, previous in zip(current_gateouts, previous_gateouts, strict=True)) if current_gateouts else 0
-                if delta <= float(parameters.get("departure_time_tolerance_minutes", 5)):
-                    break
-            previous_gateouts = current_gateouts
-            if bay_result["solver_status"] in {"TIMEOUT", "UNKNOWN", "FAILED", "INFEASIBLE"}:
-                coordination_time_limit_reached = bay_result["solver_status"] == "TIMEOUT"
-                break
+        bay_result, iterations, coordination_time_limit_reached = self._schedule_bays(
+            trips=trips,
+            bays=bays,
+            actual_bay_states=actual_bay_states,
+            initial_queue=initial_queue,
+            loading_durations=loading_durations,
+            day_start=day_start,
+            depot_close=depot_close,
+            parameters=parameters,
+            deadline=coordination_deadline,
+        )
+        bay_time_used_seconds = perf_counter() - coordination_started
+        total_coordination_iterations = iterations
 
-        bay_dropped = set(bay_result.get("dropped_trip_indexes") or [])
-        bay_drop_reason_codes = {
-            int(index): reason
-            for index, reason in (bay_result.get("dropped_trip_reasons") or {}).items()
-        }
         terminal_bay_status = bay_result.get("solver_status") if bay_result.get("solver_status") in {"TIMEOUT", "UNKNOWN", "FAILED"} else None
         terminal_solver_status = terminal_bay_status or (
             vrp_result.get("solver_status")
@@ -1243,56 +1795,293 @@ class OptimizationCoordinatorService:
             else None
         )
         if terminal_bay_status and not bay_result.get("assignments"):
-            bay_dropped.update(range(len(trips)))
-            for index in bay_dropped:
-                bay_drop_reason_codes.setdefault(index, "BAY_CONGESTION")
-        reason_descriptions = {
-            "BAY_PRODUCT_CONSTRAINT": "No eligible loading bay satisfies the active hard product, loading-duration, or bay-stability constraints.",
-            "BAY_CONGESTION": "The bay scheduler omitted this otherwise eligible trip because available bay capacity/time was insufficient relative to the Serve Loading Order penalty.",
+            bay_result["dropped_trip_indexes"] = list(range(len(trips)))
+            bay_result["dropped_trip_reasons"] = {
+                index: "BAY_CONGESTION" for index in range(len(trips))
+            }
+        bay_dropped, hard_drop_reasons, retryable_time_failures = self._post_bay_failures(
+            trips=trips,
+            bay_result=bay_result,
+            vehicles=vehicles,
+            parameters=parameters,
+            day_start=day_start,
+        )
+        dropped_by_lo = {
+            str(row["loading_order_id"]): dict(row)
+            for row in vrp_result.get("dropped") or []
         }
-        hard_drop_reasons = {
-            index: (
-                bay_drop_reason_codes.get(index, "BAY_CONGESTION"),
-                reason_descriptions[bay_drop_reason_codes.get(index, "BAY_CONGESTION")],
-            )
-            for index in bay_dropped
-        }
-        tolerance = int(parameters.get("departure_time_tolerance_minutes", 5))
-        working_limit_by_vehicle = {row["mt_id"]: int(row["working_time_limit_minutes"]) for row in vehicles}
-        cumulative_working_minutes = {row["mt_id"]: int(row.get("working_time_used_minutes") or 0) for row in vehicles}
-        for trip_index, trip in enumerate(trips):
-            if trip_index in bay_dropped:
-                continue
-            vehicle_id = trip["vehicle_id"]
-            working_before_trip = cumulative_working_minutes.get(vehicle_id, 0)
-            projected_working_minutes = working_before_trip + int(trip["operating_minutes"])
-            if trip_index not in bay_dropped and projected_working_minutes > working_limit_by_vehicle.get(vehicle_id, 0):
-                if constraint_is_hard(parameters, "vehicle_working_time"):
-                    bay_dropped.add(trip_index)
-                    hard_drop_reasons[trip_index] = ("VEHICLE_TIME_EXHAUSTED", "Cumulative MT use through depot return would exceed the active hard working-time limit.")
-                elif constraint_is_soft(parameters, "vehicle_working_time") and not any(row.get("constraint_id") == "vehicle_working_time" for row in trip.get("constraint_violations") or []):
-                    trip.setdefault("constraint_violations", []).append({"constraint_id": "vehicle_working_time", "penalty": constraint_penalty(parameters, "vehicle_working_time"), "entity": trip["vehicle_id"]})
-            if trip_index not in bay_dropped:
-                cumulative_working_minutes[vehicle_id] = projected_working_minutes
-            previous_gateouts = [
-                int(lo["current_planned_gate_out_minutes"])
-                for lo in trip.get("lo_assignments") or []
-                if lo.get("current_planned_gate_out_minutes") is not None
+        failed_vehicle_ids_by_lo: dict[str, set[str]] = defaultdict(set)
+        post_bay_reassignment_attempts = 0
+        post_bay_reassigned_lo_ids: set[str] = set()
+        post_bay_reassignment_exhausted_lo_ids: set[str] = set()
+        post_bay_reassignment_timeout_lo_ids: set[str] = set()
+        post_bay_final_drop_groups: set[tuple[str, ...]] = set()
+        post_bay_route_statuses: list[str] = []
+        route_retry_time_limit = max(
+            1,
+            int(parameters.get("route_optimization_time_limit", parameters.get("optimization_time_limit", 30))),
+        )
+        route_retry_time_used_seconds = 0.0
+
+        def record_post_bay_drop(lo: dict, *, reason_code: str, reason_description: str) -> None:
+            loading_order_id = str(lo["loading_order_id"])
+            cleaned = {key: value for key, value in lo.items() if key != "compartment_id"}
+            dropped_by_lo[loading_order_id] = {
+                **cleaned,
+                "reason_code": reason_code,
+                "reason_description": reason_description,
+            }
+
+        # A route is only preliminary until the bay schedule has supplied its
+        # authoritative queue/loading/gate-out times.  If that shift exhausts
+        # an MT's hard working time, return the trip's LO to routing, block the
+        # failed MT for those LO, and recompute candidates from the retained
+        # post-bay vehicle state.  Every retry is then scheduled globally with
+        # all retained trips so it cannot introduce an overlapping bay plan.
+        while retryable_time_failures:
+            retained_trips = [
+                trip for index, trip in enumerate(trips)
+                if index not in bay_dropped
             ]
-            trip["constraint_penalty_cost"] = sum(float(row.get("penalty") or 0) for row in trip.get("constraint_violations") or [])
-            if not previous_gateouts:
-                continue
-            new_gateout = _minutes_between(day_start, trip["gate_out"])
-            if all(abs(new_gateout - previous) <= tolerance for previous in previous_gateouts):
-                continue
-            if constraint_is_hard(parameters, "gateout_stability"):
-                bay_dropped.add(trip_index)
-                hard_drop_reasons[trip_index] = ("NO_FEASIBLE_ROUTE", "Trip would violate the active hard gate-out stability constraint.")
-            elif constraint_is_soft(parameters, "gateout_stability"):
-                trip.setdefault("constraint_violations", []).append({"constraint_id": "gateout_stability", "penalty": constraint_penalty(parameters, "gateout_stability"), "entity": trip["vehicle_id"]})
-            if constraint_is_soft(parameters, "freeze_window") and any(lo.get("freeze_window_candidate") for lo in trip.get("lo_assignments") or []):
-                trip.setdefault("constraint_violations", []).append({"constraint_id": "freeze_window", "penalty": constraint_penalty(parameters, "freeze_window"), "entity": trip["vehicle_id"]})
-            trip["constraint_penalty_cost"] = sum(float(row.get("penalty") or 0) for row in trip.get("constraint_violations") or [])
+            retry_orders_by_id: dict[str, dict] = {}
+
+            for trip_index in sorted(bay_dropped - retryable_time_failures):
+                trip = trips[trip_index]
+                group_ids = tuple(sorted(str(lo["loading_order_id"]) for lo in trip.get("lo_assignments") or []))
+                if group_ids:
+                    post_bay_final_drop_groups.add(group_ids)
+                reason_code, reason_description = hard_drop_reasons.get(
+                    trip_index,
+                    ("NO_FEASIBLE_ROUTE", "Trip violates an active hard post-bay constraint."),
+                )
+                for lo in trip.get("lo_assignments") or []:
+                    record_post_bay_drop(
+                        lo,
+                        reason_code=reason_code,
+                        reason_description=reason_description,
+                    )
+
+            for trip_index in sorted(retryable_time_failures):
+                trip = trips[trip_index]
+                failed_vehicle_id = str(trip["vehicle_id"])
+                exhausted_in_group = False
+                group_ids = tuple(sorted(str(lo["loading_order_id"]) for lo in trip.get("lo_assignments") or []))
+                for assignment in trip.get("lo_assignments") or []:
+                    loading_order_id = str(assignment["loading_order_id"])
+                    failed_vehicle_ids_by_lo[loading_order_id].add(failed_vehicle_id)
+                    allowed_vehicle_ids = [
+                        str(mt_id)
+                        for mt_id in assignment.get("allowed_vehicle_ids") or []
+                        if str(mt_id) not in failed_vehicle_ids_by_lo[loading_order_id]
+                    ]
+                    retry_order = {
+                        key: value for key, value in assignment.items()
+                        if key != "compartment_id"
+                    }
+                    retry_order["allowed_vehicle_ids"] = allowed_vehicle_ids
+                    if not allowed_vehicle_ids:
+                        exhausted_in_group = True
+                        post_bay_reassignment_exhausted_lo_ids.add(loading_order_id)
+                        record_post_bay_drop(
+                            retry_order,
+                            reason_code="VEHICLE_TIME_EXHAUSTED",
+                            reason_description=(
+                                "Every compatible alternative MT was attempted or excluded by its actual "
+                                "post-bay working-time state; no reassignment remained feasible."
+                            ),
+                        )
+                        continue
+                    retry_orders_by_id[loading_order_id] = retry_order
+                if exhausted_in_group and group_ids:
+                    post_bay_final_drop_groups.add(group_ids)
+
+            trips = retained_trips
+            bay_dropped = set()
+            hard_drop_reasons = {}
+            retryable_time_failures = set()
+            retry_orders = list(retry_orders_by_id.values())
+            if not retry_orders:
+                break
+
+            remaining_route_retry_seconds = route_retry_time_limit - route_retry_time_used_seconds
+            remaining_bay_seconds = coordination_time_limit - bay_time_used_seconds
+            if remaining_route_retry_seconds <= 0 or remaining_bay_seconds <= 0:
+                coordination_time_limit_reached = coordination_time_limit_reached or remaining_bay_seconds <= 0
+                terminal_solver_status = terminal_solver_status or "TIMEOUT"
+                for lo in retry_orders:
+                    loading_order_id = str(lo["loading_order_id"])
+                    post_bay_reassignment_timeout_lo_ids.add(loading_order_id)
+                    record_post_bay_drop(
+                        lo,
+                        reason_code="POST_BAY_REASSIGNMENT_TIMEOUT",
+                        reason_description=(
+                            "Post-bay reassignment stopped when its independent route or bay time budget expired; "
+                            "candidate infeasibility was not proven."
+                        ),
+                    )
+                post_bay_final_drop_groups.add(tuple(sorted(retry_orders_by_id)))
+                break
+
+            retry_vehicles = self._vehicles_after_retained_trips(vehicles, trips)
+            retry_distance_matrix, retry_time_matrix = self._retry_matrix(
+                loading_orders,
+                retry_orders,
+                distance_matrix,
+                time_matrix,
+            )
+            retry_constraint_rules = {
+                key: dict(value)
+                for key, value in (parameters.get("constraint_rules") or {}).items()
+            }
+            retry_constraint_rules["serve_loading_order"] = {
+                **retry_constraint_rules.get("serve_loading_order", {}),
+                "enabled": True,
+                "mode": "HARD",
+            }
+            retry_parameters = {
+                **parameters,
+                "constraint_rules": retry_constraint_rules,
+                "route_optimization_time_limit": max(1, math.ceil(remaining_route_retry_seconds)),
+            }
+            route_retry_started = perf_counter()
+            retry_result = self.vrp.solve(
+                loading_orders=retry_orders,
+                vehicles=retry_vehicles,
+                distance_matrix=retry_distance_matrix,
+                time_matrix=retry_time_matrix,
+                day_start=day_start,
+                depot_close=depot_close,
+                parameters=retry_parameters,
+            )
+            route_retry_time_used_seconds += perf_counter() - route_retry_started
+            post_bay_reassignment_attempts += 1
+            post_bay_route_statuses.append(str(retry_result.get("solver_status") or "UNKNOWN"))
+            vrp_result["objective_value"] = float(vrp_result.get("objective_value") or 0) + float(
+                retry_result.get("objective_value") or 0
+            )
+            retry_trips = list(retry_result.get("trips") or [])
+            reassigned_ids = {
+                str(lo["loading_order_id"])
+                for trip in retry_trips
+                for lo in trip.get("lo_assignments") or []
+            }
+            post_bay_reassigned_lo_ids.update(reassigned_ids)
+
+            retry_terminal_status = (
+                retry_result.get("solver_status")
+                if retry_result.get("solver_status") in {"TIMEOUT", "UNKNOWN", "FAILED"}
+                else None
+            )
+            if retry_terminal_status:
+                terminal_solver_status = retry_terminal_status
+            for dropped_lo in retry_result.get("dropped") or []:
+                loading_order_id = str(dropped_lo["loading_order_id"])
+                if loading_order_id in reassigned_ids:
+                    continue
+                if retry_terminal_status:
+                    post_bay_reassignment_timeout_lo_ids.add(loading_order_id)
+                    record_post_bay_drop(
+                        dropped_lo,
+                        reason_code="POST_BAY_REASSIGNMENT_TIMEOUT",
+                        reason_description=(
+                            "Post-bay route reassignment ended as TIMEOUT/UNKNOWN before all compatible "
+                            "MT candidates could be proven infeasible."
+                        ),
+                    )
+                else:
+                    post_bay_reassignment_exhausted_lo_ids.add(loading_order_id)
+                    record_post_bay_drop(
+                        dropped_lo,
+                        reason_code="VEHICLE_TIME_EXHAUSTED",
+                        reason_description=(
+                            "The post-bay routing retry evaluated the remaining compatible MT pool using "
+                            "actual retained working time, but no alternative assignment was feasible."
+                        ),
+                    )
+            unserved_retry_ids = set(retry_orders_by_id) - reassigned_ids
+            if unserved_retry_ids:
+                post_bay_final_drop_groups.add(tuple(sorted(unserved_retry_ids)))
+            if not retry_trips:
+                # Defensive coverage for custom/fallback solvers that omit a
+                # dropped row while returning no route.
+                for loading_order_id in unserved_retry_ids:
+                    if loading_order_id in dropped_by_lo:
+                        continue
+                    lo = retry_orders_by_id[loading_order_id]
+                    post_bay_reassignment_exhausted_lo_ids.add(loading_order_id)
+                    record_post_bay_drop(
+                        lo,
+                        reason_code="VEHICLE_TIME_EXHAUSTED",
+                        reason_description=(
+                            "No remaining compatible MT produced a feasible route from the actual "
+                            "post-bay working-time state."
+                        ),
+                    )
+                break
+
+            trips_before_retry = list(trips)
+            trips.extend(retry_trips)
+            remaining_bay_seconds = coordination_time_limit - bay_time_used_seconds
+            if remaining_bay_seconds <= 0:
+                coordination_time_limit_reached = True
+                terminal_solver_status = terminal_solver_status or "TIMEOUT"
+                trips = trips_before_retry
+                for loading_order_id in reassigned_ids:
+                    lo = retry_orders_by_id[loading_order_id]
+                    post_bay_reassignment_timeout_lo_ids.add(loading_order_id)
+                    record_post_bay_drop(
+                        lo,
+                        reason_code="POST_BAY_REASSIGNMENT_TIMEOUT",
+                        reason_description="The alternative route was found, but no bay time budget remained to validate it.",
+                    )
+                post_bay_final_drop_groups.add(tuple(sorted(reassigned_ids)))
+                break
+
+            bay_retry_started = perf_counter()
+            bay_result, retry_iterations, retry_bay_time_limit_reached = self._schedule_bays(
+                trips=trips,
+                bays=bays,
+                actual_bay_states=actual_bay_states,
+                initial_queue=initial_queue,
+                loading_durations=loading_durations,
+                day_start=day_start,
+                depot_close=depot_close,
+                parameters=parameters,
+                deadline=bay_retry_started + remaining_bay_seconds,
+            )
+            bay_time_used_seconds += perf_counter() - bay_retry_started
+            total_coordination_iterations += retry_iterations
+            coordination_time_limit_reached = coordination_time_limit_reached or retry_bay_time_limit_reached
+            retry_bay_terminal_status = (
+                bay_result.get("solver_status")
+                if bay_result.get("solver_status") in {"TIMEOUT", "UNKNOWN", "FAILED"}
+                else None
+            )
+            if retry_bay_terminal_status and not bay_result.get("assignments"):
+                terminal_solver_status = retry_bay_terminal_status
+                trips = trips_before_retry
+                for loading_order_id in reassigned_ids:
+                    lo = retry_orders_by_id[loading_order_id]
+                    post_bay_reassignment_timeout_lo_ids.add(loading_order_id)
+                    record_post_bay_drop(
+                        lo,
+                        reason_code="POST_BAY_REASSIGNMENT_TIMEOUT",
+                        reason_description=(
+                            "The alternative route was found, but the global bay re-schedule ended as "
+                            "TIMEOUT/UNKNOWN before it could be validated."
+                        ),
+                    )
+                post_bay_final_drop_groups.add(tuple(sorted(reassigned_ids)))
+                bay_dropped = set()
+                break
+            bay_dropped, hard_drop_reasons, retryable_time_failures = self._post_bay_failures(
+                trips=trips,
+                bay_result=bay_result,
+                vehicles=vehicles,
+                parameters=parameters,
+                day_start=day_start,
+            )
+
         if bay_dropped:
             kept, extra_dropped = [], []
             for index, trip in enumerate(trips):
@@ -1300,10 +2089,19 @@ class OptimizationCoordinatorService:
                     kept.append(trip)
                     continue
                 reason_code, reason_description = hard_drop_reasons.get(index, ("NO_FEASIBLE_ROUTE", "Trip violates an active hard constraint."))
+                group_ids = tuple(sorted(str(lo["loading_order_id"]) for lo in trip.get("lo_assignments") or []))
+                if group_ids:
+                    post_bay_final_drop_groups.add(group_ids)
                 for lo in trip.get("lo_assignments") or []:
                     extra_dropped.append({**lo, "reason_code": reason_code, "reason_description": reason_description})
             trips = kept
-            vrp_result["dropped"].extend(extra_dropped)
+            for lo in extra_dropped:
+                record_post_bay_drop(
+                    lo,
+                    reason_code=lo["reason_code"],
+                    reason_description=lo["reason_description"],
+                )
+        vrp_result["dropped"] = list(dropped_by_lo.values())
         if trips and vrp_result["dropped"]:
             solver_status = "PARTIAL"
         elif trips:
@@ -1318,19 +2116,28 @@ class OptimizationCoordinatorService:
             **vrp_result,
             "trips": trips,
             "solver_status": solver_status,
-            "coordination_iterations": iterations,
+            "coordination_iterations": total_coordination_iterations,
             "solver_metadata": {
                 **vrp_result["solver_metadata"],
                 "bay_engine": bay_result["engine"],
+                "bay_scheduler_strategy": str(parameters.get("bay_scheduler_strategy") or "FIFO_BALANCED"),
+                "bay_scheduler_metadata": bay_result.get("scheduler_metadata") or {},
                 "bay_solver_status": bay_result["solver_status"],
                 "bay_raw_solver_status": bay_result.get("raw_solver_status"),
                 "bay_time_limit_seconds": coordination_time_limit,
                 "bay_time_limit_reached": bool(bay_result.get("time_limit_reached") or coordination_time_limit_reached),
                 "bay_cp_sat_workers": bay_result.get("num_search_workers", parameters.get("bay_cp_sat_workers", 8)),
-                "bay_served_trip_count": len(bay_result.get("assignments") or []),
-                "bay_dropped_trip_count": len(bay_dropped),
+                "bay_served_trip_count": len(trips),
+                "bay_dropped_trip_count": len(post_bay_final_drop_groups),
                 "coordination_time_limit_reached": coordination_time_limit_reached,
                 "coordination_duration_ms": round((perf_counter() - coordination_started) * 1000),
+                "post_bay_reassignment_attempts": post_bay_reassignment_attempts,
+                "post_bay_reassigned_lo_count": len(post_bay_reassigned_lo_ids - set(dropped_by_lo)),
+                "post_bay_reassignment_exhausted_lo_count": len(post_bay_reassignment_exhausted_lo_ids),
+                "post_bay_reassignment_timeout_lo_count": len(post_bay_reassignment_timeout_lo_ids),
+                "post_bay_reassignment_route_statuses": post_bay_route_statuses,
+                "post_bay_route_time_limit_seconds": route_retry_time_limit,
+                "post_bay_route_time_used_ms": round(route_retry_time_used_seconds * 1000),
                 "constraint_violation_count": final_violation_count,
                 "constraint_penalty_cost": final_constraint_penalty,
             },

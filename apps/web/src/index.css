@@ -1552,7 +1552,15 @@ div.border.border-line.bg-white.p-5 {
 }
 
 .phase7-job-table {
-  min-width: 1240px;
+  min-width: 1420px;
+}
+
+.phase7-job-name-cell {
+  min-width: 180px;
+  max-width: 280px;
+  color: #395570;
+  font-weight: 700;
+  overflow-wrap: anywhere;
 }
 
 .phase7-operational-table {
@@ -1959,6 +1967,7 @@ div.border.border-line.bg-white.p-5 {
 .phase7-inline-alert.is-error { border: 1px solid rgba(234, 74, 67, 0.3); background: #fff7f6; color: #b33b36; }
 .phase7-toast.is-success,
 .phase7-inline-alert.is-success { border: 1px solid rgba(138, 170, 24, 0.3); background: #fbfdec; color: #667f13; }
+.phase7-inline-alert.is-warning { border: 1px solid rgba(217, 146, 22, 0.3); background: #fffaf0; color: #8b5d0c; }
 
 .phase7-job-header {
   position: sticky;
@@ -2136,6 +2145,80 @@ div.border.border-line.bg-white.p-5 {
   display: grid;
   gap: 18px;
 }
+
+.phase7-gantt-block {
+  min-width: 0;
+  border: 1px solid rgba(21, 56, 91, 0.1);
+  border-radius: 14px;
+  background: #fbfdff;
+  overflow: hidden;
+}
+
+.phase7-gantt-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  border-bottom: 1px solid rgba(21, 56, 91, 0.08);
+  padding: 13px 15px 10px;
+}
+
+.phase7-gantt-heading h4,
+.phase7-gantt-heading p {
+  margin: 0;
+}
+
+.phase7-gantt-heading h4 {
+  color: #15385b;
+  font-size: 13px;
+}
+
+.phase7-gantt-heading p {
+  margin-top: 3px;
+  color: #64748b;
+  font-size: 10px;
+}
+
+.phase7-gantt-window {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 6px;
+  color: #345473;
+  font-size: 9px;
+  font-weight: 800;
+}
+
+.phase7-gantt-legend {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 9px 14px;
+  padding: 10px 15px 0;
+  color: #64748b;
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.phase7-gantt-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.phase7-gantt-legend i {
+  width: 9px;
+  height: 9px;
+  border-radius: 3px;
+  background: #94a3b8;
+}
+
+.phase7-gantt-legend .is-queue { background: #8b5cf6; }
+.phase7-gantt-legend .is-loading { background: #0ea5a8; }
+.phase7-gantt-legend .is-gate { background: #f59e0b; }
+.phase7-gantt-legend .is-travel { background: #0b73bf; }
+.phase7-gantt-legend .is-service { background: #b8d211; }
+.phase7-gantt-legend .is-arrival { border-radius: 50%; background: #ea4a43; }
 
 .phase7-vehicle-timeline > div {
   display: grid;
@@ -2536,24 +2619,60 @@ div.border.border-line.bg-white.p-5 {
   display: grid;
   grid-template-columns: minmax(0, 2.2fr) minmax(250px, 0.8fr);
   gap: 13px;
+  align-items: start;
+}
+
+.phase7-map-pagination { margin-bottom: 13px; }
+
+.phase7-map-shell {
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid rgba(21, 56, 91, 0.12);
+  border-radius: 15px;
+  background: #eef3f6;
+  contain: layout paint;
 }
 
 .phase7-map {
+  width: 100%;
+  height: min(68vh, 650px);
   min-height: 530px;
-  border-radius: 15px;
   background: #eef3f6;
+}
+
+.phase7-map-render-note {
+  position: absolute;
+  z-index: 500;
+  right: 10px;
+  bottom: 10px;
+  max-width: calc(100% - 20px);
+  border: 1px solid rgba(21, 56, 91, 0.12);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.92);
+  color: #64748b;
+  padding: 5px 9px;
+  font-size: 9px;
+  font-weight: 700;
+  pointer-events: none;
+  backdrop-filter: blur(5px);
 }
 
 .phase7-map-legend {
   display: grid;
   align-content: start;
   gap: 8px;
+  max-height: min(68vh, 650px);
+  overflow-y: auto;
+  padding-right: 3px;
+  overscroll-behavior: contain;
 }
 
 .phase7-map-legend div {
   display: grid;
   gap: 5px;
   border: 1px solid rgba(21, 56, 91, 0.1);
+  border-left: 4px solid #0b73bf;
   border-radius: 12px;
   padding: 11px;
   font-size: 10px;
@@ -2661,9 +2780,12 @@ div.border.border-line.bg-white.p-5 {
   .phase7-meta-grid,
   .phase7-form-grid { grid-template-columns: 1fr; }
   .phase7-route-filters { grid-template-columns: 1fr; }
+  .phase7-gantt-heading { align-items: stretch; flex-direction: column; }
+  .phase7-gantt-window { justify-content: space-between; }
   .phase7-vehicle-timeline > div { grid-template-columns: 1fr; }
   .phase7-job-header { position: static; }
   .phase7-job-identity > div { width: 100%; border-right: 0; border-bottom: 1px solid rgba(21, 56, 91, 0.08); padding: 0 0 8px; }
-  .phase7-map { min-height: 390px; }
+  .phase7-map { height: 390px; min-height: 390px; }
+  .phase7-map-legend { max-height: 390px; }
   .phase7-bay-config-actions { justify-content: flex-start; flex-wrap: wrap; }
 }

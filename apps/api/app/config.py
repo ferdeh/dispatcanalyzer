@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     google_routes_encryption_key: str | None = None
     google_routes_request_timeout_seconds: float = 8.0
     google_routes_max_retries: int = 2
+    road_geometry_fallback_url: str | None = "https://router.project-osrm.org"
+    road_geometry_fallback_timeout_seconds: float = 15.0
+    road_geometry_cache_ttl_minutes: int = 43_200
     phase6_worker_poll_seconds: float = 1.0
     phase6_worker_heartbeat_seconds: float = 5.0
     phase6_worker_lease_seconds: float = 30.0

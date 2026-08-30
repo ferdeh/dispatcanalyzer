@@ -38,6 +38,7 @@ from app.phase7_constants import constraint_catalog, constraint_is_hard, constra
 from app.phase7_matrix import RouteMatrixService
 from app import phase7_service
 from app.phase7_service import (
+    _complete_vehicle_eta_state,
     _copy_frozen_plan,
     _comparison,
     _cost_breakdown,
@@ -48,6 +49,7 @@ from app.phase7_service import (
     delete_bay_configuration,
     get_bay_configuration,
     get_route_version,
+    load_mt_from_master,
     recover_interrupted_phase7_optimizations,
     update_vehicle_states,
 )
@@ -109,6 +111,14 @@ def test_legacy_time_limit_populates_independent_route_and_bay_budgets() -> None
     assert configured["route_optimization_time_limit"] == 23
     assert configured["bay_optimization_time_limit"] == 41
     assert configured["bay_cp_sat_workers"] == 6
+
+
+def test_fifo_balanced_is_the_default_bay_scheduler_and_cp_sat_is_opt_in() -> None:
+    assert effective_parameters({})["bay_scheduler_strategy"] == "FIFO_BALANCED"
+    assert effective_parameters({"bay_scheduler_strategy": "cp_sat"})["bay_scheduler_strategy"] == "CP_SAT"
+
+    with pytest.raises(ValueError, match="bay_scheduler_strategy"):
+        effective_parameters({"bay_scheduler_strategy": "RANDOM"})
 
 
 def test_cp_sat_unknown_and_timeout_are_not_reported_as_infeasible() -> None:
@@ -266,6 +276,61 @@ def test_enqueue_optimization_reserves_job_and_rejects_duplicate(monkeypatch: py
             )
         assert raised.value.status_code == 409
         assert raised.value.detail["code"] == "OPTIMIZATION_ALREADY_RUNNING"
+
+
+@pytest.mark.parametrize(
+    ("planned_eta", "accepted", "invalid_bucket"),
+    [
+        (None, False, "missing_mt"),
+        (datetime(2026, 8, 26, 0, 59, tzinfo=timezone.utc), False, "before_optimization_mt"),
+        (datetime(2026, 8, 26, 1, 0, tzinfo=timezone.utc), True, None),
+    ],
+)
+def test_optimization_requires_planned_eta_at_or_after_reference_time(
+    monkeypatch: pytest.MonkeyPatch,
+    planned_eta: datetime | None,
+    accepted: bool,
+    invalid_bucket: str | None,
+) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    monkeypatch.setattr(phase7_service, "validate_job", lambda *_args, **_kwargs: {"status": "READY", "messages": []})
+    with Session() as db:
+        db.add(MasterDepot(depot_id="D1", depot_name="Depot 1", timezone="Asia/Jakarta"))
+        db.add(MasterMT(mt_id="M-ETA", vehicle_name_raw="MT ETA", vehicle_registration="BK 2000 AA", depot_id="D1"))
+        db.add(OptimizationJob(job_id="JOB-ETA", job_no="P7-JOB-ETA", job_name="ETA", depot_id="D1", operating_date=date(2026, 8, 26)))
+        db.flush()
+        db.add(VehicleOperationalState(
+            vehicle_state_id="VS-ETA",
+            job_id="JOB-ETA",
+            mt_id="M-ETA",
+            registration_snapshot="BK 2000 AA",
+            planned_eta_depot=planned_eta,
+        ))
+        db.commit()
+
+        if accepted:
+            result = phase7_service.enqueue_optimization(
+                db,
+                "JOB-ETA",
+                {"current_time": "2026-08-26T08:00:00", "parameters": {}},
+                reroute=False,
+            )
+            assert result["status"] == "CALCULATING"
+            assert result["optimization_reference_time"] == "2026-08-26T01:00:00+00:00"
+        else:
+            with pytest.raises(HTTPException) as raised:
+                phase7_service.enqueue_optimization(
+                    db,
+                    "JOB-ETA",
+                    {"current_time": "2026-08-26T08:00:00", "parameters": {}},
+                    reroute=False,
+                )
+            assert raised.value.status_code == 422
+            assert raised.value.detail["code"] == "PLANNED_ETA_DEPOT_INVALID"
+            assert raised.value.detail[invalid_bucket][0]["mt_id"] == "M-ETA"
+            assert db.get(OptimizationJob, "JOB-ETA").status != "CALCULATING"
 
 
 def test_delete_bay_soft_deletes_master_without_exposing_it_in_configuration() -> None:
@@ -570,7 +635,153 @@ def test_bay_product_compatibility_can_be_soft_or_disabled() -> None:
     assert disabled["assignments"][0]["constraint_violations"] == []
 
 
-def test_bay_solver_keeps_feasible_subset_and_labels_congestion() -> None:
+def test_fifo_balanced_distributes_identical_ready_trips_across_all_product_bays() -> None:
+    trips = [
+        {
+            "vehicle_id": f"MT-{index:03d}",
+            "trip_number": 1,
+            "vehicle_ready_at_depot": DAY_START,
+            "lo_assignments": [{
+                "loading_order_id": f"LO-{index:03d}",
+                "compartment_id": "C1",
+                "product_id": "P1",
+                "volume_kl": 8,
+            }],
+        }
+        for index in range(100)
+    ]
+    bays = [
+        {
+            "master_bay_id": f"BAY-{index}",
+            "all_products_allowed": True,
+            "allowed_product_ids": [],
+            "number_of_loading_arms": 1,
+            "loading_mode": "SEQUENTIAL",
+            "operational_start_minutes": 0,
+            "operational_end_minutes": 24 * 60 - 1,
+        }
+        for index in range(1, 7)
+    ]
+
+    result = BayQueueOptimizationService().schedule(
+        trips=trips,
+        bays=bays,
+        actual_states=[],
+        initial_queue=[],
+        loading_durations={"P1": 10},
+        day_start=DAY_START,
+        depot_close=DAY_START + timedelta(hours=23, minutes=59),
+        parameters=parameters(),
+    )
+
+    assignments_per_bay = {
+        bay["master_bay_id"]: sum(
+            row["master_bay_id"] == bay["master_bay_id"] for row in result["assignments"]
+        )
+        for bay in bays
+    }
+    assert result["solver_status"] == "FEASIBLE"
+    assert result["engine"] == "FIFO_BALANCED"
+    assert len(result["assignments"]) == 100
+    assert max(assignments_per_bay.values()) - min(assignments_per_bay.values()) <= 1
+    assert result["scheduler_metadata"]["candidate_evaluation_count"] == 600
+
+
+def test_fifo_balanced_prefers_product_specific_bay_before_flexible_bay() -> None:
+    trips = [
+        {
+            "vehicle_id": "MT-P1",
+            "trip_number": 1,
+            "vehicle_ready_at_depot": DAY_START,
+            "lo_assignments": [{"loading_order_id": "LO-P1", "compartment_id": "C1", "product_id": "P1", "volume_kl": 8}],
+        },
+        {
+            "vehicle_id": "MT-P2",
+            "trip_number": 1,
+            "vehicle_ready_at_depot": DAY_START,
+            "lo_assignments": [{"loading_order_id": "LO-P2", "compartment_id": "C1", "product_id": "P2", "volume_kl": 8}],
+        },
+    ]
+    bays = [
+        {"master_bay_id": "BAY-P1", "all_products_allowed": False, "allowed_product_ids": ["P1"], "number_of_loading_arms": 1, "loading_mode": "SEQUENTIAL"},
+        {"master_bay_id": "BAY-P2", "all_products_allowed": False, "allowed_product_ids": ["P2"], "number_of_loading_arms": 1, "loading_mode": "SEQUENTIAL"},
+        {"master_bay_id": "BAY-ALL", "all_products_allowed": True, "allowed_product_ids": [], "number_of_loading_arms": 1, "loading_mode": "SEQUENTIAL"},
+    ]
+
+    result = BayQueueOptimizationService().schedule(
+        trips=trips,
+        bays=bays,
+        actual_states=[],
+        initial_queue=[],
+        loading_durations={"P1": 10, "P2": 10},
+        day_start=DAY_START,
+        depot_close=DAY_START + timedelta(hours=18),
+        parameters=parameters(),
+    )
+
+    selected_by_trip = {row["trip_index"]: row["master_bay_id"] for row in result["assignments"]}
+    assert selected_by_trip == {0: "BAY-P1", 1: "BAY-P2"}
+
+
+def test_fifo_balanced_propagates_actual_return_before_same_mt_next_trip() -> None:
+    trips = [
+        {
+            "vehicle_id": "MT-1",
+            "trip_number": 1,
+            "vehicle_ready_at_depot": DAY_START,
+            "gate_out": DAY_START,
+            "estimated_return_depot": DAY_START + timedelta(minutes=60),
+            "lo_assignments": [{"loading_order_id": "LO-1", "compartment_id": "C1", "product_id": "P1", "volume_kl": 8}],
+        },
+        {
+            "vehicle_id": "MT-1",
+            "trip_number": 2,
+            "vehicle_ready_at_depot": DAY_START,
+            "gate_out": DAY_START,
+            "estimated_return_depot": DAY_START + timedelta(minutes=60),
+            "lo_assignments": [{"loading_order_id": "LO-2", "compartment_id": "C1", "product_id": "P1", "volume_kl": 8}],
+        },
+    ]
+
+    result = BayQueueOptimizationService().schedule(
+        trips=trips,
+        bays=[{"master_bay_id": "BAY-1", "all_products_allowed": True, "allowed_product_ids": [], "number_of_loading_arms": 1, "loading_mode": "SEQUENTIAL"}],
+        actual_states=[],
+        initial_queue=[],
+        loading_durations={"P1": 10},
+        day_start=DAY_START,
+        depot_close=DAY_START + timedelta(hours=18),
+        parameters=parameters(gate_process_time=5),
+    )
+
+    first, second = result["assignments"]
+    assert first["gate_out"] == DAY_START + timedelta(minutes=15)
+    assert second["vehicle_ready_at_depot"] == DAY_START + timedelta(minutes=75)
+    assert second["loading_start"] == DAY_START + timedelta(minutes=75)
+
+
+def test_cp_sat_bay_scheduler_remains_available_as_explicit_strategy() -> None:
+    result = BayQueueOptimizationService().schedule(
+        trips=[{
+            "vehicle_id": "MT-1",
+            "trip_number": 1,
+            "vehicle_ready_at_depot": DAY_START,
+            "lo_assignments": [{"loading_order_id": "LO-1", "compartment_id": "C1", "product_id": "P1", "volume_kl": 8}],
+        }],
+        bays=[{"master_bay_id": "BAY-1", "all_products_allowed": True, "allowed_product_ids": [], "number_of_loading_arms": 1, "loading_mode": "SEQUENTIAL"}],
+        actual_states=[],
+        initial_queue=[],
+        loading_durations={"P1": 10},
+        day_start=DAY_START,
+        depot_close=DAY_START + timedelta(hours=18),
+        parameters=parameters(bay_scheduler_strategy="CP_SAT", bay_cp_sat_workers=3),
+    )
+
+    assert result["engine"] == "OR_TOOLS_CP_SAT"
+    assert result["num_search_workers"] == 3
+
+
+def test_fifo_bay_scheduler_keeps_feasible_subset_and_labels_exhausted_window() -> None:
     trips = [
         {
             "vehicle_id": f"MT-{index}",
@@ -603,8 +814,10 @@ def test_bay_solver_keeps_feasible_subset_and_labels_congestion() -> None:
     assert len(result["assignments"]) == 1
     assert len(result["dropped_trip_indexes"]) == 1
     dropped_index = result["dropped_trip_indexes"][0]
-    assert result["dropped_trip_reasons"][dropped_index] == "BAY_CONGESTION"
-    assert result["num_search_workers"] == 8
+    assert result["dropped_trip_reasons"][dropped_index] == "BAY_WINDOW_EXHAUSTED"
+    assert result["engine"] == "FIFO_BALANCED"
+    assert result["num_search_workers"] == 0
+    assert result["time_limit_reached"] is False
 
 
 def test_soft_bay_service_drops_only_later_trip_ready_after_depot_close() -> None:
@@ -644,7 +857,7 @@ def test_soft_bay_service_drops_only_later_trip_ready_after_depot_close() -> Non
     assert result["solver_status"] == "PARTIAL"
     assert [row["trip_index"] for row in result["assignments"]] == [0]
     assert result["dropped_trip_indexes"] == [1]
-    assert result["dropped_trip_reasons"] == {1: "BAY_CONGESTION"}
+    assert result["dropped_trip_reasons"] == {1: "BAY_WINDOW_EXHAUSTED"}
 
 
 def test_hard_serve_loading_order_keeps_all_or_reports_infeasible() -> None:
@@ -679,10 +892,10 @@ def test_hard_serve_loading_order_keeps_all_or_reports_infeasible() -> None:
     assert result["solver_status"] == "INFEASIBLE"
     assert result["assignments"] == []
     assert result["dropped_trip_indexes"] == [0, 1]
-    assert set(result["dropped_trip_reasons"].values()) == {"BAY_CONGESTION"}
+    assert set(result["dropped_trip_reasons"].values()) == {"BAY_WINDOW_EXHAUSTED"}
 
 
-def test_coordinator_persists_partial_bay_congestion_instead_of_product_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_coordinator_persists_partial_bay_window_exhaustion_instead_of_product_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     trips = [
         {
             "vehicle_id": f"MT-{index}",
@@ -734,9 +947,10 @@ def test_coordinator_persists_partial_bay_congestion_instead_of_product_failure(
     assert result["solver_status"] == "PARTIAL"
     assert len(result["trips"]) == 1
     assert len(result["dropped"]) == 1
-    assert result["dropped"][0]["reason_code"] == "BAY_CONGESTION"
+    assert result["dropped"][0]["reason_code"] == "BAY_WINDOW_EXHAUSTED"
     assert result["solver_metadata"]["bay_served_trip_count"] == 1
     assert result["solver_metadata"]["bay_dropped_trip_count"] == 1
+    assert result["solver_metadata"]["bay_scheduler_strategy"] == "FIFO_BALANCED"
 
 
 def test_coordinator_keeps_trip_that_gates_out_before_close_and_returns_after(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -795,6 +1009,255 @@ def test_coordinator_keeps_trip_that_gates_out_before_close_and_returns_after(mo
     assert result["dropped"] == []
 
 
+def test_coordinator_reassigns_post_bay_working_failure_using_actual_retained_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed_lo = {
+        "loading_order_id": "LO-RETRY",
+        "spbu_id": "SPBU-1",
+        "product_id": "P1",
+        "volume_kl": 8,
+        "allowed_vehicle_ids": ["MT-1", "MT-2"],
+    }
+    retained_lo = {
+        "loading_order_id": "LO-RETAINED",
+        "spbu_id": "SPBU-2",
+        "product_id": "P1",
+        "volume_kl": 8,
+        "allowed_vehicle_ids": ["MT-2"],
+    }
+    initial_trips = [
+        {
+            "vehicle_id": "MT-1",
+            "trip_number": 1,
+            "vehicle_ready_at_depot": DAY_START,
+            "gate_out": DAY_START,
+            "estimated_return_depot": DAY_START + timedelta(minutes=60),
+            "operating_minutes": 60,
+            "constraint_violations": [],
+            "constraint_penalty_cost": 0,
+            "lo_assignments": [{**failed_lo, "compartment_id": "C1"}],
+        },
+        {
+            "vehicle_id": "MT-2",
+            "trip_number": 1,
+            "vehicle_ready_at_depot": DAY_START,
+            "gate_out": DAY_START,
+            "estimated_return_depot": DAY_START + timedelta(minutes=30),
+            "operating_minutes": 30,
+            "constraint_violations": [],
+            "constraint_penalty_cost": 0,
+            "lo_assignments": [{**retained_lo, "compartment_id": "C1"}],
+        },
+    ]
+    retried_trip = {
+        "vehicle_id": "MT-2",
+        "trip_number": 2,
+        "vehicle_ready_at_depot": DAY_START + timedelta(minutes=40),
+        "gate_out": DAY_START + timedelta(minutes=40),
+        "estimated_return_depot": DAY_START + timedelta(minutes=90),
+        "operating_minutes": 50,
+        "constraint_violations": [],
+        "constraint_penalty_cost": 0,
+        "lo_assignments": [{**failed_lo, "allowed_vehicle_ids": ["MT-2"], "compartment_id": "C1"}],
+    }
+    coordinator = OptimizationCoordinatorService()
+    solve_calls = 0
+
+    def fake_solve(**kwargs: object) -> dict:
+        nonlocal solve_calls
+        solve_calls += 1
+        if solve_calls == 1:
+            return {
+                "solver_status": "FEASIBLE",
+                "objective_value": 100,
+                "trips": initial_trips,
+                "dropped": [],
+                "vehicle_state": [],
+                "solver_metadata": {},
+            }
+        assert [row["loading_order_id"] for row in kwargs["loading_orders"]] == ["LO-RETRY"]  # type: ignore[index]
+        assert kwargs["loading_orders"][0]["allowed_vehicle_ids"] == ["MT-2"]  # type: ignore[index]
+        retry_vehicle = next(row for row in kwargs["vehicles"] if row["mt_id"] == "MT-2")  # type: ignore[index]
+        assert retry_vehicle["working_time_used_minutes"] == 40
+        assert retry_vehicle["working_time_remaining_minutes"] == 60
+        assert retry_vehicle["effective_eta_depot"] == DAY_START + timedelta(minutes=40)
+        return {
+            "solver_status": "FEASIBLE",
+            "objective_value": 50,
+            "trips": [retried_trip],
+            "dropped": [],
+            "vehicle_state": [],
+            "solver_metadata": {},
+        }
+
+    bay_calls = 0
+
+    def fake_bay_schedule(**kwargs: object) -> dict:
+        nonlocal bay_calls
+        bay_calls += 1
+        assignments = []
+        for index, trip in enumerate(kwargs["trips"]):  # type: ignore[index]
+            shift = timedelta(0)
+            if bay_calls == 1:
+                shift = timedelta(minutes=20 if trip["vehicle_id"] == "MT-1" else 10)
+            gate_out = trip["gate_out"] + shift
+            assignments.append({
+                "trip_index": index,
+                "master_bay_id": "B1",
+                "vehicle_ready_at_depot": trip["vehicle_ready_at_depot"],
+                "queue_start": trip["vehicle_ready_at_depot"],
+                "loading_start": gate_out - timedelta(minutes=5),
+                "loading_finish": gate_out,
+                "gate_out": gate_out,
+                "queue_minutes": 0,
+                "loading_minutes": 5,
+                "constraint_violations": [],
+            })
+        return {
+            "solver_status": "FEASIBLE",
+            "raw_solver_status": "OPTIMAL",
+            "assignments": assignments,
+            "dropped_trip_indexes": [],
+            "dropped_trip_reasons": {},
+            "engine": "TEST_BAY",
+            "num_search_workers": 1,
+            "time_limit_reached": False,
+        }
+
+    monkeypatch.setattr(coordinator.vrp, "solve", fake_solve)
+    monkeypatch.setattr(coordinator.bay, "schedule", fake_bay_schedule)
+    result = coordinator.optimize(
+        loading_orders=[failed_lo, retained_lo],
+        vehicles=[
+            {"mt_id": "MT-1", "working_time_limit_minutes": 70, "working_time_used_minutes": 0},
+            {"mt_id": "MT-2", "working_time_limit_minutes": 100, "working_time_used_minutes": 0},
+        ],
+        distance_matrix=[[0, 1, 1], [1, 0, 1], [1, 1, 0]],
+        time_matrix=[[0, 60, 60], [60, 0, 60], [60, 60, 0]],
+        bays=[],
+        actual_bay_states=[],
+        initial_queue=[],
+        loading_durations={"P1": 5},
+        day_start=DAY_START,
+        depot_close=DAY_START + timedelta(hours=18),
+        parameters=parameters(max_coordination_iterations=1),
+    )
+
+    assert solve_calls == 2
+    assert result["solver_status"] == "FEASIBLE"
+    assert result["dropped"] == []
+    assert {(trip["vehicle_id"], trip["trip_number"]) for trip in result["trips"]} == {
+        ("MT-2", 1),
+        ("MT-2", 2),
+    }
+    assert result["solver_metadata"]["post_bay_reassignment_attempts"] == 1
+    assert result["solver_metadata"]["post_bay_reassigned_lo_count"] == 1
+    assert result["solver_metadata"]["post_bay_reassignment_exhausted_lo_count"] == 0
+
+
+def test_coordinator_drops_post_bay_lo_only_after_all_alternative_mt_are_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loading_order = {
+        "loading_order_id": "LO-EXHAUST",
+        "spbu_id": "SPBU-1",
+        "product_id": "P1",
+        "volume_kl": 8,
+        "allowed_vehicle_ids": ["MT-1", "MT-2"],
+    }
+
+    def trip_for(vehicle_id: str, allowed_vehicle_ids: list[str]) -> dict:
+        return {
+            "vehicle_id": vehicle_id,
+            "trip_number": 1,
+            "vehicle_ready_at_depot": DAY_START,
+            "gate_out": DAY_START,
+            "estimated_return_depot": DAY_START + timedelta(minutes=60),
+            "operating_minutes": 60,
+            "constraint_violations": [],
+            "constraint_penalty_cost": 0,
+            "lo_assignments": [{
+                **loading_order,
+                "allowed_vehicle_ids": allowed_vehicle_ids,
+                "compartment_id": "C1",
+            }],
+        }
+
+    coordinator = OptimizationCoordinatorService()
+    solve_calls = 0
+
+    def fake_solve(**kwargs: object) -> dict:
+        nonlocal solve_calls
+        solve_calls += 1
+        vehicle_id = "MT-1" if solve_calls == 1 else "MT-2"
+        allowed = ["MT-1", "MT-2"] if solve_calls == 1 else ["MT-2"]
+        if solve_calls == 2:
+            assert kwargs["loading_orders"][0]["allowed_vehicle_ids"] == ["MT-2"]  # type: ignore[index]
+        return {
+            "solver_status": "FEASIBLE",
+            "objective_value": 0,
+            "trips": [trip_for(vehicle_id, allowed)],
+            "dropped": [],
+            "vehicle_state": [],
+            "solver_metadata": {},
+        }
+
+    def fake_bay_schedule(**kwargs: object) -> dict:
+        trip = kwargs["trips"][0]  # type: ignore[index]
+        gate_out = trip["gate_out"] + timedelta(minutes=20)
+        return {
+            "solver_status": "FEASIBLE",
+            "raw_solver_status": "OPTIMAL",
+            "assignments": [{
+                "trip_index": 0,
+                "master_bay_id": "B1",
+                "vehicle_ready_at_depot": trip["vehicle_ready_at_depot"],
+                "queue_start": trip["vehicle_ready_at_depot"],
+                "loading_start": gate_out - timedelta(minutes=5),
+                "loading_finish": gate_out,
+                "gate_out": gate_out,
+                "queue_minutes": 0,
+                "loading_minutes": 5,
+                "constraint_violations": [],
+            }],
+            "dropped_trip_indexes": [],
+            "dropped_trip_reasons": {},
+            "engine": "TEST_BAY",
+            "num_search_workers": 1,
+            "time_limit_reached": False,
+        }
+
+    monkeypatch.setattr(coordinator.vrp, "solve", fake_solve)
+    monkeypatch.setattr(coordinator.bay, "schedule", fake_bay_schedule)
+    result = coordinator.optimize(
+        loading_orders=[loading_order],
+        vehicles=[
+            {"mt_id": "MT-1", "working_time_limit_minutes": 70, "working_time_used_minutes": 0},
+            {"mt_id": "MT-2", "working_time_limit_minutes": 70, "working_time_used_minutes": 0},
+        ],
+        distance_matrix=[[0, 1], [1, 0]],
+        time_matrix=[[0, 60], [60, 0]],
+        bays=[],
+        actual_bay_states=[],
+        initial_queue=[],
+        loading_durations={"P1": 5},
+        day_start=DAY_START,
+        depot_close=DAY_START + timedelta(hours=18),
+        parameters=parameters(max_coordination_iterations=1),
+    )
+
+    assert solve_calls == 2
+    assert result["trips"] == []
+    assert result["solver_status"] == "INFEASIBLE"
+    assert len(result["dropped"]) == 1
+    assert result["dropped"][0]["reason_code"] == "VEHICLE_TIME_EXHAUSTED"
+    assert "Every compatible alternative MT" in result["dropped"][0]["reason_description"]
+    assert result["solver_metadata"]["post_bay_reassignment_attempts"] == 1
+    assert result["solver_metadata"]["post_bay_reassignment_exhausted_lo_count"] == 1
+    assert result["solver_metadata"]["bay_dropped_trip_count"] == 1
+
+
 def test_i_initial_queue_delays_future_gate_out() -> None:
     ready = DAY_START + timedelta(hours=5)
     trip = {"vehicle_ready_at_depot": ready, "lo_assignments": [{"loading_order_id": "LO-1", "compartment_id": "C1", "product_id": "P1", "volume_kl": 8}]}
@@ -823,7 +1286,7 @@ def test_j_loading_duration_is_summed_per_compartment_in_sequential_mode() -> No
     assert BayQueueOptimizationService.loading_minutes(trip, {"PERTALITE": 8, "BIOSOLAR": 10}, loading_mode="SEQUENTIAL") == 26
 
 
-def test_k_user_eta_override_has_priority_over_system_and_planned_eta() -> None:
+def test_k_planned_eta_is_the_only_user_availability_input() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
@@ -831,12 +1294,255 @@ def test_k_user_eta_override_has_priority_over_system_and_planned_eta() -> None:
         db.add(MasterDepot(depot_id="D1", depot_name="Depot 1"))
         db.add(MasterMT(mt_id="M1", vehicle_name_raw="MT 1", vehicle_registration="BL 1", depot_id="D1"))
         db.add(OptimizationJob(job_id="JOB-1", job_no="P7-JOB-1", job_name="Job", depot_id="D1", operating_date=date(2026, 8, 26), depot_operational_start=time(5), depot_operational_end=time(22)))
-        db.add(VehicleOperationalState(vehicle_state_id="VS-1", job_id="JOB-1", mt_id="M1", capacity_kl=8, number_of_compartments=1, compartment_configuration=[{"compartment_id": "C1", "capacity_kl": 8}], planned_eta_depot=DAY_START + timedelta(hours=5), system_eta_depot=DAY_START + timedelta(hours=7), effective_eta_depot=DAY_START + timedelta(hours=7)))
+        db.add(VehicleOperationalState(vehicle_state_id="VS-1", job_id="JOB-1", mt_id="M1", capacity_kl=8, number_of_compartments=1, compartment_configuration=[{"compartment_id": "C1", "capacity_kl": 8}], planned_eta_depot=DAY_START + timedelta(hours=5), system_eta_depot=DAY_START + timedelta(hours=7), user_eta_override=DAY_START + timedelta(hours=8), effective_eta_depot=DAY_START + timedelta(hours=8)))
         db.commit()
-        override = DAY_START + timedelta(hours=8)
-        update_vehicle_states(db, "JOB-1", [{"mt_id": "M1", "user_eta_override": override.isoformat()}])
+        planned = DAY_START + timedelta(hours=6)
+        result = update_vehicle_states(db, "JOB-1", [{"mt_id": "M1", "planned_eta_depot": planned.isoformat()}])
         state = db.scalar(select(VehicleOperationalState).where(VehicleOperationalState.mt_id == "M1"))
-        assert state.effective_eta_depot.replace(tzinfo=timezone.utc) == override
+        assert state.planned_eta_depot.replace(tzinfo=timezone.utc) == planned
+        assert state.effective_eta_depot.replace(tzinfo=timezone.utc) == planned
+        assert state.user_eta_override is None
+        assert "user_eta_override" not in result["vehicles"][0]
+
+
+def test_k1_system_eta_is_empty_when_mt_is_first_loaded_before_v1() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as db:
+        db.add(MasterDepot(depot_id="D1", depot_name="Depot 1"))
+        db.add(MasterMT(mt_id="M1", vehicle_name_raw="MT 1", vehicle_registration="BL 1", depot_id="D1"))
+        db.add(OptimizationJob(job_id="JOB-1", job_no="P7-JOB-1", job_name="Job", depot_id="D1", operating_date=date(2026, 8, 26)))
+        db.commit()
+
+        result = load_mt_from_master(db, "JOB-1")
+
+        assert result["vehicles"][0]["system_eta_depot"] is None
+        assert db.scalar(select(VehicleOperationalState).where(VehicleOperationalState.mt_id == "M1")).system_eta_depot is None
+
+
+def test_k2_initial_completion_publishes_first_trip_return_and_clears_planned_eta() -> None:
+    planned = DAY_START + timedelta(hours=5)
+    first_return = DAY_START + timedelta(hours=8)
+    second_return = DAY_START + timedelta(hours=12)
+    state = VehicleOperationalState(
+        vehicle_state_id="VS-1",
+        job_id="JOB-1",
+        mt_id="M1",
+        planned_eta_depot=planned,
+        effective_eta_depot=planned,
+    )
+    trips = [
+        RouteVersionTrip(
+            route_version_trip_id="T2",
+            route_version_id="V1",
+            vehicle_id="M1",
+            trip_number=2,
+            shipment_id="SHIP-2",
+            gate_out=DAY_START + timedelta(hours=9),
+            estimated_return_depot=second_return,
+        ),
+        RouteVersionTrip(
+            route_version_trip_id="T1",
+            route_version_id="V1",
+            vehicle_id="M1",
+            trip_number=1,
+            shipment_id="SHIP-1",
+            gate_out=DAY_START + timedelta(hours=6),
+            estimated_return_depot=first_return,
+        ),
+    ]
+
+    system_eta = _complete_vehicle_eta_state(
+        state,
+        reroute=False,
+        trips=trips,
+        ongoing_trip_keys=set(),
+    )
+
+    assert system_eta == first_return
+    assert state.system_eta_depot == first_return
+    assert state.effective_eta_depot == first_return
+    assert state.planned_eta_depot is None
+
+
+def test_k3_reroute_completion_publishes_ongoing_trip_eta_and_clears_planned_eta() -> None:
+    planned_input = DAY_START + timedelta(hours=9)
+    calculated_ongoing_return = DAY_START + timedelta(hours=6, minutes=4)
+    state = VehicleOperationalState(
+        vehicle_state_id="VS-1",
+        job_id="JOB-1",
+        mt_id="M1",
+        planned_eta_depot=planned_input,
+        system_eta_depot=DAY_START + timedelta(hours=12),
+        effective_eta_depot=DAY_START + timedelta(hours=12),
+    )
+    trips = [
+        RouteVersionTrip(
+            route_version_trip_id="T1-REROUTE",
+            route_version_id="V2",
+            vehicle_id="M1",
+            trip_number=1,
+            shipment_id="SHIP-1",
+            gate_out=DAY_START + timedelta(hours=4),
+            estimated_return_depot=calculated_ongoing_return,
+        ),
+        RouteVersionTrip(
+            route_version_trip_id="T2-REROUTE",
+            route_version_id="V2",
+            vehicle_id="M1",
+            trip_number=2,
+            shipment_id="SHIP-2",
+            gate_out=DAY_START + timedelta(hours=10),
+            estimated_return_depot=DAY_START + timedelta(hours=14),
+        ),
+    ]
+
+    system_eta = _complete_vehicle_eta_state(
+        state,
+        reroute=True,
+        trips=trips,
+        ongoing_trip_keys={("M1", 1)},
+    )
+
+    assert system_eta == calculated_ongoing_return
+    assert state.system_eta_depot == calculated_ongoing_return
+    assert state.effective_eta_depot == calculated_ongoing_return
+    assert state.planned_eta_depot is None
+
+
+def test_k3b_reroute_ignores_and_clears_legacy_user_eta_override() -> None:
+    planned_ongoing_eta = DAY_START + timedelta(hours=6, minutes=4)
+    state = VehicleOperationalState(
+        vehicle_state_id="VS-1",
+        job_id="JOB-1",
+        mt_id="M1",
+        planned_eta_depot=planned_ongoing_eta,
+        system_eta_depot=DAY_START + timedelta(hours=12),
+        user_eta_override=DAY_START + timedelta(hours=9),
+        effective_eta_depot=DAY_START + timedelta(hours=9),
+    )
+    trips = [
+        RouteVersionTrip(
+            route_version_trip_id="T1-REROUTE",
+            route_version_id="V2",
+            vehicle_id="M1",
+            trip_number=1,
+            shipment_id="SHIP-1",
+            gate_out=DAY_START + timedelta(hours=4),
+            estimated_return_depot=DAY_START + timedelta(hours=7),
+        ),
+        RouteVersionTrip(
+            route_version_trip_id="T2-REROUTE",
+            route_version_id="V2",
+            vehicle_id="M1",
+            trip_number=2,
+            shipment_id="SHIP-2",
+            gate_out=DAY_START + timedelta(hours=10),
+            estimated_return_depot=DAY_START + timedelta(hours=14),
+        ),
+    ]
+
+    system_eta = _complete_vehicle_eta_state(
+        state,
+        reroute=True,
+        trips=trips,
+        ongoing_trip_keys={("M1", 1)},
+    )
+
+    assert system_eta == DAY_START + timedelta(hours=7)
+    assert state.system_eta_depot == DAY_START + timedelta(hours=7)
+    assert state.effective_eta_depot == DAY_START + timedelta(hours=7)
+    assert state.planned_eta_depot is None
+    assert state.user_eta_override is None
+
+
+def test_k4_reroute_without_ongoing_trip_publishes_calculated_trip_1_return() -> None:
+    state = VehicleOperationalState(
+        vehicle_state_id="VS-1",
+        job_id="JOB-1",
+        mt_id="M1",
+        planned_eta_depot=DAY_START + timedelta(hours=5),
+        system_eta_depot=DAY_START + timedelta(hours=8),
+        effective_eta_depot=DAY_START + timedelta(hours=8),
+    )
+    first_return = DAY_START + timedelta(hours=8)
+    trips = [
+        RouteVersionTrip(
+            route_version_trip_id="T2-REROUTE",
+            route_version_id="V2",
+            vehicle_id="M1",
+            trip_number=2,
+            shipment_id="SHIP-2",
+            gate_out=DAY_START + timedelta(hours=10),
+            estimated_return_depot=DAY_START + timedelta(hours=14),
+        ),
+        RouteVersionTrip(
+            route_version_trip_id="T1-REROUTE",
+            route_version_id="V2",
+            vehicle_id="M1",
+            trip_number=1,
+            shipment_id="SHIP-1",
+            gate_out=DAY_START + timedelta(hours=5),
+            estimated_return_depot=first_return,
+        ),
+    ]
+
+    system_eta = _complete_vehicle_eta_state(
+        state,
+        reroute=True,
+        trips=trips,
+        ongoing_trip_keys=set(),
+    )
+
+    assert system_eta == first_return
+    assert state.system_eta_depot == first_return
+    assert state.effective_eta_depot == first_return
+    assert state.planned_eta_depot is None
+
+
+def test_k5_reroute_publishes_trip_2_when_trip_2_contains_ongoing_lo() -> None:
+    trip_2_return = DAY_START + timedelta(hours=14)
+    state = VehicleOperationalState(
+        vehicle_state_id="VS-1",
+        job_id="JOB-1",
+        mt_id="M1",
+        planned_eta_depot=DAY_START + timedelta(hours=10),
+        system_eta_depot=DAY_START + timedelta(hours=8),
+        effective_eta_depot=DAY_START + timedelta(hours=10),
+    )
+    trips = [
+        RouteVersionTrip(
+            route_version_trip_id="T1-REROUTE",
+            route_version_id="V2",
+            vehicle_id="M1",
+            trip_number=1,
+            shipment_id="SHIP-1",
+            gate_out=DAY_START + timedelta(hours=5),
+            estimated_return_depot=DAY_START + timedelta(hours=8),
+        ),
+        RouteVersionTrip(
+            route_version_trip_id="T2-REROUTE",
+            route_version_id="V2",
+            vehicle_id="M1",
+            trip_number=2,
+            shipment_id="SHIP-2",
+            gate_out=DAY_START + timedelta(hours=10),
+            estimated_return_depot=trip_2_return,
+        ),
+    ]
+
+    system_eta = _complete_vehicle_eta_state(
+        state,
+        reroute=True,
+        trips=trips,
+        ongoing_trip_keys={("M1", 2)},
+    )
+
+    assert system_eta == trip_2_return
+    assert state.system_eta_depot == trip_2_return
+    assert state.effective_eta_depot == trip_2_return
+    assert state.planned_eta_depot is None
 
 
 def test_l_route_versioning_keeps_v1_immutable_when_v2_becomes_current() -> None:

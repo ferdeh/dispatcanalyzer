@@ -7,7 +7,7 @@ Phase 7 turns a saved Phase 6 Prediction Run into a versioned daily operational 
 Phase 7 uses:
 
 - Google OR-Tools Routing Solver for vehicle/route sequencing inside each physical-vehicle trip round;
-- OR-Tools CP-SAT for LO-to-compartment feasibility and depot bay scheduling;
+- OR-Tools CP-SAT for LO-to-compartment feasibility, with deterministic FIFO_BALANCED as the default depot bay scheduler and bay CP-SAT available only as an explicit option;
 - Google Routes API only for distance, duration, matrix, and final selected-leg geometry;
 - Phase 1 compatibility as a hard filter;
 - Phase 3 pairing, Phase 4 affinity, Phase 6 assignment/grouping, and the previous route version as soft preferences.
@@ -22,13 +22,14 @@ Select Depot
   → Select completed Phase 6 Run ID
   → import LO + immutable Phase 6 warm-start fields
   → Load active depot MT from canonical master
-  → enter initial Planned ETA Depot
+  → enter Planned ETA Depot for every MT
   → configure bays, allowed products, and product/compartment loading duration
   → enter actual bay occupancy and queue
   → Load/review parameter profile
   → click Validate in Optimization Flow
   → review Optimization Readiness popup
   → confirm Initial optimization date and time in depot timezone
+  → pre-run validation requires every Planned ETA >= optimization time
   → API 202 Accepted + Job CALCULATING
   → return to Job Management while background task builds V1
   → Initial Optimization → V1 baseline
@@ -50,7 +51,9 @@ LO Management and MT Management both provide free-text search, sorting on every 
 
 Bay Management provides Delete Bay on every persisted bay card. Deletion is a confirmed soft-delete from the active depot configuration and clears mutable current occupancy/queue rows for that bay; historical state snapshots, route versions, and bay assignments remain auditable. Newly added unsaved bay cards can be removed locally without an API mutation. Product loading speed is shown as a responsive product-card grid with a dedicated numeric duration and a separate `min / compartment` unit label.
 
-Route Plan pagination is based on unique MT, not trip rows. Its controls are rendered immediately below the Solver Status / Gate Out / Dispatch Span summary and before the route list and tables, so the visible MT scope is established before detail review. The selected MT page is shared with Vehicle Multi-Trip Timeline: `All MT` pages through the fleet in configurable groups, while selecting one registration collapses both cards to that MT. Trip/LO/SPBU/product filters continue to refine Route Plan inside the selected MT scope. Route-version responses expose both `product_id` and canonical `product_name`; the Product column renders the name while retaining the ID for audit and search. Operational KPI Groups is rendered in Simulation immediately below Simulation KPI.
+Route Plan pagination is based on unique MT, not trip rows. Its controls are rendered immediately below the Solver Status / Gate Out / Dispatch Span summary. A separate Vehicle Multi-Trip Timeline card is rendered immediately after Route Plan and before the long Route Details card, so the operational Gantt remains directly visible. It renders only the MT on the active page; selecting one registration collapses the Gantt and details to that MT. Its global X domain is the route version's first gate-out through the final depot return, with MT registrations on the right-side category axis. Duration bars cover bay queue, loading, gate processing, travel, and SPBU service. Hoverable milestones expose the MT/trip, current movement or arrival status, SPBU/depot context, actual timestamp, and duration. A queue/loading event before the first gate-out is pinned to the left boundary and explicitly retains its actual time in the tooltip. Trip/LO/SPBU/product filters continue to refine route details inside the selected MT scope. Route-version responses expose both `product_id` and canonical `product_name`; the Product column renders the name while retaining the ID for audit and search. Operational KPI Groups is rendered in Simulation immediately below Simulation KPI.
+
+Geographic Map shares the unique-MT pagination scope, so `All MT` means all MT through pages rather than hundreds of route layers in one browser render. Only trips belonging to the active page become Leaflet polylines, stop markers, and legend cards. A canvas renderer, coordinate validation, per-trip geometry-point guard, explicit map height, and automatic `invalidateSize`/`fitBounds` on version, filter, trip, and page changes keep the map visible after tab transitions and responsive on large route versions. Road geometry is hydrated lazily in this order: full-route cache, exact ordered-stop geometry from historical Phase 7/Phase 6 trips, live Google Routes, then OSRM road geometry. OSRM is strictly a geometry-only display fallback: its distance/duration never replace immutable Route Version facts, solver matrix values, ETA, assignment, sequence, or cost. Solid lines indicate road geometry; dashed lines indicate the final master-coordinate fallback.
 
 ## Optimization reference time
 
@@ -76,7 +79,7 @@ This makes historical/simulated runs deterministic: pressing the button at 14:00
 
 - `phase7_routes.py`: request/response routing, HTTP `202` acceptance, and background-task dispatch only.
 - `phase7_service.py`: jobs, async reservation/background execution, Phase 6 import, operational state, validation, profiles, snapshots, persistence, version reads, KPIs, cost, simulation, and audit.
-- `phase7_optimization.py`: compartment CP-SAT, Routing Solver, bay CP-SAT, and iterative coordination.
+- `phase7_optimization.py`: compartment CP-SAT, Routing Solver, default FIFO_BALANCED bay scheduler, opt-in bay CP-SAT, and post-bay coordination.
 - `phase7_matrix.py`: pre-materialized route matrix, cache, request audit, fallback, and final selected-leg geometry.
 - `phase7_constants.py`: statuses, reason codes, defaults, and built-in parameter profiles.
 
@@ -94,7 +97,7 @@ effective ETA at depot
   → next routing round for the same physical MT
 ```
 
-The next trip is eligible only when its loading/gate-out can occur before depot close, the MT has working time remaining, compatible LO remains, and its capacity/compartments can hold that trip. Bay-induced gate-out delay is propagated to return time and the next trip; coordination repeats until the departure delta is within tolerance or `max_coordination_iterations` is reached. A prior trip may return after depot close, but that MT cannot start another depot loading/gate-out after close. Route search uses `route_optimization_time_limit` and reserves a fair share for every remaining trip round, so Trip 1 cannot consume the entire multi-trip budget.
+The next trip is eligible only when its loading/gate-out can occur before depot close, the MT has working time remaining, compatible LO remains, and its capacity/compartments can hold that trip. FIFO_BALANCED propagates each selected bay gate-out plus the original route duration directly to the same MT's next-trip readiness in one event-driven pass. The opt-in CP_SAT strategy retains iterative departure/return coordination through `max_coordination_iterations`. A prior trip may return after depot close, but that MT cannot start another depot loading/gate-out after close. Route search uses `route_optimization_time_limit` and reserves a fair share for every remaining trip round, so Trip 1 cannot consume the entire multi-trip budget.
 
 ## Compartment assignment
 
@@ -121,7 +124,7 @@ The built-in profile keeps the following routing controls in `HARD` mode:
 - Phase 1 `MT vehicle class <= SPBU allowed vehicle class`;
 - canonical tag subset compatibility;
 - depot scope;
-- `effective_eta_depot` start time;
+- required `planned_eta_depot` start time;
 - remaining vehicle working time and no physical MT overlap;
 - required SPBU official receiving time window from Master SPBU;
 - explicit high-penalty disjunction for mandatory LO so infeasibility remains explainable;
@@ -155,11 +158,22 @@ The registry covers MT–SPBU compatibility, vehicle/compartment capacity, produ
 
 `DONE`/`ONGOING` execution state, one persisted assignment identity per LO, relational integrity, and append-only route-version history remain non-configurable structural safeguards. The configurable `freeze_window` applies to near-term `PLANNED` work.
 
-## Bay CP-SAT
+## Bay FIFO_BALANCED
 
-For each preliminary trip, CP-SAT creates a `served` variable plus loading start/end and an optional interval for every eligible bay. With `serve_loading_order=HARD`, every trip must select exactly one eligible bay. With `serve_loading_order=SOFT`, CP-SAT may retain the best feasible subset and charges the configured penalty per omitted LO. A later trip on the same physical MT cannot be retained when its earlier trip is omitted. `NoOverlap` protects bay capacity.
+`bay_scheduler_strategy=FIFO_BALANCED` is the default operational scheduler. It does not build a dense trip-by-bay search model. Instead, it keeps only the first pending trip of each physical MT in a global priority queue ordered by:
 
-Bay search has its own `bay_optimization_time_limit` and `bay_cp_sat_workers` (default 8). It does not consume the route budget. `UNKNOWN` and elapsed-limit `TIMEOUT` are preserved as solver termination states and are never rewritten as physical `INFEASIBLE`.
+1. MT ready time at depot;
+2. preliminary gate-out;
+3. trip number;
+4. MT ID, LO ID, and stable input index as deterministic tie-breaks.
+
+For each FIFO event, the scheduler enumerates the active bays, applies HARD product and bay-change eligibility, calculates loading duration, then rejects candidates whose gate-out exceeds a HARD bay/depot window. The selected candidate uses this ordering: lowest SOFT penalty, earliest gate-out, lowest projected loading workload, fewest assigned trips, least-flexible eligible bay, then stable bay ID. Therefore identical all-product bays split a simultaneous queue evenly, while product-specific bays are preserved before consuming an equally available all-product bay.
+
+The chosen bay is reserved through loading finish. Gate process follows the reservation, and its timestamp becomes the trip's actual gate-out. The same MT's next trip is not inserted into FIFO until this gate-out plus the previous calculated route duration returns it to the depot. This prevents Trip 2 from jumping ahead while Trip 1 is still loading or travelling. Complexity is approximately `O(T log T + T × B)` for `T` trips and `B` active bays; it has no bay search worker, no bay timeout, and no combinatorial symmetry across identical bays.
+
+With `serve_loading_order=SOFT`, a trip that cannot obtain a valid bay is omitted and the result remains `PARTIAL` when other trips are served. With `serve_loading_order=HARD`, one blocking trip makes the bay result `INFEASIBLE`. `BAY_PRODUCT_CONSTRAINT` is reserved for no structurally eligible bay; `BAY_WINDOW_EXHAUSTED` means compatible bays exist but all valid gate-outs exceed their operational window. A later same-MT trip blocked by failure of an earlier trip is reported as `BAY_CONGESTION`.
+
+`CP_SAT` remains available as an explicit experimental strategy in the Parameter tab for comparison and exceptional optimization studies. Only this strategy uses `bay_optimization_time_limit`, `bay_cp_sat_workers`, and iterative `max_coordination_iterations`. Its `UNKNOWN` and elapsed-limit `TIMEOUT` states remain distinct from physical `INFEASIBLE`.
 
 Before new intervals, each bay is blocked by:
 
@@ -174,7 +188,7 @@ Bay eligibility requires every trip product to be allowed or `all_products_allow
 loading finish + gate_process_time
 ```
 
-The result persists vehicle-ready, queue start, loading start/finish, gate-out, bay assignment, and per-compartment bay operations. Readiness is enforced only for a served trip; with soft service, a later trip whose MT returns after depot close is omitted without making the entire bay model infeasible.
+The result persists vehicle-ready, queue start, loading start/finish, gate-out, bay assignment, and per-compartment bay operations. FIFO audit metadata records its sequence, queue position, eligible bay list, workload before/after selection, per-bay totals, and candidate-evaluation count. With soft service, a later trip whose MT returns after depot close is omitted without making the entire bay result infeasible.
 
 ## Freeze and reroute
 
@@ -189,7 +203,7 @@ other PLANNED → re-optimizable
 
 A trip is the indivisible execution unit. If any LO in its current trip is frozen, the remaining LO on the same trip receives `FROZEN_TRIP_DEPENDENCY`. The prior trip/stops/LO assignments are copied into the new version; the old version is never updated.
 
-User ETA override outranks system ETA, which outranks initial planned ETA. Actual bay state and actual queue similarly outrank predicted state. Phase 6 is not rerun.
+`planned_eta_depot` is the only MT availability input for both Initial and Reroute. Every loaded MT must have a value, including an MT marked unavailable, and it must be equal to or later than the dispatcher-selected optimization reference time. Equality is valid; for example optimization at 00:00 accepts Planned ETA 00:00, while optimization at 12:00 rejects Planned ETA 07:00. The input is reset to `null` only after successful result persistence, so a failed run keeps the entered values for correction/retry. System ETA is `null` before V1 because no route has been calculated. Initial completion publishes the calculated `estimated_return_depot` of Trip 1. Each Reroute publishes the calculated return of the trip in the newest route version whose LO is `ONGOING`; if Trip 2 is ongoing, it selects Trip 2. An MT with no ongoing trip publishes the newest version's calculated Trip 1 return, while an MT with no calculated trip remains `null`. Planned ETA is never copied directly into System ETA. The legacy User ETA Override database field is no longer accepted, returned, displayed, or used by the solver. Actual bay state and actual queue similarly outrank predicted bay state. Phase 6 is not rerun.
 
 ## Objectives and cost
 
@@ -253,6 +267,8 @@ Pairs beyond the time/element budget use the visible Master/Haversine fallback. 
 
 Final geometry has its own wall-clock and logical-request guards. An invalid key (`403`) or rate limit (`429`) is logged as provider evidence but does not discard the OR-Tools plan. Once the guard is exhausted, remaining routes are persisted as `MIXED_OR_MASTER_FALLBACK`. Profiles may lower these two geometry values when fast completion is more important than attempting road geometry for every selected trip.
 
+The page-scoped `POST /jobs/{job_id}/map/road-geometry` endpoint can hydrate old immutable versions without rerunning the solver. It reuses full-route/historical geometry first, tries Google next, and uses OSRM only to draw the already-selected ordered stops along roads. The resulting display geometry is cached for 30 days by default and never writes back to `route_version_trip`.
+
 `GENERAL_VEHICLE` is the default. `TRUCK` is opt-in. If an account/region does not provide a supported truck road response, fallback/provider metadata must remain visible; a fallback must never be labelled as Google truck geometry.
 
 Without a configured Google key, validation returns `WARNING` and the engine uses cached/master Haversine travel estimates. This preserves offline testability but records the provider/fallback source. For each final selected trip, Phase 7 calls Compute Routes once with the solver-ordered SPBU list as intermediate waypoints, producing one road-following Depot → SPBU → Depot GeoJSON polyline. Solver evaluations never call Compute Routes. Per-leg cache/fallback remains only as a visible resilience path when the full road request fails.
@@ -275,6 +291,8 @@ Every optimization stores the selected reference timestamp, exact effective para
 
 Result statuses are `OPTIMAL`, `FEASIBLE`, `PARTIAL`, `INFEASIBLE`, `UNKNOWN`, `TIMEOUT`, legacy `TIME_LIMIT`, and `FAILED`. `PARTIAL` means a feasible subset was retained. `INFEASIBLE` is used only when the model proved that no required solution exists; it is not used for an interrupted or exhausted search. Best feasible output is retained when available. A failed solver updates the Job to `FAILED` and stores run error details instead of crashing the application process.
 
+Routing gate-out/return time is preliminary until the global bay schedule applies actual queue and loading. If that post-bay shift causes a hard MT working-time failure, the coordinator removes the failed trip, returns its LO to the routing pool, excludes the failed MT from those LO, and recomputes every candidate MT from retained post-bay trips: effective availability becomes the latest retained depot return and working-time remaining includes retained queue/loading/travel/service/return. A successful alternative route triggers a global bay re-schedule for retained and reassigned trips together. This loop continues until stable or until no compatible alternative remains. Only the latter is persisted as `VEHICLE_TIME_EXHAUSTED`; `POST_BAY_REASSIGNMENT_TIMEOUT` means the independent retry route/bay budget expired without proving infeasibility. Audit metadata records attempt, reassigned, exhausted, timeout, route-status, and retry-duration counts.
+
 Bay drop reasons distinguish cause:
 
 - `BAY_PRODUCT_CONSTRAINT`: no structurally eligible bay passes an active hard product/loading-duration/bay-stability rule;
@@ -290,6 +308,7 @@ Unserved reason codes include:
 - `SPBU_TIME_WINDOW`
 - `BAY_PRODUCT_CONSTRAINT`
 - `BAY_CONGESTION`
+- `POST_BAY_REASSIGNMENT_TIMEOUT`
 - `NO_FEASIBLE_ROUTE`
 - `USER_CANCELLED`
 - `UNSERVED_END_OF_DAY`
@@ -342,4 +361,4 @@ cd apps/api
 pytest tests/test_phase7_dynamic_vrp.py
 ```
 
-The suite covers Phase 6 soft warm start, one-product compartments, multi-trip, availability, freeze horizon, ONGOING/DONE handling, bay product compatibility, actual queue delay, per-compartment loading, ETA override precedence, route version immutability, and explicit dropped LO.
+The suite covers Phase 6 soft warm start, one-product compartments, multi-trip, mandatory Planned ETA validation, equal-time availability, freeze horizon, ONGOING/DONE handling, bay product compatibility, actual queue delay, per-compartment loading, ETA lifecycle, route version immutability, and explicit dropped LO.

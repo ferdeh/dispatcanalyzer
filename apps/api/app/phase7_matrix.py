@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import uuid
+from collections import defaultdict
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from time import perf_counter
@@ -11,8 +12,21 @@ from time import perf_counter
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .config import get_settings
 from .google_routes import GoogleRoutesClient, GoogleRoutesError, decrypt_api_key, get_google_routes_configuration
-from .models import MasterDepot, MasterSPBU, RouteAPIRequestLog, RouteMatrixCache
+from .models import (
+    MasterDepot,
+    MasterSPBU,
+    OptimizationJob,
+    PredictionRun,
+    PredictionTrip,
+    RouteAPIRequestLog,
+    RouteMatrixCache,
+    RouteVersion,
+    RouteVersionStop,
+    RouteVersionTrip,
+)
+from .road_geometry import OSRMRoadGeometryClient, RoadGeometryError
 
 
 def _utc(value: datetime) -> datetime:
@@ -55,6 +69,10 @@ class RouteMatrixService:
                 self.client = GoogleRoutesClient(decrypt_api_key(configuration.encrypted_api_key))
             except Exception:
                 self.client = None
+        self.road_geometry_client = OSRMRoadGeometryClient()
+        self.google_geometry_blocked = False
+        self._route_history_by_sequence: dict[tuple[str, tuple[str, ...]], tuple[str, str]] | None = None
+        self._prediction_history_by_sequence: dict[tuple[str, tuple[str, ...]], str] | None = None
 
     @staticmethod
     def _bucket(departure: datetime) -> datetime:
@@ -451,6 +469,246 @@ class RouteMatrixService:
                 "route_vehicle_mode": parameters.get("route_vehicle_mode", "GENERAL_VEHICLE"),
             },
         }
+
+    def _map_geometry_key(self, depot: MasterDepot, ordered_spbus: list[MasterSPBU]) -> str:
+        entities: list[MasterDepot | MasterSPBU] = [depot, *ordered_spbus, depot]
+        payload = {
+            "kind": "PHASE7_MAP_ROAD_GEOMETRY_V1",
+            "locations": [_location_id(entity) for entity in entities],
+            "coordinates": [_coordinates(entity) for entity in entities],
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+    def _load_historical_geometry_indexes(self, depot_id: str) -> None:
+        if self._route_history_by_sequence is not None and self._prediction_history_by_sequence is not None:
+            return
+
+        road_sources = (
+            "GOOGLE_ROUTES_GEOJSON",
+            "HISTORICAL_GOOGLE_ROUTES_GEOJSON",
+            "OSRM_ROAD_GEOMETRY",
+        )
+        route_rows = self.db.execute(
+            select(
+                RouteVersionTrip.route_version_trip_id,
+                RouteVersionTrip.route_geometry_source,
+            )
+            .join(RouteVersion, RouteVersion.route_version_id == RouteVersionTrip.route_version_id)
+            .join(OptimizationJob, OptimizationJob.job_id == RouteVersion.job_id)
+            .where(
+                OptimizationJob.depot_id == depot_id,
+                RouteVersionTrip.route_geometry_source.in_(road_sources),
+            )
+            .order_by(RouteVersionTrip.gate_out.desc())
+        ).all()
+        route_ids = [row[0] for row in route_rows]
+        stops_by_trip: dict[str, list[str]] = defaultdict(list)
+        for offset in range(0, len(route_ids), 500):
+            for trip_id, spbu_id in self.db.execute(
+                select(RouteVersionStop.route_version_trip_id, RouteVersionStop.spbu_id)
+                .where(RouteVersionStop.route_version_trip_id.in_(route_ids[offset : offset + 500]))
+                .order_by(RouteVersionStop.route_version_trip_id, RouteVersionStop.sequence_number)
+            ).all():
+                if spbu_id:
+                    stops_by_trip[trip_id].append(spbu_id)
+        route_index: dict[tuple[str, tuple[str, ...]], tuple[str, str]] = {}
+        for trip_id, source in route_rows:
+            sequence = tuple(stops_by_trip.get(trip_id) or [])
+            if sequence:
+                route_index.setdefault((depot_id, sequence), (trip_id, source))
+
+        prediction_index: dict[tuple[str, tuple[str, ...]], str] = {}
+        prediction_rows = self.db.execute(
+            select(PredictionTrip.id, PredictionTrip.estimated_visit_sequence)
+            .join(PredictionRun, PredictionRun.id == PredictionTrip.prediction_run_id)
+            .where(
+                PredictionRun.depot_id == depot_id,
+                PredictionTrip.route_geometry_source == "GOOGLE_ROUTES_GEOJSON",
+            )
+            .order_by(PredictionTrip.created_at.desc())
+        ).all()
+        for trip_id, sequence in prediction_rows:
+            normalized = tuple(str(value) for value in (sequence or []) if value)
+            if normalized:
+                prediction_index.setdefault((depot_id, normalized), trip_id)
+
+        self._route_history_by_sequence = route_index
+        self._prediction_history_by_sequence = prediction_index
+
+    def _historical_road_geometry(self, depot: MasterDepot, ordered_spbus: list[MasterSPBU]) -> dict | None:
+        self._load_historical_geometry_indexes(depot.depot_id)
+        spbu_ids = tuple(spbu.spbu_id for spbu in ordered_spbus)
+        route_match = (self._route_history_by_sequence or {}).get((depot.depot_id, spbu_ids))
+        if route_match:
+            trip_id, source = route_match
+            geometry = self.db.scalar(
+                select(RouteVersionTrip.route_geometry).where(RouteVersionTrip.route_version_trip_id == trip_id)
+            ) or []
+            if len(geometry) >= 2:
+                return {
+                    "route_geometry": geometry,
+                    "route_geometry_source": f"HISTORICAL_{source}" if not source.startswith("HISTORICAL_") else source,
+                    "history_source": "ROUTE_VERSION",
+                }
+
+        spbu_codes = tuple(spbu.spbu_code for spbu in ordered_spbus)
+        prediction_match = (self._prediction_history_by_sequence or {}).get((depot.depot_id, spbu_codes))
+        if prediction_match:
+            geometry = self.db.scalar(
+                select(PredictionTrip.route_geometry).where(PredictionTrip.id == prediction_match)
+            ) or []
+            if len(geometry) >= 2:
+                return {
+                    "route_geometry": geometry,
+                    "route_geometry_source": "HISTORICAL_GOOGLE_ROUTES_GEOJSON",
+                    "history_source": "PHASE6_PREDICTION_TRIP",
+                }
+        return None
+
+    def _store_map_geometry_cache(
+        self,
+        *,
+        key: str,
+        depot: MasterDepot,
+        ordered_spbus: list[MasterSPBU],
+        departure: datetime,
+        result: dict,
+    ) -> None:
+        row = self.db.scalar(select(RouteMatrixCache).where(RouteMatrixCache.cache_key == key))
+        if row is None:
+            row = RouteMatrixCache(route_matrix_cache_id=uuid.uuid4().hex, cache_key=key)
+            self.db.add(row)
+        settings = get_settings()
+        now = datetime.now(timezone.utc)
+        row.origin_location_id = depot.depot_id
+        row.destination_location_id = depot.depot_id
+        row.departure_time_bucket = self._bucket(departure)
+        row.route_vehicle_mode = "GEOMETRY_ONLY"
+        row.traffic_aware = False
+        row.distance_meters = int(result.get("distance_meters") or 0)
+        row.duration_seconds = int(result.get("duration_seconds") or 0)
+        row.route_geometry = result.get("route_geometry") or []
+        row.provider = str(result["route_geometry_source"])
+        row.response_metadata = {
+            "geometry_only": True,
+            "stop_ids": [spbu.spbu_id for spbu in ordered_spbus],
+            "stop_codes": [spbu.spbu_code for spbu in ordered_spbus],
+            "history_source": result.get("history_source"),
+        }
+        row.calculated_at = now
+        row.expires_at = now + timedelta(minutes=max(60, int(settings.road_geometry_cache_ttl_minutes)))
+
+    def build_map_road_geometry(
+        self,
+        *,
+        depot: MasterDepot,
+        ordered_spbus: list[MasterSPBU],
+        departure: datetime,
+    ) -> dict:
+        """Return road-following visualization geometry without changing solver facts."""
+        started = perf_counter()
+        entities: list[MasterDepot | MasterSPBU] = [depot, *ordered_spbus, depot]
+        coordinates = [_coordinates(entity) for entity in entities]
+        if len(entities) < 3 or not all(coordinates):
+            return {
+                "route_geometry": [],
+                "route_geometry_source": "MASTER_COORDINATE_FALLBACK",
+                "road_geometry": False,
+                "cache_hit": False,
+                "external_request_count": 0,
+                "error_codes": ["ROAD_GEOMETRY_COORDINATES_REQUIRED"],
+                "duration_ms": round((perf_counter() - started) * 1000),
+            }
+
+        key = self._map_geometry_key(depot, ordered_spbus)
+        now = datetime.now(timezone.utc)
+        cached = self.db.scalar(
+            select(RouteMatrixCache).where(RouteMatrixCache.cache_key == key, RouteMatrixCache.expires_at > now)
+        )
+        if cached and len(cached.route_geometry or []) >= 2:
+            return {
+                "route_geometry": cached.route_geometry,
+                "route_geometry_source": cached.provider,
+                "road_geometry": True,
+                "cache_hit": True,
+                "external_request_count": 0,
+                "error_codes": [],
+                "duration_ms": round((perf_counter() - started) * 1000),
+            }
+
+        historical = self._historical_road_geometry(depot, ordered_spbus)
+        if historical:
+            result = {
+                **historical,
+                "distance_meters": 0,
+                "duration_seconds": 0,
+                "road_geometry": True,
+                "cache_hit": True,
+                "external_request_count": 0,
+                "error_codes": [],
+                "duration_ms": round((perf_counter() - started) * 1000),
+            }
+            self._store_map_geometry_cache(
+                key=key,
+                depot=depot,
+                ordered_spbus=ordered_spbus,
+                departure=departure,
+                result=result,
+            )
+            return result
+
+        errors: list[str] = []
+        external_requests = 0
+        if self.client and not self.google_geometry_blocked:
+            try:
+                external_requests += 1
+                google = self.client.compute_route(
+                    origin=coordinates[0],
+                    destination=coordinates[-1],
+                    intermediates=coordinates[1:-1],
+                    departure_datetime=departure,
+                    routing_mode="DRIVE",
+                    routing_preference="TRAFFIC_AWARE",
+                )
+                result = {
+                    **google,
+                    "road_geometry": True,
+                    "cache_hit": False,
+                    "external_request_count": external_requests,
+                    "error_codes": errors,
+                    "duration_ms": round((perf_counter() - started) * 1000),
+                }
+                self._store_map_geometry_cache(key=key, depot=depot, ordered_spbus=ordered_spbus, departure=departure, result=result)
+                return result
+            except GoogleRoutesError as exc:
+                errors.append(exc.code)
+                if exc.code in {"GOOGLE_RATE_LIMIT", "GOOGLE_API_KEY_INVALID", "GOOGLE_ROUTES_NOT_ENABLED"}:
+                    self.google_geometry_blocked = True
+
+        try:
+            external_requests += 1
+            fallback = self.road_geometry_client.compute_route(coordinates)
+            result = {
+                **fallback,
+                "road_geometry": True,
+                "cache_hit": False,
+                "external_request_count": external_requests,
+                "error_codes": errors,
+                "duration_ms": round((perf_counter() - started) * 1000),
+            }
+            self._store_map_geometry_cache(key=key, depot=depot, ordered_spbus=ordered_spbus, departure=departure, result=result)
+            return result
+        except RoadGeometryError as exc:
+            errors.append(exc.code)
+            return {
+                "route_geometry": [],
+                "route_geometry_source": "MASTER_COORDINATE_FALLBACK",
+                "road_geometry": False,
+                "cache_hit": False,
+                "external_request_count": external_requests,
+                "error_codes": errors,
+                "duration_ms": round((perf_counter() - started) * 1000),
+            }
 
     def build_route_geometry(
         self,

@@ -754,8 +754,7 @@ def list_job_vehicles(db: Session, job_id: str) -> list[dict]:
             "compartments": row.compartment_configuration,
             "planned_eta_depot": _iso(row.planned_eta_depot),
             "system_eta_depot": _iso(row.system_eta_depot),
-            "user_eta_override": _iso(row.user_eta_override),
-            "effective_eta_depot": _iso(row.effective_eta_depot),
+            "effective_eta_depot": _iso(row.planned_eta_depot or row.system_eta_depot),
             "operational_status": row.operational_status,
             "working_time_used": row.working_time_used_minutes,
             "working_time_remaining": row.working_time_remaining_minutes,
@@ -776,8 +775,6 @@ def update_vehicle_states(db: Session, job_id: str, updates: list[dict], *, acto
         before = {"effective_eta_depot": _iso(row.effective_eta_depot), "operational_status": row.operational_status}
         if "planned_eta_depot" in update:
             row.planned_eta_depot = datetime.fromisoformat(str(update["planned_eta_depot"]).replace("Z", "+00:00")) if update["planned_eta_depot"] else None
-        if "user_eta_override" in update:
-            row.user_eta_override = datetime.fromisoformat(str(update["user_eta_override"]).replace("Z", "+00:00")) if update["user_eta_override"] else None
         if "operational_status" in update:
             status = str(update["operational_status"]).upper()
             if status not in MT_STATUSES:
@@ -786,9 +783,11 @@ def update_vehicle_states(db: Session, job_id: str, updates: list[dict], *, acto
         if "working_time_limit_minutes" in update:
             row.working_time_limit_minutes = max(1, int(update["working_time_limit_minutes"]))
             row.working_time_remaining_minutes = max(0, row.working_time_limit_minutes - row.working_time_used_minutes)
-        # Actual/user override outranks previous prediction; planned ETA is the
-        # required initial Trip-1 input before a system ETA exists.
-        row.effective_eta_depot = row.user_eta_override or row.system_eta_depot or row.planned_eta_depot
+        # Planned ETA is the only user-maintained availability input. Keep the
+        # legacy database column empty, but retain it in the schema so existing
+        # installations do not need a destructive migration.
+        row.user_eta_override = None
+        row.effective_eta_depot = row.planned_eta_depot or row.system_eta_depot
         row.updated_by = actor
         after = {"effective_eta_depot": _iso(row.effective_eta_depot), "operational_status": row.operational_status}
         if before != after:
@@ -992,6 +991,22 @@ def apply_freeze_rules(
     return rows
 
 
+def _planned_eta_issues(
+    vehicles: list[VehicleOperationalState],
+    *,
+    optimization_reference_time: datetime | None = None,
+) -> tuple[list[VehicleOperationalState], list[VehicleOperationalState]]:
+    missing = [row for row in vehicles if row.planned_eta_depot is None]
+    before_reference = [
+        row
+        for row in vehicles
+        if row.planned_eta_depot is not None
+        and optimization_reference_time is not None
+        and _utc(row.planned_eta_depot) < _utc(optimization_reference_time)
+    ]
+    return missing, before_reference
+
+
 def validate_job(db: Session, job_id: str, parameters: dict | None = None) -> dict:
     job = _require_job(db, job_id)
     ensure_default_parameter_profiles(db)
@@ -1014,9 +1029,9 @@ def validate_job(db: Session, job_id: str, parameters: dict | None = None) -> di
         add("DEPOT_OPERATING_WINDOW_REQUIRED", "BLOCKED", "Master Depot must contain both depot_operational_start and depot_operational_end.")
     if job.depot_operational_start is None or job.depot_operational_end is None:
         add("JOB_DEPOT_OPERATING_WINDOW_REQUIRED", "BLOCKED", "Phase 7 Job is missing its Depot operating-window snapshot.")
-    missing_eta = [row.registration_snapshot or row.mt_id for row in vehicles if row.operational_status != "UNAVAILABLE" and not (row.user_eta_override or row.system_eta_depot or row.planned_eta_depot)]
-    if missing_eta and constraint_rule(parameters, "vehicle_availability").get("enabled", True):
-        add("MT_ETA_REQUIRED", "BLOCKED" if constraint_is_hard(parameters, "vehicle_availability") else "WARNING", f"Planned ETA Depot is missing for {len(missing_eta)} available MT.")
+    missing_eta, _ = _planned_eta_issues(vehicles)
+    if missing_eta:
+        add("PLANNED_ETA_DEPOT_REQUIRED", "BLOCKED", f"Planned ETA Depot is required for all {len(missing_eta)} MT before optimization.")
     if any(not row.spbu_id or not db.get(MasterSPBU, row.spbu_id) for row in lo_rows):
         add("SPBU_MAPPING_REQUIRED", "BLOCKED", "One or more LO does not map to canonical SPBU master data.")
     missing_spbu_windows = {
@@ -1132,7 +1147,9 @@ def _solver_inputs(db: Session, job: OptimizationJob, parameters: dict, *, curre
     for row in vehicle_rows:
         row.working_time_limit_minutes = working_time_limit
         row.working_time_remaining_minutes = max(0, working_time_limit - row.working_time_used_minutes)
-        row.effective_eta_depot = row.user_eta_override or row.system_eta_depot or row.planned_eta_depot
+        # Pre-run validation guarantees this value exists and is not earlier
+        # than the dispatcher-selected optimization reference time.
+        row.effective_eta_depot = row.planned_eta_depot
     mts = {row.mt_id: db.get(MasterMT, row.mt_id) for row in vehicle_rows}
     spbu_ids = sorted({row.spbu_id for row in optimizable})
     spbus = {spbu_id: db.get(MasterSPBU, spbu_id) for spbu_id in spbu_ids}
@@ -1273,8 +1290,8 @@ def _solver_inputs(db: Session, job: OptimizationJob, parameters: dict, *, curre
             "tags": row.tag_snapshot,
             "capacity_kl": row.capacity_kl,
             "compartments": row.compartment_configuration,
-            "availability_eta_depot": _utc(row.effective_eta_depot) if row.effective_eta_depot else _utc(current_time),
-            "effective_eta_depot": max(_utc(row.effective_eta_depot), _utc(current_time)) if row.effective_eta_depot else _utc(current_time),
+            "availability_eta_depot": _utc(row.planned_eta_depot),
+            "effective_eta_depot": _utc(row.planned_eta_depot),
             "optimization_reference_time": _utc(current_time),
             "depot_operational_start": operational_start,
             "operational_status": row.operational_status,
@@ -1485,6 +1502,44 @@ def _comparison(db: Session, job: OptimizationJob, result: dict, *, gate_out_tol
         "gate_out_changes": gate_out_changes,
         "route_sequence_changes": route_sequence_changes,
     }
+
+
+def _complete_vehicle_eta_state(
+    state: VehicleOperationalState,
+    *,
+    reroute: bool,
+    trips: list[RouteVersionTrip],
+    ongoing_trip_keys: set[tuple[str, int]],
+) -> datetime | None:
+    """Publish the relevant route-version trip return and consume Planned ETA.
+
+    Initial optimization publishes Trip 1. A reroute publishes the calculated
+    return of the trip containing an ONGOING LO; when the MT has no ONGOING LO,
+    it continues to publish Trip 1 from the new route version. Planned ETA is
+    only a solver availability input and is never copied into System ETA.
+    """
+    calculated_trips = [trip for trip in trips if trip.estimated_return_depot is not None]
+    ongoing_trips = [
+        trip
+        for trip in calculated_trips
+        if reroute and (trip.vehicle_id, int(trip.trip_number)) in ongoing_trip_keys
+    ]
+    selected_trip = (
+        max(ongoing_trips, key=lambda trip: (int(trip.trip_number), _utc(trip.gate_out)))
+        if ongoing_trips
+        else min(
+            calculated_trips,
+            key=lambda trip: (int(trip.trip_number), _utc(trip.gate_out)),
+            default=None,
+        )
+    )
+    system_eta = selected_trip.estimated_return_depot if selected_trip else None
+
+    state.planned_eta_depot = None
+    state.user_eta_override = None
+    state.system_eta_depot = system_eta
+    state.effective_eta_depot = state.system_eta_depot
+    return system_eta
 
 
 def _copy_frozen_plan(db: Session, job: OptimizationJob, version: RouteVersion, frozen_rows: list[LOOperationalState]) -> tuple[list[RouteVersionTrip], set[str]]:
@@ -1702,6 +1757,39 @@ def _prepare_optimization(
         raise HTTPException(
             status_code=409,
             detail={"code": "ALL_LO_DONE", "message": "All LO are DONE. The Job is closed and no new operational plan was created."},
+        )
+    vehicle_rows = db.scalars(
+        select(VehicleOperationalState)
+        .where(VehicleOperationalState.job_id == job.job_id)
+        .order_by(VehicleOperationalState.registration_snapshot, VehicleOperationalState.mt_id)
+    ).all()
+    missing_planned_eta, early_planned_eta = _planned_eta_issues(
+        vehicle_rows,
+        optimization_reference_time=current_time,
+    )
+    if missing_planned_eta or early_planned_eta:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "PLANNED_ETA_DEPOT_INVALID",
+                "message": (
+                    "Every MT must have Planned ETA Depot at or after the selected optimization time. "
+                    "A Planned ETA equal to the optimization time is valid."
+                ),
+                "optimization_reference_time": _iso(current_time),
+                "missing_mt": [
+                    {"mt_id": row.mt_id, "registration": row.registration_snapshot}
+                    for row in missing_planned_eta
+                ],
+                "before_optimization_mt": [
+                    {
+                        "mt_id": row.mt_id,
+                        "registration": row.registration_snapshot,
+                        "planned_eta_depot": _iso(row.planned_eta_depot),
+                    }
+                    for row in early_planned_eta
+                ],
+            },
         )
     profile_id = payload.get("profile_id")
     profile_parameters = get_parameter_profile(db, profile_id)["parameters"] if profile_id else DEFAULT_PHASE7_PARAMETERS
@@ -1959,17 +2047,27 @@ def run_optimization(
         trips_by_vehicle: dict[str, list[RouteVersionTrip]] = defaultdict(list)
         for trip in all_version_trips:
             trips_by_vehicle[trip.vehicle_id].append(trip)
+        ongoing_trip_keys = {
+            (row.current_vehicle_id, int(row.current_trip_number))
+            for row in inputs["all_lo_rows"]
+            if row.status == "ONGOING"
+            and row.current_vehicle_id
+            and row.current_trip_number is not None
+        }
         vehicle_rows = {row.mt_id: row for row in db.scalars(select(VehicleOperationalState).where(VehicleOperationalState.job_id == job.job_id)).all()}
         for mt_id, state in vehicle_rows.items():
             mt_trips = trips_by_vehicle[mt_id]
             delivered = sum(assignment.volume_kl for assignment in db.scalars(select(RouteVersionLOAssignment).where(RouteVersionLOAssignment.route_version_id == route_version.route_version_id, RouteVersionLOAssignment.vehicle_id == mt_id, RouteVersionLOAssignment.assignment_status != "DROPPED")).all())
-            last_return = max((trip.estimated_return_depot for trip in mt_trips), default=state.effective_eta_depot)
-            state.system_eta_depot = last_return
-            state.effective_eta_depot = state.user_eta_override or state.system_eta_depot or state.planned_eta_depot
+            system_eta = _complete_vehicle_eta_state(
+                state,
+                reroute=reroute,
+                trips=mt_trips,
+                ongoing_trip_keys=ongoing_trip_keys,
+            )
             used_minutes = sum(trip.operating_minutes for trip in mt_trips)
             state.working_time_used_minutes = max(state.working_time_used_minutes, used_minutes)
             state.working_time_remaining_minutes = max(0, state.working_time_limit_minutes - state.working_time_used_minutes)
-            db.add(RouteVersionVehicleAssignment(route_version_vehicle_assignment_id=uuid.uuid4().hex, route_version_id=route_version.route_version_id, vehicle_id=mt_id, used=bool(mt_trips), trip_count=len(mt_trips), delivered_kl=delivered, total_distance_meters=sum(trip.distance_meters for trip in mt_trips), total_operating_minutes=used_minutes, working_time_remaining_minutes=state.working_time_remaining_minutes, activation_cost=OptimizationCoordinatorService().vrp._vehicle_cost(parameters, next((row for row in inputs["vehicles"] if row["mt_id"] == mt_id), {"vehicle_class": state.vehicle_class, "tags": state.tag_snapshot})), system_eta_depot=last_return))
+            db.add(RouteVersionVehicleAssignment(route_version_vehicle_assignment_id=uuid.uuid4().hex, route_version_id=route_version.route_version_id, vehicle_id=mt_id, used=bool(mt_trips), trip_count=len(mt_trips), delivered_kl=delivered, total_distance_meters=sum(trip.distance_meters for trip in mt_trips), total_operating_minutes=used_minutes, working_time_remaining_minutes=state.working_time_remaining_minutes, activation_cost=OptimizationCoordinatorService().vrp._vehicle_cost(parameters, next((row for row in inputs["vehicles"] if row["mt_id"] == mt_id), {"vehicle_class": state.vehicle_class, "tags": state.tag_snapshot})), system_eta_depot=system_eta))
         gateouts = [trip.gate_out for trip in all_version_trips]
         loading_starts = [trip.loading_start for trip in all_version_trips if trip.loading_start]
         route_version.first_gate_out = min(gateouts) if gateouts else None
@@ -2178,6 +2276,97 @@ def get_map_route(db: Session, job_id: str, version_id: str | None = None, *, ve
     version = get_route_version(db, job_id, version_id)
     trips = [trip for trip in version["trips"] if (not vehicle_id or trip["vehicle_id"] == vehicle_id) and (trip_number is None or trip["trip_number"] == trip_number)]
     return {"route_version_id": version["route_version_id"], "version_label": version["version_label"], "depot": {"depot_id": depot.depot_id if depot else None, "name": depot.depot_name if depot else None, "latitude": depot.latitude if depot else None, "longitude": depot.longitude if depot else None}, "trips": trips, "provider_role": "Google Routes supplies road matrix/geometry only; OR-Tools produces the optimized plan."}
+
+
+def get_map_road_geometry(
+    db: Session,
+    job_id: str,
+    version_id: str,
+    *,
+    vehicle_ids: list[str],
+    trip_number: int | None = None,
+) -> dict:
+    """Hydrate page-scoped display geometry without mutating the route version."""
+    job = _require_job(db, job_id)
+    depot = db.get(MasterDepot, job.depot_id)
+    if depot is None:
+        raise HTTPException(status_code=404, detail={"code": "DEPOT_NOT_FOUND", "message": "Job depot was not found."})
+    if not vehicle_ids:
+        raise HTTPException(status_code=422, detail={"code": "VEHICLE_SCOPE_REQUIRED", "message": "At least one MT is required for map geometry."})
+    if len(set(vehicle_ids)) > 25:
+        raise HTTPException(status_code=422, detail={"code": "MAP_PAGE_TOO_LARGE", "message": "Road geometry can hydrate at most 25 MT per request."})
+
+    version = get_route_version(db, job_id, version_id)
+    vehicle_scope = set(vehicle_ids)
+    trips = [
+        trip for trip in version["trips"]
+        if trip["vehicle_id"] in vehicle_scope and (trip_number is None or trip["trip_number"] == trip_number)
+    ]
+    if len(trips) > 60:
+        raise HTTPException(status_code=422, detail={"code": "MAP_TRIP_SCOPE_TOO_LARGE", "message": "Road geometry can hydrate at most 60 trips per request."})
+
+    matrix_service = RouteMatrixService(db, job_id=job_id)
+    response_trips = []
+    cache_hits = 0
+    external_requests = 0
+    road_count = 0
+    error_codes: set[str] = set()
+    started = perf_counter()
+    for trip in trips:
+        ordered_spbus = []
+        for stop in sorted(trip["stops"], key=lambda row: int(row["sequence"])):
+            spbu = db.get(MasterSPBU, stop["spbu_id"])
+            if spbu:
+                ordered_spbus.append(spbu)
+        geometry = matrix_service.build_map_road_geometry(
+            depot=depot,
+            ordered_spbus=ordered_spbus,
+            departure=datetime.fromisoformat(trip["gate_out"]),
+        )
+        cache_hits += int(bool(geometry.get("cache_hit")))
+        external_requests += int(geometry.get("external_request_count") or 0)
+        error_codes.update(str(code) for code in geometry.get("error_codes") or [])
+        road_geometry = bool(geometry.get("road_geometry") and len(geometry.get("route_geometry") or []) >= 2)
+        road_count += int(road_geometry)
+        response_trips.append({
+            "route_version_trip_id": trip["route_version_trip_id"],
+            "vehicle_id": trip["vehicle_id"],
+            "trip_number": trip["trip_number"],
+            "route_geometry": geometry.get("route_geometry") if road_geometry else trip["route_geometry"],
+            "route_geometry_source": geometry.get("route_geometry_source") if road_geometry else trip["route_geometry_source"],
+            "road_geometry": road_geometry,
+            "cache_hit": bool(geometry.get("cache_hit")),
+            "error_codes": geometry.get("error_codes") or [],
+        })
+
+    fingerprint = hashlib.sha256(
+        json.dumps({"version_id": version_id, "vehicle_ids": sorted(vehicle_scope), "trip_number": trip_number}, sort_keys=True).encode()
+    ).hexdigest()
+    db.add(RouteAPIRequestLog(
+        request_log_id=uuid.uuid4().hex,
+        job_id=job_id,
+        request_type="PHASE7_MAP_ROAD_GEOMETRY",
+        provider="ROAD_GEOMETRY_CACHE_GOOGLE_OSRM",
+        request_fingerprint=fingerprint,
+        requested_pair_count=len(trips),
+        cache_hit_count=cache_hits,
+        duration_ms=round((perf_counter() - started) * 1000),
+        success=road_count == len(trips),
+        error_message=",".join(sorted(error_codes)) or None,
+    ))
+    db.commit()
+    return {
+        "route_version_id": version["route_version_id"],
+        "version_label": version["version_label"],
+        "status": "ROAD_GEOMETRY" if road_count == len(trips) else "PARTIAL_ROAD_GEOMETRY",
+        "requested_trip_count": len(trips),
+        "road_geometry_trip_count": road_count,
+        "cache_hit_count": cache_hits,
+        "external_request_count": external_requests,
+        "error_codes": sorted(error_codes),
+        "trips": response_trips,
+        "provider_role": "OR-Tools keeps assignment and stop order immutable; Google/history/OSRM only hydrate page-scoped road geometry for display.",
+    }
 
 
 def get_cost_analysis(db: Session, job_id: str, version_id: str | None = None) -> dict:

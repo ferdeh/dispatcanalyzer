@@ -125,7 +125,7 @@ const pageMetadata: Record<Page, { eyebrow: string; title: string; description: 
   "phase7-optimization": {
     eyebrow: "Phase 7 · Optimization & Control",
     title: "Dynamic Multi-Trip VRP & Depot Bay Queue",
-    description: "Fleet-wide OR-Tools routing, CP-SAT bay scheduling, rolling operational updates, and immutable route versions.",
+    description: "Fleet-wide OR-Tools routing, FIFO_BALANCED bay scheduling, rolling operational updates, and immutable route versions.",
   },
   "google-maps-integration": {
     eyebrow: "Settings",

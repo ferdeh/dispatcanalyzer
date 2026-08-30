@@ -104,7 +104,7 @@ The repository includes read-only Phase 2–4 intelligence, persisted Phase 5 ML
 - Source boundary: original Phase 6 prediction fields are immutable warm-start/soft-preference evidence; current Phase 7 assignment is stored separately
 - Engine A: Google OR-Tools Routing Solver with a physical-vehicle multi-trip loop
 - Compartment engine: CP-SAT LO-to-compartment assignment with one product per compartment
-- Engine B: CP-SAT bay eligibility, actual occupancy/queue, loading, and gate-out schedule
+- Engine B: deterministic `FIFO_BALANCED` bay eligibility, actual occupancy/queue, balanced loading, and gate-out schedule; CP-SAT remains opt-in
 - Google role: prebuilt distance/time matrix, cache, final selected-leg geometry, and map display only; Google is never called from a solver callback
 - Hard compatibility: Phase 1 vehicle-class limit, canonical tag subset, depot, capacity, compartments, availability, working time, SPBU window, frozen assignment, and bay products
 - Soft evidence: Phase 3 pairing, Phase 4 MT affinity, Phase 6 vehicle/grouping, and previous-plan stability penalties
@@ -112,5 +112,5 @@ The repository includes read-only Phase 2–4 intelligence, persisted Phase 5 ML
 - Versioning: every optimization appends V1/V2/... plus state snapshot, parameter snapshot/checksum, solver metadata, cost, dropped reason, and comparison
 - End of day: all-DONE closes the Job without a new version; remaining LO at depot close is explicit `UNSERVED_END_OF_DAY`
 - Schema: migration `0019_phase7_dynamic_vrp`
-- Algorithm: `phase7.dynamic_multitrip_vrp_bay.v1`
+- Algorithm: `phase7.dynamic_multitrip_vrp_bay.v4` (`FIFO_BALANCED` operational bay scheduling plus post-bay alternative-MT retry)
 - Technical documentation: `docs/PHASE_7_DYNAMIC_VRP.md`
