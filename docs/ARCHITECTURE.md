@@ -46,12 +46,35 @@ Immutable Phase 6 run + current LO/MT/bay state + parameter snapshot
     → prebuilt Google Routes/master-fallback distance-time matrix
     → OR-Tools Routing Solver physical-MT trip rounds
     → CP-SAT one-product compartment placement
-    → CP-SAT bay eligibility, actual queue, loading, and gate-out
-    → propagate bay delay to return availability
-    → repeat coordination until tolerance/iteration limit
+    → FIFO_BALANCED bay eligibility, actual queue, loading, and gate-out
+    → per-trip candidate-audited post-bay repair and return propagation
+    → optional bay CP-SAT experiment when explicitly selected
     → append immutable Route V1/V2/... + cost/audit/dropped reasons
 ```
 
 Google Routes is a travel-data provider only. Matrix calls are completed before solver evaluation, callbacks use in-memory integers, and Compute Routes geometry is requested only for solver-selected final legs. Neither Phase 6 nor Phase 7 calls GMPRO/`optimizeTours`. Offline/master Haversine fallback remains explicit in provider metadata and map styling.
 
 The multi-trip state is keyed by physical MT, not by duplicated virtual vehicles. Each accepted trip updates predicted depot return, used/remaining working time, and completed trip count before the same MT may enter another routing round. During reroute, DONE, ONGOING, freeze-window PLANNED, and every LO sharing one of those physical trips are copied unchanged into the next version. Actual user ETA and bay/queue state outrank prior system predictions.
+
+Phase 8 adds a separate mutable manual-dispatch snapshot after Phase 6/7. It never invokes OR-Tools, GMPRO, or any fleet-wide solver. The selected source route is copied once into Phase 8 job/vehicle/LO/trip/assignment tables; cluster, shift, tags, route metadata, and source lineage remain snapshot evidence. The canonical compatibility evaluator remains authoritative for manual assignments.
+
+```mermaid
+flowchart LR
+    P6[Immutable Phase 6 run] --> P7[Immutable Phase 7 route versions]
+    P6 --> S[Phase 8 working snapshot]
+    P7 --> S
+    S --> E[Manual MT Trip LO edits]
+    E --> C[Canonical compatibility and constraints]
+    C --> R[Google Routes per-trip recalculation]
+    R --> T[Cascading MT availability]
+    T --> SIM[Hourly KL simulation and Gantt]
+    T --> D[Daily distribution dashboard]
+    SIM --> F[Finalized immutable dispatch version]
+    D --> F
+```
+
+All Phase 8 mutations are transactional and job/trip versions provide optimistic conflict detection. A database uniqueness constraint prevents duplicate LO assignment. Route failures remain explicit `WARNING`/`CONFLICT`; downstream trip timestamps become `NEEDS_RECALCULATION` instead of silently retaining stale values. Simulation and dashboard are server-side projections of the same current relational state used by Trip Management.
+
+The Phase 7 → Phase 8 handoff is copy-on-create, not a live foreign-state projection. A Manual Dispatch Job records the source Phase, Phase 7 Job, Prediction Run where available, Route Version label/identifier, source creation time, and a configuration/lineage snapshot. Later reroutes in Phase 7 do not mutate an existing Phase 8 workspace. Likewise, Phase 8 Apply and Finalize never move the Phase 7 current-route pointer.
+
+Phase 8 maintains one relational current state shared by all workspace tabs. Trip mutations and Apply refresh the same vehicle/trip/LO graph consumed by the simulation and dashboard projections; the frontend does not maintain separate authoritative copies per tab. Finalization validates the persisted state inside a transaction, stores actor/time, and converts that dispatch version to read-only.

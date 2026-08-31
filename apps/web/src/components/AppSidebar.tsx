@@ -28,6 +28,7 @@ export type AppPage =
   | "machine-learning-intelligence"
   | "prediction-assignment"
   | "phase7-optimization"
+  | "manual-dispatch"
   | "google-maps-integration"
   | "documentation";
 
@@ -69,6 +70,7 @@ const navGroups: NavGroup[] = [
     items: [
       { page: "prediction-assignment", label: "Prediction & Assignment", icon: Sparkles, phase: 6 },
       { page: "phase7-optimization", label: "Dynamic VRP & Bay", icon: Truck, phase: 7 },
+      { page: "manual-dispatch", label: "Manual Dispatching", icon: Route, phase: 8 },
     ],
   },
   {

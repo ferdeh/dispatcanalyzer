@@ -1539,3 +1539,173 @@ class RouteAPIRequestLog(Base):
     success: Mapped[bool] = mapped_column(Boolean, default=False)
     error_message: Mapped[str | None] = mapped_column(Text)
     created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# Phase 8 is a mutable, versioned working snapshot. It references Phase 6/7
+# through lineage values only and never owns or changes source records.
+class ManualDispatchJob(Base):
+    __tablename__ = "manual_dispatch_job"
+    __table_args__ = (
+        Index("ix_manual_dispatch_job_depot_date", "depot_id", "operational_date"),
+        Index("ix_manual_dispatch_job_status_updated", "status", "updated_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    job_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    job_name: Mapped[str] = mapped_column(String(255))
+    depot_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_depot.depot_id"), index=True)
+    operational_date = mapped_column(Date, nullable=False, index=True)
+    source_phase: Mapped[str] = mapped_column(String(20))
+    source_job_id: Mapped[str] = mapped_column(String(64), index=True)
+    source_run_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    source_route_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source_route_version: Mapped[str] = mapped_column(String(80))
+    source_created_at = mapped_column(DateTime(timezone=True), nullable=True)
+    dispatch_version: Mapped[int] = mapped_column(Integer, default=1)
+    parent_dispatch_job_id: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("manual_dispatch_job.id"), nullable=True, index=True
+    )
+    status: Mapped[str] = mapped_column(String(30), default="DRAFT", index=True)
+    row_version: Mapped[int] = mapped_column(Integer, default=1)
+    configuration_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    source_lineage_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_by: Mapped[str] = mapped_column(String(120), default="local-user")
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    finalized_by: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    finalized_at = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class ManualDispatchVehicle(Base):
+    __tablename__ = "manual_dispatch_vehicle"
+    __table_args__ = (UniqueConstraint("dispatch_job_id", "mt_id", name="uq_manual_dispatch_vehicle_job_mt"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    dispatch_job_id: Mapped[str] = mapped_column(String(64), ForeignKey("manual_dispatch_job.id", ondelete="CASCADE"), index=True)
+    mt_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_mt.mt_id"), index=True)
+    vehicle_registration: Mapped[str | None] = mapped_column(String(80))
+    vehicle_class: Mapped[int | None] = mapped_column(Integer)
+    capacity_kl: Mapped[float] = mapped_column(Float, default=0)
+    mt_tags: Mapped[list] = mapped_column(JSON, default=list)
+    number_of_compartments: Mapped[int] = mapped_column(Integer, default=0)
+    compartment_configuration: Mapped[list] = mapped_column(JSON, default=list)
+    initial_available_datetime = mapped_column(DateTime(timezone=True), nullable=False)
+    last_available_datetime = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(30), default="IDLE")
+
+
+class ManualDispatchLoadingOrder(Base):
+    __tablename__ = "manual_dispatch_loading_order"
+    __table_args__ = (
+        UniqueConstraint("dispatch_job_id", "lo_id", name="uq_manual_dispatch_scope_job_lo"),
+        Index("ix_manual_dispatch_scope_status", "dispatch_job_id", "assignment_status"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    dispatch_job_id: Mapped[str] = mapped_column(String(64), ForeignKey("manual_dispatch_job.id", ondelete="CASCADE"), index=True)
+    lo_id: Mapped[str] = mapped_column(String(120), index=True)
+    lo_number: Mapped[str] = mapped_column(String(120))
+    spbu_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_spbu.spbu_id"), index=True)
+    spbu_number: Mapped[str | None] = mapped_column(String(120))
+    spbu_name: Mapped[str | None] = mapped_column(String(255))
+    product_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("master_product.product_id"))
+    product_name: Mapped[str | None] = mapped_column(String(255))
+    volume_kl: Mapped[float] = mapped_column(Float)
+    cluster_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    cluster_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    shift_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    shift_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    spbu_tags: Mapped[list] = mapped_column(JSON, default=list)
+    assignment_status: Mapped[str] = mapped_column(String(30), default="UNASSIGNED", index=True)
+    status_reason: Mapped[str | None] = mapped_column(Text)
+    source_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ManualDispatchTrip(Base):
+    __tablename__ = "manual_dispatch_trip"
+    __table_args__ = (
+        UniqueConstraint("dispatch_vehicle_id", "trip_sequence", name="uq_manual_dispatch_trip_sequence"),
+        Index("ix_manual_dispatch_trip_departure", "dispatch_vehicle_id", "departure_datetime"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    dispatch_vehicle_id: Mapped[str] = mapped_column(String(64), ForeignKey("manual_dispatch_vehicle.id", ondelete="CASCADE"), index=True)
+    trip_sequence: Mapped[int] = mapped_column(Integer)
+    available_before_trip_datetime = mapped_column(DateTime(timezone=True), nullable=False)
+    departure_datetime = mapped_column(DateTime(timezone=True), nullable=True)
+    estimated_return_datetime = mapped_column(DateTime(timezone=True), nullable=True)
+    turnaround_duration_seconds: Mapped[int] = mapped_column(Integer, default=0)
+    available_after_trip_datetime = mapped_column(DateTime(timezone=True), nullable=True)
+    distance_meter: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    travel_duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    service_duration_seconds: Mapped[int] = mapped_column(Integer, default=0)
+    operational_buffer_seconds: Mapped[int] = mapped_column(Integer, default=0)
+    total_duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_volume_kl: Mapped[float] = mapped_column(Float, default=0)
+    status: Mapped[str] = mapped_column(String(30), default="DRAFT", index=True)
+    route_provider: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    route_response_status: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    route_error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    route_geometry: Mapped[list] = mapped_column(JSON, default=list)
+    route_calculated_at = mapped_column(DateTime(timezone=True), nullable=True)
+    row_version: Mapped[int] = mapped_column(Integer, default=1)
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class ManualDispatchTripLO(Base):
+    __tablename__ = "manual_dispatch_trip_lo"
+    __table_args__ = (
+        UniqueConstraint("dispatch_job_id", "manual_dispatch_lo_id", name="uq_manual_dispatch_lo_assignment"),
+        Index("ix_manual_dispatch_trip_lo_trip_stop", "trip_id", "stop_sequence"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    dispatch_job_id: Mapped[str] = mapped_column(String(64), ForeignKey("manual_dispatch_job.id", ondelete="CASCADE"), index=True)
+    trip_id: Mapped[str] = mapped_column(String(64), ForeignKey("manual_dispatch_trip.id", ondelete="CASCADE"), index=True)
+    manual_dispatch_lo_id: Mapped[str] = mapped_column(String(64), ForeignKey("manual_dispatch_loading_order.id", ondelete="CASCADE"), index=True)
+    stop_sequence: Mapped[int] = mapped_column(Integer)
+    estimated_arrival_datetime = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ManualDispatchRouteLeg(Base):
+    __tablename__ = "manual_dispatch_route_leg"
+    __table_args__ = (UniqueConstraint("trip_id", "leg_sequence", name="uq_manual_dispatch_route_leg_sequence"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    trip_id: Mapped[str] = mapped_column(String(64), ForeignKey("manual_dispatch_trip.id", ondelete="CASCADE"), index=True)
+    leg_sequence: Mapped[int] = mapped_column(Integer)
+    origin_type: Mapped[str] = mapped_column(String(30))
+    origin_id: Mapped[str] = mapped_column(String(120))
+    destination_type: Mapped[str] = mapped_column(String(30))
+    destination_id: Mapped[str] = mapped_column(String(120))
+    origin_lat: Mapped[float] = mapped_column(Float)
+    origin_lng: Mapped[float] = mapped_column(Float)
+    destination_lat: Mapped[float] = mapped_column(Float)
+    destination_lng: Mapped[float] = mapped_column(Float)
+    distance_meter: Mapped[int] = mapped_column(Integer)
+    duration_seconds: Mapped[int] = mapped_column(Integer)
+    traffic_duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    route_provider: Mapped[str] = mapped_column(String(80))
+    request_timestamp = mapped_column(DateTime(timezone=True), nullable=False)
+    response_status: Mapped[str] = mapped_column(String(80))
+    calculated_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ManualDispatchAuditLog(Base):
+    __tablename__ = "manual_dispatch_audit_log"
+    __table_args__ = (Index("ix_manual_dispatch_audit_job_created", "dispatch_job_id", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    dispatch_job_id: Mapped[str] = mapped_column(String(64), ForeignKey("manual_dispatch_job.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[str] = mapped_column(String(120))
+    action: Mapped[str] = mapped_column(String(80), index=True)
+    entity_type: Mapped[str] = mapped_column(String(60))
+    entity_id: Mapped[str] = mapped_column(String(120))
+    old_value_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    new_value_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)

@@ -379,3 +379,16 @@ pytest tests/test_phase7_dynamic_vrp.py
 ```
 
 The suite covers Phase 6 soft warm start, one-product compartments, multi-trip, mandatory Planned ETA validation, equal-time availability, freeze horizon, ONGOING/DONE handling, bay product compatibility, actual queue delay, per-compartment loading, ETA lifecycle, route version immutability, and explicit dropped LO.
+
+## Handoff to Phase 8 Manual Dispatch
+
+Every persisted Route Version is an immutable candidate source for Phase 8. The Phase 8 source selector is scoped by the same depot and operating date and discovers `V1`, `V2`, and later versions dynamically; no maximum version is hardcoded. The selected Phase 6 warm start is also exposed through the Phase 7 Job lineage when that source run is available.
+
+Creating a Manual Dispatch Job copies vehicle, trip, LO scope/assignment, route metadata, cluster, shift, tag, configuration, and source lineage into Phase 8 tables. This is a point-in-time snapshot:
+
+- later Phase 7 reroutes do not mutate the Manual Dispatch Job;
+- Phase 8 edits, Apply, versioning, and Finalize do not mutate the Phase 7 Job or Route Version;
+- the Phase 7 current Route Version remains the optimization authority, while the finalized Phase 8 version becomes the human-reviewed dispatch authority;
+- selecting a newer Phase 7 route requires a new Phase 8 job/version rather than silently replacing an existing snapshot.
+
+Phase 7 remains responsible for fleet-wide assignment, global stop sequencing, multi-trip constraints, compartment placement, and depot bay scheduling. Phase 8 does not call the Phase 7 solver; it applies canonical compatibility guardrails and recalculates only an explicitly edited trip with Google Routes.

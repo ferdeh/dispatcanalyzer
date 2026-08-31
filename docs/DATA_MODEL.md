@@ -82,3 +82,15 @@ Phase 7 operational optimization persistence:
 - `route_matrix_cache`, `route_api_request_log`: departure-bucket travel data, provider/fallback metadata, expiry, pair counts, cache hits, request duration, and audit outcome.
 
 Route versions are never updated in place. Reroute copies frozen execution units and writes re-optimized future work into a new version. `optimization_job.current_route_version_id` is the only mutable pointer to the latest operational plan; older versions and their snapshots remain queryable.
+
+Phase 8 manual dispatch persistence:
+
+- `manual_dispatch_job`: domain/public job ID, depot/date, source Phase 6/7 lineage, source job/run/route/version metadata, dispatch version and parent, lifecycle, optimistic `row_version`, configuration snapshot, creator/updater, and finalization actor/time.
+- `manual_dispatch_vehicle`: one MT snapshot per dispatch job with registration, class, capacity KL, tags, compartments, initial/last availability, and dispatch status.
+- `manual_dispatch_loading_order`: complete planning-scope LO snapshot, including SPBU/product/volume, saved cluster/shift/tags, source evidence, and explicit `ASSIGNED`/`UNASSIGNED` state.
+- `manual_dispatch_trip`: ordered physical-MT trip with before/departure/return/after timestamps, turnaround/buffer, distance, travel/service/total duration, KL total, route status/error/provider/geometry, and optimistic `row_version`.
+- `manual_dispatch_trip_lo`: relational assignment from one in-scope LO to one trip, with stop sequence and calculated SPBU arrival timestamp. A database uniqueness constraint prevents one LO scope from being assigned to two trips.
+- `manual_dispatch_route_leg`: auditable Depot/SPBU edge with coordinates, distance, static/traffic duration, provider, request timestamp, and response status.
+- `manual_dispatch_audit_log`: append-only actor/action/entity record with previous/new JSON and movement/timeline metadata.
+
+`0022_phase8_manual_dispatch` adds these tables without changing Phase 6/7 source tables. Creating a Phase 8 job or version performs a deep relational copy. Finalized rows remain immutable; further editing starts a child dispatch version rather than overwriting the finalized snapshot.

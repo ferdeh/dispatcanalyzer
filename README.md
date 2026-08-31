@@ -1,10 +1,10 @@
 # Dispatch Intelligence Platform
 
-Dispatch Intelligence Platform adalah aplikasi intelligence dan operational control distribusi BBM. Platform ini dibangun bertahap dari Phase 0 sampai Phase 7 untuk mengubah:
+Dispatch Intelligence Platform adalah aplikasi intelligence dan operational control distribusi BBM. Platform ini dibangun bertahap dari Phase 0 sampai Phase 8 untuk mengubah:
 
 Master Data + Loading Order + GPS Operational Data + Historical Dispatch
 
-menjadi trusted operational intelligence, saved prediction, dan dynamic multi-trip route plan yang auditable. Phase 6 menghasilkan warm start shipment/MT; Phase 7 memakai Google OR-Tools untuk optimasi fleet-wide dan depot bay scheduling. Google Routes API tetap hanya menjadi provider jarak, waktu, matrix, dan geometry—bukan optimization engine.
+menjadi trusted operational intelligence, saved prediction, dynamic multi-trip route plan, dan final human-reviewed dispatch yang auditable. Phase 6 menghasilkan warm start shipment/MT; Phase 7 memakai Google OR-Tools untuk optimasi fleet-wide dan depot bay scheduling; Phase 8 membuat snapshot untuk adjustment manual, per-trip recalculation, simulation, dashboard, audit, dan finalization. Google Routes API tetap hanya menjadi provider jarak, waktu, matrix, dan geometry—bukan optimization engine.
 
 Prinsip utama: jangan lanjut ke phase berikutnya sebelum phase berjalan benar, diuji, tervalidasi visual, terdokumentasi, dan usable.
 
@@ -42,6 +42,7 @@ WEB_PORT=3001 docker compose up -d web
 - Phase 5 - Machine Learning Intelligence: `/machine-learning-intelligence`
 - Phase 6 - Shipment & MT Assignment Prediction: `/prediction-assignment`
 - Phase 7 - Dynamic Multi-Trip VRP & Depot Bay Queue: `/phase7-optimization`
+- Phase 8 - Manual Dispatching & Operational Simulation: `/phase-8/manual-dispatch`
 - Settings - Google Maps Integration: `/settings/google-maps-integration`
 - Documentation - Panduan Pengguna: `/documentation`
 
@@ -496,6 +497,8 @@ Phase 3 pairing intelligence implementation is summarized in `PHASE_3_COMPLETION
 Phase 4 methodology is documented in `docs/PHASE_4_SPBU_MT_AFFINITY.md`, with implementation status in `PHASE_4_COMPLETION_REPORT.md`.
 Phase 7 architecture, workflow, hard/soft constraints, API, schema, dan operasi dispatcher didokumentasikan di `docs/PHASE_7_DYNAMIC_VRP.md`.
 
+Phase 8 snapshot boundary, MT–Trip–LO editing, eligibility, Apply, route legs, multi-trip availability, cascading recalculation, simulation KL/Gantt, daily dashboard, versioning, audit, dan finalization didokumentasikan di `docs/PHASE_8_MANUAL_DISPATCH.md`.
+
 ## Phase Roadmap
 
 ### Phase 0: Master Data Strengthening and Operational Data Foundation
@@ -906,8 +909,9 @@ Phase 7 sekarang bertanggung jawab atas final route optimization, fleet-wide con
 
 Verification terakhir:
 
-- migration PostgreSQL memiliki single head revision `0020_phase7_reference_time`
-- full deployment-image regression terbaru lulus **151 tests**; focused Phase 7 lulus **68 tests**, termasuk current-version warm start V1→V2→V3, actual-state freeze/release MT, retained working-time tanpa double count future trip, reference time/timezone depot, asynchronous reservation, bay subset/timeout semantics, depot gate-out window yang tidak membatasi return MT, geometry depot-stop-depot, activation cost satu kali per MT, dan material gate-out change
+- migration PostgreSQL memiliki single head revision `0022_phase8_manual_dispatch`
+- full deployment-image regression terbaru lulus **158 tests**; focused Phase 7 lulus **69 tests**, termasuk current-version warm start V1→V2→V3, actual-state freeze/release MT, retained working-time tanpa double count future trip, reference time/timezone depot, asynchronous reservation, bay subset/timeout semantics, depot gate-out window yang tidak membatasi return MT, geometry depot-stop-depot, activation cost satu kali per MT, dan material gate-out change
+- focused Phase 8 lulus **7 tests** untuk immutable source snapshot, canonical eligibility/tag guardrail, selected-MT Google road geometry yang read-only, multi-trip availability dan cascade, duplicate LO/delete-trip recovery, KL capacity gap, finalization, finalized read-only state, serta dispatch versioning
 - focused Phase 5 + Phase 6 regression suite berisi **39 tests**
 - Phase 7 acceptance/hardening meliputi warm start, dispatcher-selected reference time, compartment, multi-trip, ETA, freeze, DONE/ONGOING, bay compatibility/queue/loading, versioning, dropped reason, final geometry, dan trip-number continuation
 - TypeScript type checking dan Vite production build lulus
@@ -1121,6 +1125,53 @@ Setiap phase harus melewati gate berikut sebelum phase berikutnya dimulai:
 - `GET/POST/PUT /api/v1/phase7/parameter-profiles[...]`
 - `GET /api/v1/phase7/constraint-catalog`
 
+### Handoff Phase 7 → Phase 8
+
+Phase 7 dan Phase 8 memakai data operasional yang sama sebagai lineage, tetapi mempunyai authority dan lifecycle berbeda. Phase 7 memilih assignment dan sequence fleet-wide melalui optimization; Phase 8 menerima satu hasil terpilih sebagai snapshot lalu hanya mengizinkan adjustment manual serta recalculation lokal per trip.
+
+| Aspek | Phase 7 | Phase 8 |
+|---|---|---|
+| Input utama | Saved Phase 6 Prediction Run + current LO/MT/bay state | Phase 6 warm start atau Route Version Phase 7 yang dipilih |
+| Authority | Global assignment, multi-trip routing, compartment, bay, dan gate-out optimization | Human-reviewed MT–Trip–LO assignment, constraint guardrail, timeline, simulation, dan final dispatch |
+| Engine | OR-Tools Routing Solver, compartment CP-SAT, `FIFO_BALANCED` bay scheduler default | Tidak ada global solver; canonical validation + Google Routes per-trip Apply |
+| Version | Immutable Route V1/V2/...; current pointer berada pada Phase 7 Job | Dispatch V1/V2/... sebagai deep-copy snapshot dengan parent lineage |
+| Mutation source | Tidak menulis ulang Phase 6 | Tidak menulis ulang Phase 6 maupun Phase 7 |
+| Output | Optimized operational route candidate | Finalized, read-only, human-reviewed dispatch plan |
+
+Saat membuat Manual Dispatch Job, daftar Phase 7 Job dibatasi oleh depot dan operational date. Source route dibaca dinamis—tanpa hardcoded maximum version—kemudian vehicle, trip, LO scope, assignment, cluster, shift, tags, route metadata, dan configuration snapshot disalin ke tabel Phase 8. Perubahan Phase 7 setelah snapshot dibuat tidak mengubah Manual Dispatch Job yang sudah ada; dispatcher harus membuat job/version baru bila ingin memakai source terbaru.
+
+### Phase 8 — Manual Dispatching & Operational Simulation
+
+Phase 8 dimulai dari landing **Manual Dispatch Job List**, bukan langsung membuka editor. Create Job memakai dependent selection Depot → Operational Date → Phase 7 Job → source route dinamis. Source dapat berupa Phase 6 Prediction/Warm Start atau route Phase 7 mana pun. `Create & Load` membuat relational snapshot MT, trip, LO scope, assignment, cluster, shift, tag, route, configuration, dan lineage tanpa mengubah source.
+
+Workspace job memakai header persisten dan lima tab yang membaca current state yang sama: **Trip Management**, **Simulation Diagram**, **Daily Distribution Dashboard**, **Geographic Map**, dan **History / Audit**. Operasi Add/Remove/Move/Reorder/Edit menandai trip `MODIFIED`. Tombol Apply menjalankan canonical compatibility, capacity/sequence/timeline validation, Google Routes per leg, service time, ETA SPBU, return depot, turnaround, next availability, dan invalidasi trip berikutnya menjadi `NEEDS_RECALCULATION`. Phase 8 tidak menjalankan OR-Tools atau global VRP reoptimization.
+
+Tab **Geographic Map** mempunyai search box nomor/ID MT dan dropdown **Select No. MT**. Map hanya memuat satu MT terpilih agar ringan, tetapi menampilkan seluruh trip MT itu. Geometry memakai hasil Google Routes yang sudah tersimpan atau satu full-route Google request Depot → ordered SPBU → Depot untuk source snapshot yang belum memiliki geometry Google. Hydration bersifat read-only dan tidak mengubah assignment, sequence, ETA, status, distance, atau dispatch version. Jika Google Routes gagal/tidak dikonfigurasi, error ditampilkan per trip dan route tidak diganti garis lurus.
+
+Lifecycle job adalah `DRAFT → IN_PROGRESS → READY → FINALIZED`. Lifecycle trip membedakan `DRAFT`, `MODIFIED`, `CALCULATING`, `VALID`, `WARNING`, `CONFLICT`, dan `NEEDS_RECALCULATION`. Hanya Apply sukses yang menghasilkan route/timeline authoritative. Finalized job tidak dapat diedit langsung; perubahan lanjutan wajib melalui **Create New Version**.
+
+Simulation memakai KL sebagai capacity metric: gate-out demand KL, available MT capacity KL, capacity gap, serta Gantt `AVAILABLE_AT_DEPOT`/`TRIP`. Dashboard membedakan Time Utilization dari Volume Capacity Utilization, memakai saved shift/cluster source, dan dapat membuka filtered Unassigned LO. Finalization memblokir incompatibility, duplicate, uncalculated/stale route, dan timeline overlap; unassigned demand default-nya warning dengan acknowledgment. Finalized version read-only dan **Create New Version** menghasilkan deep-copy snapshot baru.
+
+Endpoint Phase 8:
+
+- `GET /api/v1/phase8/manual-dispatch/sources`
+- `GET/POST /api/v1/phase8/manual-dispatch/jobs`
+- `GET /api/v1/phase8/manual-dispatch/jobs/{job_id}`
+- `POST /api/v1/phase8/manual-dispatch/jobs/{job_id}/versions`
+- `GET /api/v1/phase8/manual-dispatch/jobs/{job_id}/vehicles/{vehicle_id}/eligible-loading-orders`
+- `POST /api/v1/phase8/manual-dispatch/jobs/{job_id}/trips`
+- `PATCH/DELETE /api/v1/phase8/manual-dispatch/jobs/{job_id}/trips/{trip_id}`
+- `POST/DELETE /api/v1/phase8/manual-dispatch/jobs/{job_id}/trips/{trip_id}/loading-orders[...]`
+- `POST /api/v1/phase8/manual-dispatch/jobs/{job_id}/loading-orders/{lo_scope_id}/move`
+- `PUT /api/v1/phase8/manual-dispatch/jobs/{job_id}/trips/{trip_id}/stop-order`
+- `POST /api/v1/phase8/manual-dispatch/jobs/{job_id}/trips/{trip_id}/apply`
+- `GET /api/v1/phase8/manual-dispatch/jobs/{job_id}/simulation`
+- `GET /api/v1/phase8/manual-dispatch/jobs/{job_id}/dashboard`
+- `GET /api/v1/phase8/manual-dispatch/jobs/{job_id}/map?vehicle_id=...`
+- `GET /api/v1/phase8/manual-dispatch/jobs/{job_id}/audit`
+- `GET /api/v1/phase8/manual-dispatch/jobs/{job_id}/validation`
+- `POST /api/v1/phase8/manual-dispatch/jobs/{job_id}/finalize`
+
 ## Important Design Principles
 
 - Jangan overwrite master data secara diam-diam dari historical evidence.
@@ -1128,6 +1179,7 @@ Setiap phase harus melewati gate berikut sebelum phase berikutnya dimulai:
 - Semua canonical dan derived records harus menjaga lineage jika memungkinkan.
 - Jangan menggunakan LLM untuk deterministic analytics.
 - Phase 7 route optimization hanya boleh membaca saved Phase 6 sebagai warm start; jangan menulis balik atau menjalankan Phase 6 otomatis saat reroute.
+- Phase 8 hanya boleh menyalin Phase 6/7 sebagai working snapshot; jangan menulis balik source dan jangan menjalankan global reoptimization otomatis.
 - Google Routes menyediakan travel data dan geometry saja; OR-Tools adalah satu-satunya optimization engine Phase 7.
 - Jangan tampilkan uncertainty sebagai fakta pasti; gunakan status seperti `UNKNOWN`, `UNMAPPED`, `AMBIGUOUS`, `LOW CONFIDENCE`, `PARTIAL`, atau `INSUFFICIENT DATA`.
 
@@ -1144,6 +1196,7 @@ Dokumen pendukung:
 - `docs/TAG_COMPATIBILITY.md`
 - `docs/DATA_QUALITY.md`
 - `docs/PHASE_7_DYNAMIC_VRP.md`
+- `docs/PHASE_8_MANUAL_DISPATCH.md`
 - `docs/SHIPMENT_MODEL.md`
 - `docs/GPS_MODEL.md`
 - `docs/PHASES.md`

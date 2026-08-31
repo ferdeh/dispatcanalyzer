@@ -56,6 +56,7 @@ from .phase5_behavioral import recover_interrupted_behavioral_training_runs
 from .phase5_routes import router as phase5_router
 from .phase6_routes import router as phase6_router
 from .phase7_routes import router as phase7_router
+from .phase8_routes import router as phase8_router
 from .phase7_service import recover_interrupted_phase7_optimizations
 from .google_routes_settings_routes import router as google_routes_settings_router
 from .tag_consistency import build_tag_consistency_payload, get_tag_consistency_detail
@@ -96,6 +97,7 @@ app.add_middleware(
 app.include_router(phase5_router)
 app.include_router(phase6_router)
 app.include_router(phase7_router)
+app.include_router(phase8_router)
 app.include_router(google_routes_settings_router)
 
 

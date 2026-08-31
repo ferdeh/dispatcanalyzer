@@ -16,7 +16,9 @@ Phase 6: time-aware shipment prediction, rolling multi-trip MT assignment, and e
 
 Phase 7: dynamic fleet-wide multi-trip VRP, depot bay queue scheduling, rolling reroute, and immutable operational route versions.
 
-The repository includes read-only Phase 2–4 intelligence, persisted Phase 5 ML workflows, Phase 6 inference/assignment/availability estimation, and Phase 7 OR-Tools optimization/control. Phase 6 may estimate a preliminary small-stop sequence for cycle time; Phase 7 owns fleet-wide route optimization and depot bay scheduling.
+Phase 8: manual dispatch adjustment, per-trip constraint validation and route recalculation, cascading fleet availability, operational simulation, dashboard, audit, versioning, and final dispatch.
+
+The repository includes read-only Phase 2–4 intelligence, persisted Phase 5 ML workflows, Phase 6 inference/assignment/availability estimation, Phase 7 OR-Tools optimization/control, and Phase 8 human-in-the-loop dispatch finalization. Phase 6 may estimate a preliminary small-stop sequence for cycle time; Phase 7 owns fleet-wide route optimization and depot bay scheduling; Phase 8 owns manual adjustment, per-trip recalculation, simulation, audit, and the finalized dispatch version.
 
 ## Phase 2
 
@@ -115,3 +117,30 @@ The repository includes read-only Phase 2–4 intelligence, persisted Phase 5 ML
 - Schema: migration `0019_phase7_dynamic_vrp`
 - Algorithm: `phase7.dynamic_multitrip_vrp_bay.v6` (`FIFO_BALANCED`, per-trip candidate-audited post-bay repair, current Route Version reroute seed, and actual-state-aware future-trip release)
 - Technical documentation: `docs/PHASE_7_DYNAMIC_VRP.md`
+
+## Phase 8
+
+- API prefix: `/api/v1/phase8/manual-dispatch`
+- UI: `/phase-8/manual-dispatch` and `/phase-8/manual-dispatch/:jobId?tab=...`
+- Source: immutable snapshot of Phase 6 warm start or any dynamically discovered Phase 7 Route Version
+- Boundary: manual editing and per-trip recalculation only; no global VRP reoptimization and no mutation of Phase 6/7 records
+- Hierarchy: `MT → Trip → Loading Order`, with relational Unassigned LO scope
+- Eligibility: canonical `compatibility.evaluate_mt_spbu_compatibility`, depot/active/scope/uniqueness/capacity/compartment guardrails
+- Apply: validation → Google Routes legs → service time → return/turnaround → availability → downstream invalidation
+- Simulation: 15/30/60-minute server aggregates of gate-out KL, available fleet KL, capacity gap, and MT movement Gantt
+- Dashboard: hourly/cumulative KL, saved shift/cluster distributions, separate time/volume utilization metrics, and remaining demand
+- Geographic Map: search/select one MT and render all of its trips with stored or live Google Routes road geometry without mutating the dispatch snapshot
+- Versioning: finalized versions are immutable; new versions are deep-copy working snapshots with parent lineage
+- Finalization: hard errors block; unassigned LO is an explicit acknowledgment warning by default
+- Schema: migration `0022_phase8_manual_dispatch`
+- Technical documentation: `docs/PHASE_8_MANUAL_DISPATCH.md`
+
+## Phase 7 → Phase 8 operational handoff
+
+1. Phase 7 persists an immutable Route Version (`V1`, `V2`, and later versions) while the Job points to the current operational version.
+2. The dispatcher opens Phase 8 and selects depot, operational date, Phase 7 Job, and one dynamically discovered source route. Phase 6 Warm Start remains selectable through the same Phase 7 lineage.
+3. `Create & Load` copies the selected MT, trip, LO scope/assignment, route metadata, cluster, shift, tags, configuration, and source lineage into a separate Manual Dispatch Job.
+4. Manual edits affect only Phase 8. Apply recalculates one trip and cascades availability invalidation only along that MT's later trips; no fleet-wide solver runs.
+5. Simulation and Dashboard read the same current Phase 8 state. Finalization produces a read-only Dispatch Version; subsequent edits require a child version.
+
+This handoff is intentionally one-way. Phase 8 never writes assignments, timestamps, statuses, or current-version pointers back to Phase 6 or Phase 7.

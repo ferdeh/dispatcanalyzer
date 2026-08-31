@@ -11,6 +11,7 @@ import { GoogleMapsIntegrationPage } from "./components/GoogleMapsIntegrationPag
 import { AppSidebar, type AppPage } from "./components/AppSidebar";
 import { DocumentationPage } from "./components/DocumentationPage";
 import { Phase7OptimizationPage } from "./components/Phase7OptimizationPage";
+import { ManualDispatchPage } from "./components/ManualDispatchPage";
 
 type Overview = Record<string, number>;
 type Charts = Record<string, SeriesPoint[]>;
@@ -126,6 +127,11 @@ const pageMetadata: Record<Page, { eyebrow: string; title: string; description: 
     eyebrow: "Phase 7 · Optimization & Control",
     title: "Dynamic Multi-Trip VRP & Depot Bay Queue",
     description: "Fleet-wide OR-Tools routing, FIFO_BALANCED bay scheduling, rolling operational updates, and immutable route versions.",
+  },
+  "manual-dispatch": {
+    eyebrow: "Phase 8 · Manual Dispatch & Simulation",
+    title: "Manual Dispatching & Operational Simulation",
+    description: "Human-in-the-loop trip adjustment, compatibility guardrails, route recalculation, fleet simulation, audit, and final dispatch.",
   },
   "google-maps-integration": {
     eyebrow: "Settings",
@@ -779,6 +785,7 @@ function pageFromPath(pathname: string): Page {
   if (pathname === "/machine-learning-intelligence") return "machine-learning-intelligence";
   if (pathname === "/prediction-assignment") return "prediction-assignment";
   if (pathname === "/phase7-optimization") return "phase7-optimization";
+  if (pathname === "/phase-8/manual-dispatch" || pathname.startsWith("/phase-8/manual-dispatch/")) return "manual-dispatch";
   if (pathname === "/settings/google-maps-integration") return "google-maps-integration";
   if (pathname === "/documentation") return "documentation";
   return "dashboard";
@@ -2243,6 +2250,8 @@ function App() {
                     ? "/prediction-assignment"
                     : page === "phase7-optimization"
                       ? "/phase7-optimization"
+                    : page === "manual-dispatch"
+                      ? "/phase-8/manual-dispatch"
                     : page === "google-maps-integration"
                       ? "/settings/google-maps-integration"
                       : page === "documentation"
@@ -2389,6 +2398,10 @@ function App() {
 
         {currentPage === "phase7-optimization" && (
           <Phase7OptimizationPage depots={depots} products={products} />
+        )}
+
+        {currentPage === "manual-dispatch" && (
+          <ManualDispatchPage depots={depots} />
         )}
 
         {currentPage === "google-maps-integration" && (

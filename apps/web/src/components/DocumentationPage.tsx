@@ -47,8 +47,8 @@ const guides: GuidePage[] = [
         id: "doc-tujuan",
         title: "Tujuan dan batas aplikasi",
         paragraphs: [
-          "Dispatch Intelligence Platform mengubah Master Data, Loading Order, GPS, dan histori dispatch menjadi informasi operasional yang dapat diaudit. Phase 0–5 terutama menjelaskan pola historis; Phase 6 menghasilkan prediction/assignment berbasis snapshot model; Phase 7 menghasilkan route plan multi-trip dan jadwal depot bay yang versioned.",
-          "Phase 7 memakai prediction Phase 6 sebagai warm start dan soft preference, bukan hard assignment. Probability, affinity, consistency, atau confidence yang tinggi tetap tidak otomatis menjadi rekomendasi bisnis atau izin untuk melewati master compatibility.",
+          "Dispatch Intelligence Platform mengubah Master Data, Loading Order, GPS, dan histori dispatch menjadi informasi operasional yang dapat diaudit. Phase 0–5 terutama menjelaskan pola historis; Phase 6 menghasilkan prediction/assignment; Phase 7 menghasilkan route plan multi-trip; Phase 8 memberi workspace adjustment manual, simulation, audit, dan final dispatch.",
+          "Phase 7 memakai prediction Phase 6 sebagai warm start dan soft preference. Phase 8 menyalin source Phase 6/7 menjadi snapshot terpisah dan tidak menjalankan global reoptimization. Probability, affinity, consistency, atau confidence yang tinggi tetap bukan izin melewati master compatibility.",
         ],
         note: "Selalu baca depot, periode, unit analitik, kualitas data, dan evidence count sebelum memakai hasil.",
       },
@@ -62,6 +62,7 @@ const guides: GuidePage[] = [
           { title: "Bangun model Phase 5", text: "Readiness wajib lolos sebelum anomaly analysis atau behavioral clustering dijalankan." },
           { title: "Jalankan Phase 6", text: "Pilih model tersimpan, upload LO dan MT availability, validasi, lalu jalankan prediction." },
           { title: "Kendalikan operasi di Phase 7", text: "Buat Job per depot/tanggal, load Prediction Run tersimpan, masukkan actual MT/bay/queue, optimalkan V1, lalu reroute ke versi baru saat kondisi berubah." },
+          { title: "Finalkan dispatch di Phase 8", text: "Pilih source route, sesuaikan MT–Trip–LO, Apply per trip, periksa simulation/dashboard, selesaikan hard error, lalu Finalize." },
         ],
       },
       {
@@ -499,6 +500,7 @@ const guides: GuidePage[] = [
           { title: "Atur constraint dan validasi", text: "Buka Parameter → Constraint Settings. Aktifkan/nonaktifkan rule, pilih HARD atau SOFT, isi penalty untuk SOFT, atur MT Working Time dan Route Time Limit, lalu gunakan FIFO_BALANCED sebagai Bay Scheduler Strategy default. Bay CP-SAT Time Limit/Workers hanya dipakai bila CP_SAT dipilih eksplisit. Default Working Time terpisah sudah dihapus. Kembali ke Job Overview dan klik Validate di card Optimization Flow; hasil Optimization Readiness tampil sebagai popup memakai draft constraint yang sedang aktif." },
           { title: "Buat baseline V1", text: "Klik Run Initial Optimization lalu isi tanggal dan waktu referensi pada popup. Tanggal harus sama dengan Operating Date Job. Pre-run menolak jika salah satu Planned ETA kosong atau lebih awal dari waktu optimasi; nilai yang sama persis tetap valid. Phase 6 menjadi soft seed V1. Setelah lolos, API mengembalikan 202, Job menjadi CALCULATING, UI kembali ke Job Management, dan worker melanjutkan matrix/solver/persistence di background." },
           { title: "Update dan reroute", text: "Setelah Initial, isi kembali Planned ETA untuk seluruh MT karena input sebelumnya sudah di-reset. Ubah status LO atau bay queue aktual, lalu klik Re-Optimize Now; tanggal dikunci ke tanggal Initial dan waktu tidak boleh mundur dari run terakhir. Current Route Version menjadi seed berikutnya: V1 untuk V2, V2 untuk V3, dan seterusnya. Validasi Planned ETA yang sama berlaku sebelum reroute asynchronous menyimpan versi baru." },
+          { title: "Serahkan candidate ke Phase 8", text: "Buka Manual Dispatching, pilih depot/tanggal/Phase 7 Job yang sama, lalu pilih satu Route Version secara eksplisit. Phase 8 membuat point-in-time copy; reroute Phase 7 berikutnya tidak mengubah manual job dan Phase 8 tidak memindahkan current Route Version Phase 7." },
         ],
       },
       {
@@ -555,8 +557,66 @@ const guides: GuidePage[] = [
     ],
   },
   {
-    id: "doc-maps",
+    id: "doc-phase8",
     number: "11",
+    title: "Phase 8 · Manual Dispatching",
+    description: "Adjustment manual dengan compatibility guardrail, per-trip recalculation, simulation KL, dashboard, audit, dan final dispatch.",
+    page: "manual-dispatch",
+    topics: [
+      {
+        id: "doc-phase8-workflow",
+        title: "Workflow dispatcher dan batas modul",
+        steps: [
+          { title: "Create snapshot", text: "Pilih depot, tanggal, Phase 7 Job, dan Phase 6 warm start atau route V1/V2/versi dinamis lain. Create & Load tidak mengubah source." },
+          { title: "Edit MT → Trip → LO", text: "Tambah, hapus, pindah, atau ubah urutan LO. Eligible LO selalu difilter backend memakai canonical vehicle-class, tag, depot, active MT, uniqueness, capacity, dan rule yang tersedia." },
+          { title: "Apply per trip", text: "Trip MODIFIED belum valid. Apply memvalidasi, memanggil Google Routes per leg, menambah service time, menghitung ETA/return/turnaround, dan meng-invalidasi downstream trip." },
+          { title: "Periksa simulation dan dashboard", text: "Baca demand gate-out KL, available fleet capacity KL, capacity gap, Gantt, hourly/cumulative distribution, shift/cluster, utilization, dan remaining demand." },
+          { title: "Periksa Geographic Map", text: "Cari nomor/ID MT, pilih No. MT dari dropdown, lalu periksa seluruh trip sebagai road geometry Google Depot–SPBU berurutan–Depot." },
+          { title: "Finalize atau version", text: "Selesaikan hard error. Unassigned LO memerlukan acknowledgment. Finalized job read-only; Create New Version membuat snapshot kerja baru." },
+        ],
+        note: "Phase 8 tidak memakai OR-Tools, tidak memanggil GMPRO, dan tidak mengoptimalkan fleet secara global.",
+      },
+      {
+        id: "doc-phase8-lineage",
+        title: "Lineage Phase 7 ke Phase 8",
+        paragraphs: [
+          "Phase 7 adalah authority untuk global assignment, route sequence, multi-trip, compartment, bay, dan gate-out optimization. Phase 8 adalah authority untuk human-reviewed adjustment, per-trip route recalculation, operational simulation, dan final dispatch. Kedua fase tidak berbagi mutable assignment table.",
+          "Create & Load menyalin vehicle, trip, LO scope/assignment, cluster, shift, tags, route metadata, configuration, serta source job/run/version ke relational Phase 8 snapshot. Versi Phase 7 ditemukan dinamis tanpa batas V maksimum. Reroute baru di Phase 7 tidak mengubah snapshot yang sudah dibuat; pilih source terbaru melalui Manual Dispatch Job/version baru.",
+        ],
+        note: "Handoff bersifat one-way copy. Phase 8 Apply/Finalize tidak menulis ke Phase 6, Phase 7, atau current Route Version pointer.",
+      },
+      {
+        id: "doc-phase8-card",
+        title: "Cara membaca card dan status",
+        cards: [
+          { name: "Job DRAFT / IN PROGRESS", meaning: "Snapshot baru atau workspace yang masih mempunyai edit, warning, dan stale calculation.", reading: "Belum boleh dianggap final dispatch; selesaikan Apply dan complete validation." },
+          { name: "Job READY / FINALIZED", meaning: "READY berarti seluruh trip saat ini VALID; FINALIZED berarti version terkunci read-only.", reading: "READY masih melewati final validation. Perubahan setelah FINALIZED wajib memakai Create New Version." },
+          { name: "MT Card", meaning: "Registration, ID, class/capacity KL, tag, initial/last availability, trip, volume, dan status.", reading: "Capacity KL dipakai simulation; jangan membaca MT hanya sebagai count." },
+          { name: "Trip MODIFIED", meaning: "Assignment/order/start berubah tetapi route/timeline belum diterima.", reading: "Klik Apply; simulation lama di-invalidasi setelah mutation." },
+          { name: "Trip WARNING / CONFLICT", meaning: "WARNING menunjukkan route provider gagal; CONFLICT menunjukkan hard input, compatibility, capacity, coordinate, atau timeline error.", reading: "Keduanya tidak dapat lolos finalization sampai diselesaikan dan di-Apply ulang." },
+          { name: "NEEDS RECALCULATION", meaning: "Trip sebelumnya mengubah dependency availability.", reading: "Return lama dibersihkan. Apply trip berurutan sebelum finalize." },
+          { name: "Unassigned LO", meaning: "LO tetap ada di planning scope tetapi tidak berada pada trip.", reading: "Filter shift/cluster/product/SPBU dan assign hanya ke MT eligible." },
+          { name: "Capacity Gap", meaning: "Available MT capacity KL dikurangi gate-out demand KL per bucket.", reading: "Negatif adalah shortage indicator, bukan definitive infeasibility." },
+          { name: "Utilization Time", meaning: "Active valid trip time dibagi depot operating window.", reading: "Berbeda dari Volume Capacity Utilization." },
+          { name: "Geographic Map", meaning: "Search dan dropdown satu MT untuk menampilkan semua trip-nya mengikuti jalan Google.", reading: "Geometry Google tersimpan dipakai ulang; source non-Google di-hydrate read-only melalui full-route Google request. Map tidak mengubah assignment, sequence, ETA, status, atau dispatch version dan tidak memakai straight-line fallback bila Google gagal." },
+          { name: "History / Audit", meaning: "Actor, action, entity, previous/new value, source/destination, reason, dan timestamp.", reading: "Gunakan evidence untuk merekonstruksi perubahan assignment/timeline." },
+        ],
+        formulas: [
+          "Total Trip Duration = travel time + total SPBU service time + optional operational buffer\nAvailable After Trip = estimated return depot + turnaround",
+          "LO Gate-Out Demand(t) = sum volume_kl LO yang trip-nya departure di bucket t\nAvailable MT Capacity(t) = sum capacity_kl MT yang berada di depot pada t\nCapacity Gap(t) = Available Capacity(t) - Demand(t)",
+          "Utilization Time % = active trip time / available operating window\nVolume Capacity Utilization % = assigned volume / sum trip vehicle capacity",
+        ],
+        examples: [
+          { title: "Cascade Trip 1", text: "Trip 1 berubah dan available-after mundur dari 09:00 ke 10:00. Trip 2 menerima available-before 10:00, Trip 2 dan Trip 3 menjadi NEEDS_RECALCULATION, dan timestamp lama tidak dipertahankan sebagai VALID." },
+          { title: "Unassigned saat Finalize", text: "Unassigned LO menimbulkan warning dan membutuhkan acknowledgment. Duplicate LO, incompatibility, overlapping trip, route failure, atau NEEDS_RECALCULATION tetap menjadi hard blocker." },
+          { title: "Capacity gap", text: "Demand gate-out 120 KL dan available MT capacity 96 KL menghasilkan gap -24 KL. Nilai negatif disebut shortage indicator, bukan bukti definitive infeasibility." },
+        ],
+      },
+    ],
+  },
+  {
+    id: "doc-maps",
+    number: "12",
     title: "Google Maps Integration",
     description: "API key dan parameter route estimation Phase 6.",
     page: "google-maps-integration",
@@ -597,7 +657,7 @@ const guides: GuidePage[] = [
   },
   {
     id: "doc-glosarium",
-    number: "12",
+    number: "13",
     title: "Glosarium dan Guardrail",
     description: "Istilah penting agar hasil tidak salah ditafsirkan.",
     topics: [
