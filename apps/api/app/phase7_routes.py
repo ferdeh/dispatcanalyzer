@@ -18,6 +18,7 @@ from .phase7_service import (
     get_cost_analysis,
     get_dropped_lo,
     get_job,
+    get_lo_comparison,
     get_map_road_geometry,
     get_map_route,
     get_parameter_profile,
@@ -142,6 +143,7 @@ class OptimizationRequest(BaseModel):
     parameters: dict = Field(default_factory=dict)
     current_time: datetime
     reason: str | None = Field(default=None, max_length=160)
+    route_time_limit_confirmed: bool = False
 
 
 class ValidationRequest(BaseModel):
@@ -267,6 +269,16 @@ def phase7_reroute(job_id: str, request: OptimizationRequest, background_tasks: 
 @router.get("/jobs/{job_id}/versions")
 def phase7_route_versions(job_id: str, db: Session = Depends(get_db)) -> list[dict]:
     return list_route_versions(db, job_id)
+
+
+@router.get("/jobs/{job_id}/comparison")
+def phase7_lo_comparison(
+    job_id: str,
+    source_a: str = Query(..., min_length=1),
+    source_b: str = Query(..., min_length=1),
+    db: Session = Depends(get_db),
+) -> dict:
+    return get_lo_comparison(db, job_id, source_a, source_b)
 
 
 @router.get("/jobs/{job_id}/versions/{version_id}")

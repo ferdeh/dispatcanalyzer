@@ -24,6 +24,11 @@ from app.models import (
     OptimizationJob,
     OptimizationParameterSnapshot,
     OptimizationRun,
+    PredictionAssignment,
+    PredictionRun,
+    PredictionShipment,
+    PredictionShipmentLine,
+    PredictionTrip,
     RouteAPIRequestLog,
     RouteMatrixCache,
     RouteVersion,
@@ -48,9 +53,11 @@ from app.phase7_service import (
     delete_job,
     delete_bay_configuration,
     get_bay_configuration,
+    get_lo_comparison,
     get_route_version,
     load_mt_from_master,
     recover_interrupted_phase7_optimizations,
+    route_time_limit_recommendation,
     update_vehicle_states,
 )
 
@@ -111,6 +118,22 @@ def test_legacy_time_limit_populates_independent_route_and_bay_budgets() -> None
     assert configured["route_optimization_time_limit"] == 23
     assert configured["bay_optimization_time_limit"] == 41
     assert configured["bay_cp_sat_workers"] == 6
+
+
+def test_route_time_limit_recommendation_scales_with_lo_and_mt_workload() -> None:
+    recommendation = route_time_limit_recommendation(675, 206, 30)
+
+    assert recommendation == {
+        "lo_count": 675,
+        "mt_count": 206,
+        "estimated_lo_per_mt": 4,
+        "configured_seconds": 30,
+        "recommended_minimum_seconds": 240,
+        "below_recommendation": True,
+        "requires_confirmation": True,
+        "calculation_basis": "round30(15 + 0.25 x LO + 10 x ceil(LO / MT))",
+    }
+    assert route_time_limit_recommendation(20, 20, 60)["requires_confirmation"] is False
 
 
 def test_fifo_balanced_is_the_default_bay_scheduler_and_cp_sat_is_opt_in() -> None:
@@ -219,6 +242,93 @@ def test_route_version_exposes_canonical_product_name() -> None:
         assert payload["trips"][0]["stops"][0]["product_names"] == ["Bio Solar"]
         assert payload["first_loading_start"] == (DAY_START + timedelta(minutes=10)).isoformat()
         assert payload["depot_dispatch_span_minutes"] == 20
+
+
+def test_lo_comparison_uses_immutable_phase6_and_route_version_snapshots() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as db:
+        db.add_all([
+            MasterDepot(depot_id="D1", depot_name="Depot 1"),
+            MasterMT(mt_id="M1", vehicle_name_raw="MT 1", vehicle_registration="BK 1001 AA", depot_id="D1"),
+            MasterMT(mt_id="M2", vehicle_name_raw="MT 2", vehicle_registration="BK 1002 AA", depot_id="D1"),
+            MasterSPBU(spbu_id="S1", spbu_code="14200001", spbu_name="SPBU A"),
+            MasterSPBU(spbu_id="S2", spbu_code="14200002", spbu_name="SPBU B"),
+            MasterProduct(product_id="P1", product_name="Bio Solar", normalized_product="BIO SOLAR"),
+            PredictionRun(
+                id="P6",
+                prediction_run_no="PRED-TEST",
+                depot_id="D1",
+                model_id="MODEL-1",
+                model_version=1,
+                status="COMPLETED",
+                input_loading_order_filename="lo.csv",
+                input_mt_availability_filename="mt.csv",
+                algorithm_version="test",
+            ),
+        ])
+        db.flush()
+        db.add(OptimizationJob(job_id="JOB-COMPARE", job_no="P7-JOB-COMPARE", job_name="Compare", depot_id="D1", operating_date=date(2026, 8, 26), source_prediction_run_id="P6"))
+        db.add_all([
+            PredictionShipment(id="SHIP-A", prediction_run_id="P6", predicted_shipment_id="P6-SHIP-A", shift_id="SHIFT-1", shift_name="Shift 1"),
+            PredictionShipment(id="SHIP-B", prediction_run_id="P6", predicted_shipment_id="P6-SHIP-B", shift_id="SHIFT-1", shift_name="Shift 1"),
+        ])
+        db.flush()
+        db.add_all([
+            PredictionShipmentLine(id="LINE-1", prediction_run_id="P6", prediction_shipment_id="SHIP-A", loading_order_no="LO-1", spbu_id="S1", spbu_no="14200001", product_id="P1", product_name="Bio Solar", order_quantity_kl=8, model_predicted_shipment_id="P6-SHIP-A"),
+            PredictionShipmentLine(id="LINE-2", prediction_run_id="P6", prediction_shipment_id="SHIP-B", loading_order_no="LO-2", spbu_id="S2", spbu_no="14200002", product_id="P1", product_name="Bio Solar", order_quantity_kl=8, model_predicted_shipment_id="P6-SHIP-B"),
+            PredictionAssignment(id="P6-A1", prediction_shipment_id="SHIP-A", final_vehicle_id="M1", assignment_status="ASSIGNED"),
+            PredictionAssignment(id="P6-A2", prediction_shipment_id="SHIP-B", final_vehicle_id="M1", assignment_status="ASSIGNED"),
+            PredictionTrip(id="P6-T1", prediction_run_id="P6", prediction_shipment_id="SHIP-A", trip_id="TRIP-1", trip_number=1, vehicle_id="M1", planned_start_datetime=DAY_START, predicted_departure_datetime=DAY_START + timedelta(hours=1), estimated_return_datetime=DAY_START + timedelta(hours=3), assignment_status="ASSIGNED"),
+            PredictionTrip(id="P6-T2", prediction_run_id="P6", prediction_shipment_id="SHIP-B", trip_id="TRIP-2", trip_number=2, vehicle_id="M1", planned_start_datetime=DAY_START + timedelta(hours=3), predicted_departure_datetime=DAY_START + timedelta(hours=4), estimated_return_datetime=DAY_START + timedelta(hours=6), assignment_status="ASSIGNED"),
+            RouteVersion(route_version_id="V1-COMPARE", job_id="JOB-COMPARE", version_number=1, version_label="V1", reason="Initial", state_snapshot_id="STATE-1", parameter_snapshot_id="PARAM-1", objective="MIN_TOTAL_COST", solver_status="FEASIBLE"),
+        ])
+        db.flush()
+        db.add(RouteVersionTrip(route_version_trip_id="V1-T1", route_version_id="V1-COMPARE", vehicle_id="M2", trip_number=1, shipment_id="V1-SHIP-A", vehicle_ready_at_depot=DAY_START, gate_out=DAY_START + timedelta(hours=1, minutes=30), estimated_return_depot=DAY_START + timedelta(hours=4)))
+        db.flush()
+        db.add_all([
+            RouteVersionLOAssignment(route_version_lo_assignment_id="V1-A1", route_version_id="V1-COMPARE", route_version_trip_id="V1-T1", loading_order_id="LO-1", vehicle_id="M2", trip_number=1, shipment_id="V1-SHIP-A", spbu_id="S1", product_id="P1", volume_kl=8, planned_gate_out=DAY_START + timedelta(hours=1, minutes=30), assignment_status="PLANNED"),
+            RouteVersionLOAssignment(route_version_lo_assignment_id="V1-A2", route_version_id="V1-COMPARE", loading_order_id="LO-2", spbu_id="S2", product_id="P1", volume_kl=8, assignment_status="DROPPED", dropped_reason_code="NO_COMPATIBLE_MT"),
+            RouteVersionLOAssignment(route_version_lo_assignment_id="V1-A3", route_version_id="V1-COMPARE", route_version_trip_id="V1-T1", loading_order_id="LO-3", vehicle_id="M2", trip_number=1, shipment_id="V1-SHIP-A", spbu_id="S1", product_id="P1", volume_kl=8, planned_gate_out=DAY_START + timedelta(hours=1, minutes=30), assignment_status="PLANNED"),
+        ])
+        db.commit()
+
+        payload = get_lo_comparison(db, "JOB-COMPARE", "PHASE6", "V1-COMPARE")
+
+        assert payload["source_a"]["label"] == "Phase 6 · PRED-TEST"
+        assert payload["source_b"]["label"] == "Phase 7 · V1"
+        assert payload["summary"] == {
+            "total_lo_a": 2,
+            "total_lo_b": 3,
+            "union_lo_count": 3,
+            "common_lo_count": 2,
+            "only_a_count": 0,
+            "only_b_count": 1,
+            "assigned_lo_a": 2,
+            "assigned_lo_b": 2,
+            "dropped_or_unassigned_a": 0,
+            "dropped_or_unassigned_b": 1,
+            "same_mt_count": 0,
+            "changed_mt_count": 1,
+            "comparable_mt_count": 1,
+            "mt_change_pct": 100.0,
+            "gate_out_changed_count": 1,
+            "average_abs_gate_out_delta_minutes": 30.0,
+            "eta_depot_changed_count": 1,
+            "average_abs_eta_depot_delta_minutes": 60.0,
+        }
+        rows = {row["loading_order_id"]: row for row in payload["rows"]}
+        assert rows["LO-1"]["a"]["mt_registration"] == "BK 1001 AA"
+        assert rows["LO-1"]["b"]["mt_registration"] == "BK 1002 AA"
+        assert rows["LO-1"]["gate_out_delta_minutes"] == 30
+        assert rows["LO-1"]["eta_depot_delta_minutes"] == 60
+        assert rows["LO-2"]["b"]["status"] == "DROPPED"
+        assert rows["LO-3"]["a"]["present"] is False
+
+        with pytest.raises(HTTPException) as raised:
+            get_lo_comparison(db, "JOB-COMPARE", "PHASE6", "PHASE6")
+        assert raised.value.status_code == 422
 
 
 def test_enqueue_optimization_reserves_job_and_rejects_duplicate(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -333,6 +443,60 @@ def test_optimization_requires_planned_eta_at_or_after_reference_time(
             assert db.get(OptimizationJob, "JOB-ETA").status != "CALCULATING"
 
 
+def test_enqueue_requires_acknowledgement_when_route_limit_is_below_recommendation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    recommendation = route_time_limit_recommendation(675, 206, 30)
+    monkeypatch.setattr(
+        phase7_service,
+        "validate_job",
+        lambda *_args, **_kwargs: {
+            "status": "WARNING",
+            "messages": [],
+            "route_time_limit_recommendation": recommendation,
+        },
+    )
+    with Session() as db:
+        db.add(MasterDepot(depot_id="D1", depot_name="Depot 1", timezone="Asia/Jakarta"))
+        db.add(MasterMT(mt_id="M-LIMIT", vehicle_name_raw="MT Limit", vehicle_registration="BK 3000 AA", depot_id="D1"))
+        db.add(OptimizationJob(job_id="JOB-LIMIT", job_no="P7-JOB-LIMIT", job_name="Limit", depot_id="D1", operating_date=date(2026, 8, 26)))
+        db.flush()
+        db.add(VehicleOperationalState(
+            vehicle_state_id="VS-LIMIT",
+            job_id="JOB-LIMIT",
+            mt_id="M-LIMIT",
+            registration_snapshot="BK 3000 AA",
+            planned_eta_depot=datetime(2026, 8, 26, 1, 0, tzinfo=timezone.utc),
+        ))
+        db.commit()
+
+        with pytest.raises(HTTPException) as raised:
+            phase7_service.enqueue_optimization(
+                db,
+                "JOB-LIMIT",
+                {"current_time": "2026-08-26T08:00:00", "parameters": {"route_optimization_time_limit": 30}},
+                reroute=False,
+            )
+        assert raised.value.status_code == 422
+        assert raised.value.detail["code"] == "ROUTE_TIME_LIMIT_CONFIRMATION_REQUIRED"
+        assert db.get(OptimizationJob, "JOB-LIMIT").status != "CALCULATING"
+
+        accepted = phase7_service.enqueue_optimization(
+            db,
+            "JOB-LIMIT",
+            {
+                "current_time": "2026-08-26T08:00:00",
+                "parameters": {"route_optimization_time_limit": 30},
+                "route_time_limit_confirmed": True,
+            },
+            reroute=False,
+        )
+        assert accepted["status"] == "CALCULATING"
+
+
 def test_delete_bay_soft_deletes_master_without_exposing_it_in_configuration() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     Base.metadata.create_all(engine)
@@ -433,6 +597,90 @@ def test_a_phase6_warm_start_is_soft_and_can_reassign_when_preferred_mt_is_too_l
     )
     assert result["trips"][0]["vehicle_id"] == "M2"
     assert result["trips"][0]["lo_assignments"][0]["phase6_predicted_vehicle_id"] == "M1"
+
+
+def test_reroute_warm_start_uses_the_next_trip_from_the_current_route_version() -> None:
+    m1 = vehicle("M1")
+    m1["completed_trip_count"] = 1
+    m2 = vehicle("M2")
+    current_rows = [
+        {
+            **loading_order("LO-M1-T2-B", "S2", allowed=["M1"]),
+            "current_vehicle_id": "M1",
+            "current_trip_number": 2,
+            "current_stop_sequence": 2,
+        },
+        {
+            **loading_order("LO-M1-T2-A", "S1", allowed=["M1"]),
+            "current_vehicle_id": "M1",
+            "current_trip_number": 2,
+            "current_stop_sequence": 1,
+        },
+        {
+            **loading_order("LO-M1-T3", "S3", allowed=["M1"]),
+            "current_vehicle_id": "M1",
+            "current_trip_number": 3,
+            "current_stop_sequence": 1,
+        },
+        loading_order("LO-NEW", "S4", allowed=["M1", "M2"]),
+    ]
+
+    routes, seeded_count = VRPOptimizationService._build_warm_routes(
+        current_rows,
+        [m1, m2],
+        source="CURRENT_ROUTE",
+    )
+
+    assert routes == [[2, 1], []]
+    assert seeded_count == 2
+
+    # After Trip 2 has become completed/current, the next optimization round
+    # seeds Trip 3. Newly added LO remains available to the optimizer but is
+    # not falsely presented as part of the previous immutable route.
+    m1["completed_trip_count"] = 2
+    routes, seeded_count = VRPOptimizationService._build_warm_routes(
+        current_rows,
+        [m1, m2],
+        source="CURRENT_ROUTE",
+    )
+    assert routes == [[3], []]
+    assert seeded_count == 1
+
+
+def test_reroute_hard_freeze_retains_current_mt_and_relative_stop_sequence() -> None:
+    second_stop = {
+        **loading_order("LO-SECOND", "S2", allowed=["M1", "M2"]),
+        "current_vehicle_id": "M1",
+        "current_trip_number": 1,
+        "current_stop_sequence": 2,
+        "reroute_assignment_locked": True,
+    }
+    first_stop = {
+        **loading_order("LO-FIRST", "S1", allowed=["M1", "M2"]),
+        "current_vehicle_id": "M1",
+        "current_trip_number": 1,
+        "current_stop_sequence": 1,
+        "reroute_assignment_locked": True,
+    }
+    result = VRPOptimizationService().solve(
+        loading_orders=[second_stop, first_stop],
+        vehicles=[vehicle("M1", capacity=16, compartments=2), vehicle("M2", capacity=16, compartments=2)],
+        distance_matrix=[[0, 1_000, 1_000], [1_000, 0, 1_000], [1_000, 1_000, 0]],
+        time_matrix=[[0, 600, 600], [600, 0, 600], [600, 600, 0]],
+        day_start=DAY_START,
+        depot_close=DAY_START + timedelta(hours=18),
+        parameters=parameters(route_warm_start_source="CURRENT_ROUTE", route_warm_start_version_id="V1"),
+    )
+
+    assert result["solver_status"] in {"OPTIMAL", "FEASIBLE"}
+    assert len(result["trips"]) == 1
+    assert result["trips"][0]["vehicle_id"] == "M1"
+    assert [stop["loading_order"]["loading_order_id"] for stop in result["trips"][0]["stops"]] == [
+        "LO-FIRST",
+        "LO-SECOND",
+    ]
+    assert result["solver_metadata"]["route_warm_start_source"] == "CURRENT_ROUTE"
+    assert result["solver_metadata"]["route_warm_start_version_id"] == "V1"
 
 
 def test_b_one_compartment_one_product_rejects_mixed_product() -> None:
@@ -587,6 +835,175 @@ def test_g_done_lo_is_permanently_excluded_from_reoptimizable_set() -> None:
     reoptimizable = [item for item in rows if item.status == "PLANNED" and not item.frozen]
     assert row.frozen is True
     assert reoptimizable == []
+
+
+def test_reroute_inputs_lock_early_mt_release_late_mt_and_copy_only_executed_trip() -> None:
+    engine = create_engine(
+        "sqlite+pysqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, autoflush=False)
+    with Session() as db:
+        db.add(
+            MasterDepot(
+                depot_id="D1",
+                depot_name="Depot",
+                timezone="UTC",
+                depot_operational_start=time(0),
+                depot_operational_end=time(23, 59),
+            )
+        )
+        db.add(
+            MasterSPBU(
+                spbu_id="S1",
+                spbu_code="S1",
+                spbu_name="SPBU",
+                primary_depot_id="D1",
+                vehicle_type_tag=8,
+                official_window_start=time(0),
+                official_window_end=time(23, 59),
+            )
+        )
+        for mt_id in ("MT-EARLY", "MT-LATE", "MT-ONGOING"):
+            db.add(
+                MasterMT(
+                    mt_id=mt_id,
+                    vehicle_name_raw=mt_id,
+                    vehicle_registration=mt_id,
+                    depot_id="D1",
+                    vehicle_type_tag=8,
+                    number_of_compartments=1,
+                )
+            )
+        job = OptimizationJob(
+            job_id="JOB-1",
+            job_no="P7-JOB-1",
+            job_name="Reroute",
+            depot_id="D1",
+            operating_date=date(2026, 8, 26),
+            current_route_version_id="V1",
+            depot_operational_start=time(0),
+            depot_operational_end=time(23, 59),
+        )
+        db.add(job)
+        db.flush()
+
+        vehicle_eta = {
+            "MT-EARLY": DAY_START + timedelta(hours=6, minutes=30),
+            "MT-LATE": DAY_START + timedelta(hours=8),
+            "MT-ONGOING": DAY_START + timedelta(hours=9),
+        }
+        for mt_id, eta in vehicle_eta.items():
+            db.add(
+                VehicleOperationalState(
+                    vehicle_state_id=f"VS-{mt_id}",
+                    job_id=job.job_id,
+                    mt_id=mt_id,
+                    registration_snapshot=mt_id,
+                    vehicle_class=8,
+                    capacity_kl=8,
+                    number_of_compartments=1,
+                    compartment_configuration=[{"compartment_id": "C1", "capacity_kl": 8}],
+                    planned_eta_depot=eta,
+                    effective_eta_depot=eta,
+                    operational_status="READY",
+                )
+            )
+
+        lo_specs = [
+            ("LO-EARLY", "MT-EARLY", "PLANNED", DAY_START + timedelta(hours=7)),
+            ("LO-LATE", "MT-LATE", "PLANNED", DAY_START + timedelta(hours=7)),
+            ("LO-ONGOING", "MT-ONGOING", "ONGOING", DAY_START + timedelta(hours=5)),
+        ]
+        for index, (lo_id, mt_id, status, gate_out) in enumerate(lo_specs, start=1):
+            trip_id = f"TRIP-{lo_id}"
+            db.add(
+                LOOperationalState(
+                    lo_state_id=f"STATE-{lo_id}",
+                    job_id=job.job_id,
+                    loading_order_id=lo_id,
+                    spbu_id="S1",
+                    spbu_name_snapshot="SPBU",
+                    volume_kl=8,
+                    depot_id="D1",
+                    operating_date=job.operating_date,
+                    source_prediction_run_id="P6-1",
+                    phase6_predicted_vehicle_id=mt_id,
+                    current_vehicle_id=mt_id,
+                    current_trip_number=1,
+                    current_shipment_id=f"SHIP-{index}",
+                    planned_gate_out=gate_out,
+                    status=status,
+                )
+            )
+            db.add(
+                RouteVersionTrip(
+                    route_version_trip_id=trip_id,
+                    route_version_id="V1",
+                    vehicle_id=mt_id,
+                    trip_number=1,
+                    shipment_id=f"SHIP-{index}",
+                    vehicle_ready_at_depot=gate_out - timedelta(minutes=20),
+                    queue_start=gate_out - timedelta(minutes=20),
+                    loading_start=gate_out - timedelta(minutes=15),
+                    loading_finish=gate_out - timedelta(minutes=5),
+                    gate_out=gate_out,
+                    estimated_return_depot=gate_out + timedelta(hours=1),
+                    operating_minutes=80,
+                )
+            )
+            db.add(
+                RouteVersionLOAssignment(
+                    route_version_lo_assignment_id=f"ASSIGN-{lo_id}",
+                    route_version_id="V1",
+                    route_version_trip_id=trip_id,
+                    loading_order_id=lo_id,
+                    vehicle_id=mt_id,
+                    trip_number=1,
+                    shipment_id=f"SHIP-{index}",
+                    spbu_id="S1",
+                    volume_kl=8,
+                    stop_sequence=1,
+                )
+            )
+        db.commit()
+
+        inputs = phase7_service._solver_inputs(
+            db,
+            job,
+            parameters(freeze_window_minutes=60, departure_time_tolerance_minutes=5),
+            current_time=DAY_START + timedelta(hours=6),
+            reroute=True,
+        )
+
+        payload_by_lo = {row["loading_order_id"]: row for row in inputs["loading_orders"]}
+        assert inputs["route_warm_start_source"] == "CURRENT_ROUTE"
+        assert inputs["route_warm_start_version_id"] == "V1"
+        assert inputs["copy_frozen_loading_order_ids"] == ["LO-ONGOING"]
+        assert payload_by_lo["LO-EARLY"]["reroute_assignment_locked"] is True
+        assert payload_by_lo["LO-EARLY"]["reroute_release_reason"] is None
+        assert payload_by_lo["LO-EARLY"]["allowed_vehicle_ids"] == ["MT-EARLY"]
+        assert payload_by_lo["LO-LATE"]["reroute_assignment_locked"] is False
+        assert payload_by_lo["LO-LATE"]["reroute_release_reason"] == "MT_LATE"
+        assert set(payload_by_lo["LO-LATE"]["allowed_vehicle_ids"]) == {
+            "MT-EARLY",
+            "MT-LATE",
+            "MT-ONGOING",
+        }
+        completed_by_mt = {row["mt_id"]: row["completed_trip_count"] for row in inputs["vehicles"]}
+        assert completed_by_mt == {"MT-EARLY": 0, "MT-LATE": 0, "MT-ONGOING": 1}
+        working_by_mt = {
+            row["mt_id"]: (row["working_time_used_minutes"], row["working_time_remaining_minutes"])
+            for row in inputs["vehicles"]
+        }
+        assert working_by_mt == {
+            "MT-EARLY": (0, 720),
+            "MT-LATE": (0, 720),
+            # The current trip started at 04:40 and dispatcher ETA is 09:00.
+            "MT-ONGOING": (260, 460),
+        }
 
 
 def test_h_bay_product_compatibility_is_hard() -> None:
@@ -1156,6 +1573,102 @@ def test_coordinator_reassigns_post_bay_working_failure_using_actual_retained_st
     assert result["solver_metadata"]["post_bay_reassignment_exhausted_lo_count"] == 0
 
 
+def test_coordinator_reassigns_bay_window_failure_to_unused_compatible_mt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    loading_order = {
+        "loading_order_id": "LO-BAY-RETRY",
+        "spbu_id": "SPBU-1",
+        "product_id": "P1",
+        "volume_kl": 8,
+        "allowed_vehicle_ids": ["MT-LATE", "MT-UNUSED"],
+    }
+    late_trip = {
+        "vehicle_id": "MT-LATE",
+        "trip_number": 1,
+        "vehicle_ready_at_depot": DAY_START + timedelta(hours=17, minutes=50),
+        "preliminary_gate_out": DAY_START + timedelta(hours=17, minutes=50),
+        "gate_out": DAY_START + timedelta(hours=17, minutes=50),
+        "estimated_return_depot": DAY_START + timedelta(hours=19),
+        "operating_minutes": 70,
+        "constraint_violations": [],
+        "constraint_penalty_cost": 0,
+        "lo_assignments": [{**loading_order, "compartment_id": "C1"}],
+    }
+    repaired_trip = {
+        "vehicle_id": "MT-UNUSED",
+        "trip_number": 1,
+        "vehicle_ready_at_depot": DAY_START,
+        "preliminary_gate_out": DAY_START,
+        "gate_out": DAY_START,
+        "estimated_return_depot": DAY_START + timedelta(minutes=70),
+        "operating_minutes": 70,
+        "constraint_violations": [],
+        "constraint_penalty_cost": 0,
+        "lo_assignments": [{**loading_order, "allowed_vehicle_ids": ["MT-UNUSED"], "compartment_id": "C1"}],
+    }
+    coordinator = OptimizationCoordinatorService()
+    solve_calls = 0
+
+    def fake_solve(**kwargs: object) -> dict:
+        nonlocal solve_calls
+        solve_calls += 1
+        trips = [late_trip] if solve_calls == 1 else [repaired_trip]
+        if solve_calls == 2:
+            assert [row["mt_id"] for row in kwargs["vehicles"]] == ["MT-UNUSED"]  # type: ignore[index]
+        return {
+            "solver_status": "FEASIBLE",
+            "objective_value": 0,
+            "trips": trips,
+            "dropped": [],
+            "vehicle_state": [],
+            "solver_metadata": {},
+        }
+
+    monkeypatch.setattr(coordinator.vrp, "solve", fake_solve)
+    vehicle_defaults = {
+        "capacity_kl": 8,
+        "compartments": [{"compartment_id": "C1", "capacity_kl": 8}],
+        "working_time_limit_minutes": 600,
+        "working_time_used_minutes": 0,
+        "working_time_remaining_minutes": 600,
+        "completed_trip_count": 0,
+        "operational_status": "READY",
+    }
+    result = coordinator.optimize(
+        loading_orders=[loading_order],
+        vehicles=[
+            {**vehicle_defaults, "mt_id": "MT-LATE", "effective_eta_depot": DAY_START + timedelta(hours=17, minutes=50)},
+            {**vehicle_defaults, "mt_id": "MT-UNUSED", "effective_eta_depot": DAY_START},
+        ],
+        distance_matrix=[[0, 1], [1, 0]],
+        time_matrix=[[0, 60], [60, 0]],
+        bays=[{
+            "master_bay_id": "B1",
+            "all_products_allowed": True,
+            "allowed_product_ids": [],
+            "number_of_loading_arms": 1,
+            "loading_mode": "SEQUENTIAL",
+            "operational_start_minutes": 0,
+            "operational_end_minutes": 18 * 60,
+        }],
+        actual_bay_states=[],
+        initial_queue=[],
+        loading_durations={"P1": 10},
+        day_start=DAY_START,
+        depot_close=DAY_START + timedelta(hours=18),
+        parameters=parameters(route_optimization_time_limit=10, bay_optimization_time_limit=10),
+    )
+
+    assert solve_calls == 2
+    assert result["solver_status"] == "FEASIBLE"
+    assert result["dropped"] == []
+    assert result["trips"][0]["vehicle_id"] == "MT-UNUSED"
+    assert result["solver_metadata"]["post_bay_reassigned_lo_count"] == 1
+    assert result["solver_metadata"]["post_bay_candidate_audit"][-1]["status"] == "ACCEPTED"
+    assert result["solver_metadata"]["post_bay_candidate_audit"][-1]["candidate_mt_id"] == "MT-UNUSED"
+
+
 def test_coordinator_drops_post_bay_lo_only_after_all_alternative_mt_are_exhausted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1319,6 +1832,100 @@ def test_k1_system_eta_is_empty_when_mt_is_first_loaded_before_v1() -> None:
 
         assert result["vehicles"][0]["system_eta_depot"] is None
         assert db.scalar(select(VehicleOperationalState).where(VehicleOperationalState.mt_id == "M1")).system_eta_depot is None
+
+
+def test_k1a_lo_system_eta_is_trip_specific_and_mt_delivery_status_follows_lo_state() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as db:
+        db.add(MasterDepot(depot_id="D1", depot_name="Depot 1"))
+        db.add(MasterSPBU(spbu_id="S1", spbu_code="S1", spbu_name="SPBU 1"))
+        db.add_all([
+            MasterMT(mt_id="M1", vehicle_name_raw="MT 1", vehicle_registration="BL 1", depot_id="D1"),
+            MasterMT(mt_id="M2", vehicle_name_raw="MT 2", vehicle_registration="BL 2", depot_id="D1"),
+            MasterMT(mt_id="M3", vehicle_name_raw="MT 3", vehicle_registration="BL 3", depot_id="D1"),
+            MasterMT(mt_id="M4", vehicle_name_raw="MT 4", vehicle_registration="BL 4", depot_id="D1"),
+        ])
+        job = OptimizationJob(
+            job_id="JOB-1",
+            job_no="P7-JOB-1",
+            job_name="Job",
+            depot_id="D1",
+            operating_date=date(2026, 8, 26),
+        )
+        db.add(job)
+        db.add_all([
+            OperationalStateSnapshot(state_snapshot_id="STATE-1", job_id="JOB-1", snapshot_reason="Initial"),
+            OptimizationParameterSnapshot(parameter_snapshot_id="PARAM-1", job_id="JOB-1", effective_parameters={}, parameter_checksum="a"),
+        ])
+        db.flush()
+        db.add(RouteVersion(
+            route_version_id="V1",
+            job_id="JOB-1",
+            version_number=1,
+            version_label="V1",
+            reason="Initial",
+            state_snapshot_id="STATE-1",
+            parameter_snapshot_id="PARAM-1",
+            objective="MIN_TOTAL_COST",
+            solver_status="FEASIBLE",
+        ))
+        db.flush()
+        trip_1_return = DAY_START + timedelta(hours=8)
+        trip_2_return = DAY_START + timedelta(hours=12)
+        m2_ongoing_return = DAY_START + timedelta(hours=10)
+        db.add_all([
+            RouteVersionTrip(route_version_trip_id="T1", route_version_id="V1", vehicle_id="M1", trip_number=1, shipment_id="SHIP-1", vehicle_ready_at_depot=DAY_START, gate_out=DAY_START + timedelta(hours=6), estimated_return_depot=trip_1_return),
+            RouteVersionTrip(route_version_trip_id="T2", route_version_id="V1", vehicle_id="M1", trip_number=2, shipment_id="SHIP-2", vehicle_ready_at_depot=trip_1_return, gate_out=DAY_START + timedelta(hours=9), estimated_return_depot=trip_2_return),
+            RouteVersionTrip(route_version_trip_id="T3", route_version_id="V1", vehicle_id="M2", trip_number=2, shipment_id="SHIP-4", vehicle_ready_at_depot=DAY_START, gate_out=DAY_START + timedelta(hours=7), estimated_return_depot=m2_ongoing_return),
+        ])
+        db.flush()
+        db.add_all([
+            RouteVersionLOAssignment(route_version_lo_assignment_id="A1", route_version_id="V1", route_version_trip_id="T1", loading_order_id="LO-1", vehicle_id="M1", trip_number=1, shipment_id="SHIP-1", spbu_id="S1", volume_kl=8, assignment_status="DONE"),
+            RouteVersionLOAssignment(route_version_lo_assignment_id="A2", route_version_id="V1", route_version_trip_id="T2", loading_order_id="LO-2", vehicle_id="M1", trip_number=2, shipment_id="SHIP-2", spbu_id="S1", volume_kl=8, assignment_status="PLANNED"),
+            RouteVersionLOAssignment(route_version_lo_assignment_id="A4", route_version_id="V1", route_version_trip_id="T3", loading_order_id="LO-4", vehicle_id="M2", trip_number=2, shipment_id="SHIP-4", spbu_id="S1", volume_kl=8, assignment_status="ONGOING"),
+        ])
+        for mt_id in ["M1", "M2", "M3", "M4"]:
+            db.add(VehicleOperationalState(vehicle_state_id=f"VS-{mt_id}", job_id="JOB-1", mt_id=mt_id, registration_snapshot=f"BL {mt_id[-1]}", capacity_kl=8, number_of_compartments=1, compartment_configuration=[{"compartment_id": "C1", "capacity_kl": 8}], system_eta_depot=DAY_START + timedelta(hours=20)))
+        lo_rows = [
+            ("LO-1", "M1", 1, "DONE"),
+            ("LO-2", "M1", 2, "PLANNED"),
+            ("LO-3", "M2", 1, "DONE"),
+            ("LO-4", "M2", 2, "ONGOING"),
+            ("LO-5", "M3", 1, "PLANNED"),
+        ]
+        for lo_id, mt_id, trip_number, status in lo_rows:
+            db.add(LOOperationalState(
+                lo_state_id=f"STATE-{lo_id}",
+                job_id="JOB-1",
+                loading_order_id=lo_id,
+                spbu_id="S1",
+                volume_kl=8,
+                depot_id="D1",
+                operating_date=date(2026, 8, 26),
+                source_prediction_run_id="P6-1",
+                current_vehicle_id=mt_id,
+                current_trip_number=trip_number,
+                status=status,
+            ))
+        job.current_route_version_id = "V1"
+        db.commit()
+
+        los = {row["loading_order_id"]: row for row in phase7_service.list_job_los(db, "JOB-1")}
+        vehicles = {row["mt_id"]: row for row in phase7_service.list_job_vehicles(db, "JOB-1")}
+
+        assert los["LO-1"]["system_eta_depot"] == trip_1_return.isoformat()
+        assert los["LO-2"]["system_eta_depot"] == trip_2_return.isoformat()
+        assert los["LO-3"]["system_eta_depot"] is None
+        assert vehicles["M1"]["delivery_status"] == "DONE"
+        assert vehicles["M2"]["delivery_status"] == "ONGOING"
+        assert vehicles["M3"]["delivery_status"] == "PLANNED"
+        assert vehicles["M4"]["delivery_status"] == "PLANNED"
+        assert vehicles["M1"]["system_eta_depot"] is None
+        assert vehicles["M2"]["system_eta_depot"] == m2_ongoing_return.isoformat()
+        assert vehicles["M3"]["system_eta_depot"] is None
+        assert vehicles["M4"]["system_eta_depot"] is None
 
 
 def test_k2_initial_completion_publishes_first_trip_return_and_clears_planned_eta() -> None:
@@ -1969,13 +2576,23 @@ def test_v_copy_frozen_plan_flushes_parent_trip_and_bay_before_dependents() -> N
         job.current_route_version_id = "V1"
         db.commit()
 
-        frozen = lo_state("LO-1", status="PLANNED")
+        frozen = lo_state("LO-1", status="ONGOING")
         frozen.frozen = True
-        copied_trips, copied_ids = _copy_frozen_plan(db, job, v2, [frozen])
+        actual_return = DAY_START + timedelta(hours=2)
+        copied_trips, copied_ids = _copy_frozen_plan(
+            db,
+            job,
+            v2,
+            [frozen],
+            ongoing_return_by_mt={"M1": actual_return},
+        )
         db.flush()
 
         assert copied_ids == {"LO-1"}
         assert len(copied_trips) == 1
+        assert phase7_service._utc(copied_trips[0].estimated_return_depot) == actual_return
+        assert copied_trips[0].operating_minutes == 120
+        assert copied_trips[0].cost_breakdown["actual_state_adjustment"]["source"] == "REROUTE_PLANNED_ETA_DEPOT"
         copied_trip_id = copied_trips[0].route_version_trip_id
         assert db.get(RouteVersionTrip, copied_trip_id) is not None
         copied_bay = db.scalar(

@@ -35,10 +35,11 @@ import { apiGet, apiSend } from "../lib/api";
 
 type Depot = { depot_id: string; depot_code: string | null; depot_name: string };
 type Product = { product_id: string; product_name: string; active_status?: string };
-type Phase7Tab = "overview" | "lo" | "mt" | "bay" | "parameter" | "route" | "simulation" | "map" | "cost" | "versions";
+type Phase7Tab = "overview" | "lo" | "mt" | "bay" | "parameter" | "route" | "comparison" | "simulation" | "map" | "cost" | "versions";
 type JobSortKey = "job_no" | "job_name" | "operating_date" | "depot" | "total_lo" | "total_mt" | "current_route_version" | "status" | "last_updated";
-type LOSortKey = "loading_order_id" | "spbu" | "product" | "volume_kl" | "phase6_shipment" | "phase6_mt" | "current_mt" | "trip" | "planned_gate_out" | "status" | "frozen";
-type MTSortKey = "registration" | "class_tags" | "capacity_kl" | "compartments" | "planned_eta" | "system_eta" | "effective_eta" | "status" | "working_time";
+type LOSortKey = "loading_order_id" | "spbu" | "product" | "volume_kl" | "phase6_shipment" | "phase6_mt" | "current_mt" | "trip" | "planned_gate_out" | "system_eta_depot" | "status" | "frozen";
+type MTSortKey = "registration" | "class_tags" | "capacity_kl" | "compartments" | "planned_eta" | "system_eta" | "effective_eta" | "delivery_status" | "status" | "working_time";
+type ComparisonSortKey = "loading_order_id" | "spbu" | "product" | "mt_a" | "mt_b" | "gate_out_a" | "gate_out_b" | "eta_a" | "eta_b" | "delta";
 type JobSummary = {
   job_id: string;
   job_no: string;
@@ -113,6 +114,7 @@ type LoadingOrder = {
   current_trip: number | null;
   current_compartment: string | null;
   planned_gate_out: string | null;
+  system_eta_depot: string | null;
   status: "PLANNED" | "ONGOING" | "DONE";
   frozen: boolean;
   frozen_reason: string | null;
@@ -129,6 +131,7 @@ type Vehicle = {
   system_eta_depot: string | null;
   effective_eta_depot: string | null;
   operational_status: string;
+  delivery_status: "PLANNED" | "ONGOING" | "DONE";
   working_time_used: number;
   working_time_remaining: number;
   working_time_limit: number;
@@ -248,6 +251,68 @@ type RouteVersion = {
   trips: RouteTrip[];
   dropped_lo: Array<Record<string, string | number | null>>;
 };
+type ComparisonSource = {
+  source_id: string;
+  source_type: "PHASE6" | "PHASE7";
+  label: string;
+  prediction_run_id: string | null;
+  prediction_run_no: string | null;
+  version_number: number | null;
+  version_label: string | null;
+  created_at: string | null;
+};
+type ComparisonSide = {
+  present: boolean;
+  mt_id: string | null;
+  mt_registration: string | null;
+  trip_number: number | null;
+  shipment_id: string | null;
+  gate_out: string | null;
+  eta_depot: string | null;
+  status: string;
+  dropped_reason_code: string | null;
+};
+type ComparisonRow = {
+  loading_order_id: string;
+  spbu_id: string | null;
+  spbu_name: string | null;
+  product_id: string | null;
+  product_name: string | null;
+  volume_kl: number;
+  a: ComparisonSide;
+  b: ComparisonSide;
+  mt_changed: boolean;
+  gate_out_delta_minutes: number | null;
+  eta_depot_delta_minutes: number | null;
+};
+type ComparisonSummary = {
+  total_lo_a: number;
+  total_lo_b: number;
+  union_lo_count: number;
+  common_lo_count: number;
+  only_a_count: number;
+  only_b_count: number;
+  assigned_lo_a: number;
+  assigned_lo_b: number;
+  dropped_or_unassigned_a: number;
+  dropped_or_unassigned_b: number;
+  same_mt_count: number;
+  changed_mt_count: number;
+  comparable_mt_count: number;
+  mt_change_pct: number;
+  gate_out_changed_count: number;
+  average_abs_gate_out_delta_minutes: number;
+  eta_depot_changed_count: number;
+  average_abs_eta_depot_delta_minutes: number;
+};
+type LOComparison = {
+  job_id: string;
+  available_sources: ComparisonSource[];
+  source_a: ComparisonSource;
+  source_b: ComparisonSource;
+  summary: ComparisonSummary;
+  rows: ComparisonRow[];
+};
 type MapRoadGeometryTrip = {
   route_version_trip_id: string;
   vehicle_id: string;
@@ -280,6 +345,22 @@ type OptimizationDialog = {
   reroute: boolean;
   date: string;
   time: string;
+  routeTimeLimitConfirmed: boolean;
+};
+type RouteTimeLimitRecommendation = {
+  lo_count: number;
+  mt_count: number;
+  estimated_lo_per_mt: number;
+  configured_seconds: number;
+  recommended_minimum_seconds: number;
+  below_recommendation: boolean;
+  requires_confirmation: boolean;
+  calculation_basis: string;
+};
+type ValidationResult = {
+  status: string;
+  messages: Array<{ code: string; level: string; message: string }>;
+  route_time_limit_recommendation: RouteTimeLimitRecommendation;
 };
 
 
@@ -290,6 +371,7 @@ const tabs: Array<{ id: Phase7Tab; label: string; icon: typeof Route }> = [
   { id: "bay", label: "Bay Management", icon: Warehouse },
   { id: "parameter", label: "Parameter", icon: Settings2 },
   { id: "route", label: "Route Plan", icon: Route },
+  { id: "comparison", label: "Comparison", icon: GitCompareArrows },
   { id: "simulation", label: "Simulation", icon: CalendarClock },
   { id: "map", label: "Geographic Map", icon: MapPinned },
   { id: "cost", label: "Cost & Dropped LO", icon: CircleDollarSign },
@@ -300,6 +382,13 @@ const tabs: Array<{ id: Phase7Tab; label: string; icon: typeof Route }> = [
 function displayDateTime(value: string | null | undefined, timeZone?: string): string {
   if (!value) return "—";
   return new Intl.DateTimeFormat("id-ID", { dateStyle: "medium", timeStyle: "short", timeZone }).format(new Date(value));
+}
+
+
+function displayMinuteDelta(value: number | null): string {
+  if (value === null) return "—";
+  if (value === 0) return "0 min";
+  return `${value > 0 ? "+" : ""}${value} min`;
 }
 
 
@@ -715,9 +804,10 @@ export function Phase7OptimizationPage({ depots, products }: { depots: Depot[]; 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [validation, setValidation] = useState<{ status: string; messages: Array<{ code: string; level: string; message: string }> } | null>(null);
+  const [validation, setValidation] = useState<ValidationResult | null>(null);
   const [readinessOpen, setReadinessOpen] = useState(false);
   const [selectedMT, setSelectedMT] = useState("");
+  const [routeMTSearch, setRouteMTSearch] = useState("");
   const [selectedTrip, setSelectedTrip] = useState<number | "ALL">("ALL");
   const [routeMTPage, setRouteMTPage] = useState(1);
   const [routeMTPerPage, setRouteMTPerPage] = useState(5);
@@ -728,6 +818,13 @@ export function Phase7OptimizationPage({ depots, products }: { depots: Depot[]; 
   const [routeLOFilter, setRouteLOFilter] = useState("");
   const [routeSPBUFilter, setRouteSPBUFilter] = useState("");
   const [routeProductFilter, setRouteProductFilter] = useState("");
+  const [comparisonSourceA, setComparisonSourceA] = useState("");
+  const [comparisonSourceB, setComparisonSourceB] = useState("");
+  const [comparisonResult, setComparisonResult] = useState<LOComparison | null>(null);
+  const [comparisonSearch, setComparisonSearch] = useState("");
+  const [comparisonSort, setComparisonSort] = useState<{ key: ComparisonSortKey; direction: "asc" | "desc" }>({ key: "loading_order_id", direction: "asc" });
+  const [comparisonPage, setComparisonPage] = useState(1);
+  const [comparisonPerPage, setComparisonPerPage] = useState(25);
 
   async function loadJobs(depotId: string) {
     if (!depotId) { setJobs([]); return; }
@@ -826,7 +923,13 @@ export function Phase7OptimizationPage({ depots, products }: { depots: Depot[]; 
   const selectedRun = predictionRuns.find((row) => row.id === selectedPredictionRun || row.run_id === selectedPredictionRun);
   const selectedProfileRow = profiles.find((row) => row.profile_id === selectedProfile);
   const routeVehicleOptions = useMemo(() => Array.from(new Map((routeVersion?.trips || []).map((row) => [row.vehicle_id, row.registration || row.vehicle_id])).entries()).sort((left, right) => left[1].localeCompare(right[1], "id-ID", { numeric: true, sensitivity: "base" })), [routeVersion]);
-  const routeFilteredVehicleOptions = useMemo(() => selectedMT ? routeVehicleOptions.filter(([vehicleId]) => vehicleId === selectedMT) : routeVehicleOptions, [routeVehicleOptions, selectedMT]);
+  const routeFilteredVehicleOptions = useMemo(() => {
+    const query = routeMTSearch.trim().toLocaleLowerCase("id-ID");
+    return routeVehicleOptions.filter(([vehicleId, registration]) =>
+      (!selectedMT || vehicleId === selectedMT)
+      && (!query || `${vehicleId} ${registration}`.toLocaleLowerCase("id-ID").includes(query)),
+    );
+  }, [routeMTSearch, routeVehicleOptions, selectedMT]);
   const routeMTPageCount = Math.max(1, Math.ceil(routeFilteredVehicleOptions.length / routeMTPerPage));
   const pagedRouteVehicleOptions = routeFilteredVehicleOptions.slice((routeMTPage - 1) * routeMTPerPage, routeMTPage * routeMTPerPage);
   const routeMTRangeStart = routeFilteredVehicleOptions.length ? (routeMTPage - 1) * routeMTPerPage + 1 : 0;
@@ -935,7 +1038,7 @@ export function Phase7OptimizationPage({ depots, products }: { depots: Depot[]; 
 
   const filteredLO = useMemo(() => {
     const query = loSearch.trim().toLocaleLowerCase("id-ID");
-    const rows = query ? loadingOrders.filter((row) => [row.loading_order_id, row.spbu_id, row.spbu_name, row.product_id, row.product_name, row.phase6_shipment, row.phase6_mt, row.current_mt, row.current_compartment, row.status, row.frozen_reason].some((value) => String(value || "").toLocaleLowerCase("id-ID").includes(query))) : loadingOrders;
+    const rows = query ? loadingOrders.filter((row) => [row.loading_order_id, row.spbu_id, row.spbu_name, row.product_id, row.product_name, row.phase6_shipment, row.phase6_mt, row.current_mt, row.current_compartment, row.system_eta_depot, row.status, row.frozen_reason].some((value) => String(value || "").toLocaleLowerCase("id-ID").includes(query))) : loadingOrders;
     const value = (row: LoadingOrder): string | number => ({
       loading_order_id: row.loading_order_id,
       spbu: row.spbu_name || row.spbu_id,
@@ -946,6 +1049,7 @@ export function Phase7OptimizationPage({ depots, products }: { depots: Depot[]; 
       current_mt: row.current_mt || "",
       trip: row.current_trip || 0,
       planned_gate_out: row.planned_gate_out || "",
+      system_eta_depot: row.system_eta_depot || "",
       status: row.status,
       frozen: row.frozen ? 1 : 0,
     })[loSort.key];
@@ -962,7 +1066,7 @@ export function Phase7OptimizationPage({ depots, products }: { depots: Depot[]; 
 
   const filteredMT = useMemo(() => {
     const query = mtSearch.trim().toLocaleLowerCase("id-ID");
-    const rows = query ? vehicles.filter((row) => [row.mt_id, row.registration, row.vehicle_class, row.tags.join(" "), row.capacity_kl, row.number_of_compartments, row.operational_status, vehicleDrafts[row.mt_id]?.status].some((value) => String(value ?? "").toLocaleLowerCase("id-ID").includes(query))) : vehicles;
+    const rows = query ? vehicles.filter((row) => [row.mt_id, row.registration, row.vehicle_class, row.tags.join(" "), row.capacity_kl, row.number_of_compartments, row.delivery_status, row.operational_status, vehicleDrafts[row.mt_id]?.status].some((value) => String(value ?? "").toLocaleLowerCase("id-ID").includes(query))) : vehicles;
     const value = (row: Vehicle): string | number => ({
       registration: row.registration || row.mt_id,
       class_tags: `${row.vehicle_class ?? ""} ${row.tags.join(" ")}`,
@@ -971,6 +1075,7 @@ export function Phase7OptimizationPage({ depots, products }: { depots: Depot[]; 
       planned_eta: vehicleDrafts[row.mt_id]?.planned || row.planned_eta_depot || "",
       system_eta: row.system_eta_depot || "",
       effective_eta: row.effective_eta_depot || "",
+      delivery_status: row.delivery_status,
       status: vehicleDrafts[row.mt_id]?.status || row.operational_status,
       working_time: row.working_time_remaining,
     })[mtSort.key];
@@ -985,13 +1090,95 @@ export function Phase7OptimizationPage({ depots, products }: { depots: Depot[]; 
   const mtRangeStart = filteredMT.length ? (mtPage - 1) * mtPerPage + 1 : 0;
   const mtRangeEnd = Math.min(mtPage * mtPerPage, filteredMT.length);
 
+  const comparisonSourceOptions = useMemo<ComparisonSource[]>(() => {
+    const rows: ComparisonSource[] = [];
+    if (job?.source_prediction_run_id) {
+      const predictionRun = predictionRuns.find((row) => row.id === job.source_prediction_run_id);
+      rows.push({
+        source_id: "PHASE6",
+        source_type: "PHASE6",
+        label: `Phase 6 · ${predictionRun?.run_id || job.source_prediction_run_id}`,
+        prediction_run_id: job.source_prediction_run_id,
+        prediction_run_no: predictionRun?.run_id || null,
+        version_number: null,
+        version_label: null,
+        created_at: predictionRun?.saved_at || null,
+      });
+    }
+    rows.push(...[...versions]
+      .sort((left, right) => Number(left.version_number || 0) - Number(right.version_number || 0))
+      .map((version) => ({
+        source_id: String(version.route_version_id),
+        source_type: "PHASE7" as const,
+        label: `Phase 7 · ${String(version.version_label)}`,
+        prediction_run_id: null,
+        prediction_run_no: null,
+        version_number: Number(version.version_number),
+        version_label: String(version.version_label),
+        created_at: version.created_at ? String(version.created_at) : null,
+      })));
+    return rows;
+  }, [job?.source_prediction_run_id, predictionRuns, versions]);
+  const comparisonSourceKey = comparisonSourceOptions.map((row) => row.source_id).join("|");
+  const filteredComparisonRows = useMemo(() => {
+    if (!comparisonResult) return [];
+    const query = comparisonSearch.trim().toLocaleLowerCase("id-ID");
+    const rows = query ? comparisonResult.rows.filter((row) => [
+      row.loading_order_id,
+      row.spbu_id,
+      row.spbu_name,
+      row.product_id,
+      row.product_name,
+      row.a.mt_id,
+      row.a.mt_registration,
+      row.a.status,
+      row.a.dropped_reason_code,
+      row.b.mt_id,
+      row.b.mt_registration,
+      row.b.status,
+      row.b.dropped_reason_code,
+    ].some((value) => String(value || "").toLocaleLowerCase("id-ID").includes(query))) : comparisonResult.rows;
+    const value = (row: ComparisonRow): string | number => ({
+      loading_order_id: row.loading_order_id,
+      spbu: row.spbu_name || row.spbu_id || "",
+      product: row.product_name || row.product_id || "",
+      mt_a: row.a.mt_registration || row.a.mt_id || "",
+      mt_b: row.b.mt_registration || row.b.mt_id || "",
+      gate_out_a: row.a.gate_out || "",
+      gate_out_b: row.b.gate_out || "",
+      eta_a: row.a.eta_depot || "",
+      eta_b: row.b.eta_depot || "",
+      delta: Math.max(Math.abs(row.gate_out_delta_minutes || 0), Math.abs(row.eta_depot_delta_minutes || 0)),
+    })[comparisonSort.key];
+    return [...rows].sort((left, right) => {
+      const leftValue = value(left); const rightValue = value(right);
+      const comparison = typeof leftValue === "number" && typeof rightValue === "number"
+        ? leftValue - rightValue
+        : String(leftValue).localeCompare(String(rightValue), "id-ID", { numeric: true, sensitivity: "base" });
+      return comparisonSort.direction === "asc" ? comparison : -comparison;
+    });
+  }, [comparisonResult, comparisonSearch, comparisonSort]);
+  const comparisonPageCount = Math.max(1, Math.ceil(filteredComparisonRows.length / comparisonPerPage));
+  const pagedComparisonRows = filteredComparisonRows.slice((comparisonPage - 1) * comparisonPerPage, comparisonPage * comparisonPerPage);
+  const comparisonRangeStart = filteredComparisonRows.length ? (comparisonPage - 1) * comparisonPerPage + 1 : 0;
+  const comparisonRangeEnd = Math.min(comparisonPage * comparisonPerPage, filteredComparisonRows.length);
+
   useEffect(() => { setJobPage(1); }, [selectedDepot, jobSearch, jobsPerPage, jobSort.key, jobSort.direction]);
   useEffect(() => { if (jobPage > jobPageCount) setJobPage(jobPageCount); }, [jobPage, jobPageCount]);
   useEffect(() => { setLOPage(1); }, [loSearch, loPerPage, loSort.key, loSort.direction, job?.job_id]);
   useEffect(() => { if (loPage > loPageCount) setLOPage(loPageCount); }, [loPage, loPageCount]);
   useEffect(() => { setMTPage(1); }, [mtSearch, mtPerPage, mtSort.key, mtSort.direction, job?.job_id]);
   useEffect(() => { if (mtPage > mtPageCount) setMTPage(mtPageCount); }, [mtPage, mtPageCount]);
-  useEffect(() => { setRouteMTPage(1); }, [selectedMT, selectedVersion, routeMTPerPage, job?.job_id]);
+  useEffect(() => {
+    setComparisonResult(null);
+    setComparisonSearch("");
+    setComparisonSourceA(comparisonSourceOptions[0]?.source_id || "");
+    setComparisonSourceB(comparisonSourceOptions[1]?.source_id || "");
+  }, [job?.job_id, comparisonSourceKey]);
+  useEffect(() => { setComparisonPage(1); }, [comparisonSearch, comparisonPerPage, comparisonSort.key, comparisonSort.direction, comparisonResult]);
+  useEffect(() => { if (comparisonPage > comparisonPageCount) setComparisonPage(comparisonPageCount); }, [comparisonPage, comparisonPageCount]);
+  useEffect(() => { setRouteMTPage(1); }, [routeMTSearch, selectedMT, selectedVersion, routeMTPerPage, job?.job_id]);
+  useEffect(() => { setRouteMTSearch(""); }, [job?.job_id]);
   useEffect(() => { if (routeMTPage > routeMTPageCount) setRouteMTPage(routeMTPageCount); }, [routeMTPage, routeMTPageCount]);
   useEffect(() => {
     if (selectedMT && routeVehicleOptions.length && !routeVehicleOptions.some(([vehicleId]) => vehicleId === selectedMT)) {
@@ -1047,6 +1234,11 @@ export function Phase7OptimizationPage({ depots, products }: { depots: Depot[]; 
     return <button type="button" className={active ? "phase7-sort-button is-active" : "phase7-sort-button"} onClick={() => setMTSort((current) => current.key === key ? { key, direction: current.direction === "asc" ? "desc" : "asc" } : { key, direction: "asc" })}><span>{label}</span><ArrowUpDown size={13} /><i>{active ? (mtSort.direction === "asc" ? "ASC" : "DESC") : ""}</i></button>;
   }
 
+  function comparisonSortButton(label: string, key: ComparisonSortKey) {
+    const active = comparisonSort.key === key;
+    return <button type="button" className={active ? "phase7-sort-button is-active" : "phase7-sort-button"} onClick={() => setComparisonSort((current) => current.key === key ? { key, direction: current.direction === "asc" ? "desc" : "asc" } : { key, direction: "asc" })}><span>{label}</span><ArrowUpDown size={13} /><i>{active ? (comparisonSort.direction === "asc" ? "ASC" : "DESC") : ""}</i></button>;
+  }
+
   async function createNewJob() {
     if (!selectedDepot || !createForm.job_name.trim()) return;
     await runAction(async () => {
@@ -1068,6 +1260,14 @@ export function Phase7OptimizationPage({ depots, products }: { depots: Depot[]; 
   async function refreshWorkspace(versionId?: string) {
     if (!job) return;
     await loadWorkspace(job.job_id, versionId || selectedVersion || undefined);
+  }
+
+  async function applyLOComparison() {
+    if (!job || !comparisonSourceA || !comparisonSourceB || comparisonSourceA === comparisonSourceB) return;
+    await runAction(async () => {
+      const query = new URLSearchParams({ source_a: comparisonSourceA, source_b: comparisonSourceB });
+      setComparisonResult(await apiGet<LOComparison>(`/api/v1/phase7/jobs/${job.job_id}/comparison?${query.toString()}`));
+    }, "LO List comparison calculated from immutable snapshots.");
   }
 
   async function loadPhase6() {
@@ -1255,14 +1455,14 @@ export function Phase7OptimizationPage({ depots, products }: { depots: Depot[]; 
     if (!job) return;
     setReadinessOpen(false);
     await runAction(async () => {
-      const result = await apiSend<NonNullable<typeof validation>>(`/api/v1/phase7/jobs/${job.job_id}/validation`, "POST", { parameters: parameterDraft });
+      const result = await apiSend<ValidationResult>(`/api/v1/phase7/jobs/${job.job_id}/validation`, "POST", { parameters: parameterDraft });
       setValidation(result);
       setReadinessOpen(true);
       await refreshWorkspace();
     }, "Pre-optimization validation completed against the current constraint settings.");
   }
 
-  function openOptimizationDialog(reroute: boolean) {
+  async function openOptimizationDialog(reroute: boolean) {
     if (!job) return;
     const initialParts = job.initial_optimization_reference_time
       ? zonedDateTimeParts(job.initial_optimization_reference_time, job.depot_timezone)
@@ -1274,16 +1474,30 @@ export function Phase7OptimizationPage({ depots, products }: { depots: Depot[]; 
     const nowParts = zonedDateTimeParts(new Date(), job.depot_timezone);
     let time = nowParts.date === date ? nowParts.time : job.depot_operational_start.slice(0, 5);
     if (reroute && latestParts?.date === date && latestParts.time > time) time = latestParts.time;
-    setOptimizationDialog({ reroute, date, time });
+    setBusy(true);
     setError("");
     setNotice("");
+    try {
+      const result = await apiSend<ValidationResult>(`/api/v1/phase7/jobs/${job.job_id}/validation`, "POST", { parameters: parameterDraft });
+      setValidation(result);
+      setOptimizationDialog({
+        reroute,
+        date,
+        time,
+        routeTimeLimitConfirmed: !result.route_time_limit_recommendation.requires_confirmation,
+      });
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Unable to calculate the Route Time Limit recommendation.");
+    } finally {
+      setBusy(false);
+    }
   }
 
-  async function optimize(reroute: boolean, referenceTime: string) {
+  async function optimize(reroute: boolean, referenceTime: string, routeTimeLimitConfirmed: boolean) {
     if (!job) return;
     const targetDepot = job.depot_id;
     await runAction(async () => {
-      await apiSend<OptimizationDispatch>(`/api/v1/phase7/jobs/${job.job_id}/${reroute ? "reroute" : "optimize"}`, "POST", { profile_id: selectedProfile || null, parameters: parameterDraft, current_time: referenceTime, reason: reroute ? "Operational Reroute" : "Initial Plan" });
+      await apiSend<OptimizationDispatch>(`/api/v1/phase7/jobs/${job.job_id}/${reroute ? "reroute" : "optimize"}`, "POST", { profile_id: selectedProfile || null, parameters: parameterDraft, current_time: referenceTime, reason: reroute ? "Operational Reroute" : "Initial Plan", route_time_limit_confirmed: routeTimeLimitConfirmed });
       setOptimizationDialog(null);
       setJob(null);
       setRouteVersion(null);
@@ -1354,6 +1568,7 @@ export function Phase7OptimizationPage({ depots, products }: { depots: Depot[]; 
   const initialReferenceParts = job.initial_optimization_reference_time ? zonedDateTimeParts(job.initial_optimization_reference_time, job.depot_timezone) : null;
   const latestReferenceParts = job.latest_optimization_reference_time ? zonedDateTimeParts(job.latest_optimization_reference_time, job.depot_timezone) : null;
   let optimizationDialogError = "";
+  const routeTimeRecommendation = validation?.route_time_limit_recommendation || null;
   if (optimizationDialog) {
     const lockedDate = optimizationDialog.reroute ? initialReferenceParts?.date || job.operating_date : job.operating_date;
     if (!optimizationDialog.date || !optimizationDialog.time) optimizationDialogError = "Tanggal dan waktu optimasi wajib diisi.";
@@ -1361,6 +1576,7 @@ export function Phase7OptimizationPage({ depots, products }: { depots: Depot[]; 
       ? `Tanggal Re-optimize dikunci ke tanggal Initial ${lockedDate}.`
       : `Tanggal Initial harus sama dengan Operating Date Job ${job.operating_date}.`;
     else if (optimizationDialog.reroute && latestReferenceParts?.date === optimizationDialog.date && optimizationDialog.time < latestReferenceParts.time) optimizationDialogError = `Waktu Re-optimize tidak boleh lebih awal dari run terakhir (${latestReferenceParts.time}).`;
+    else if (routeTimeRecommendation?.requires_confirmation && !optimizationDialog.routeTimeLimitConfirmed) optimizationDialogError = "Konfirmasi Route Time Limit yang lebih pendek dari saran sistem sebelum menjalankan optimasi.";
   }
 
   return (
@@ -1382,7 +1598,7 @@ export function Phase7OptimizationPage({ depots, products }: { depots: Depot[]; 
         </Section>
         <Section title="Optimization Flow" description="Every run asks for an explicit operational reference time and creates an immutable route version, state snapshot, and parameter snapshot.">
           <div className="phase7-step-list">{["Load Phase 6 Prediction Run", "Load MT from Master", "Enter initial MT ETA Depot", "Enter current Bay State", "Select and review Parameter Profile", "Validate hard requirements", "Set optimization date & time", "Run Initial Optimization → V1"].map((label, index) => <div key={label}><span>{index + 1}</span><strong>{label}</strong></div>)}</div>
-          <div className="phase7-action-row"><button className="phase7-secondary" disabled={busy || job.status === "CALCULATING"} onClick={() => void validateWorkspace()}><CheckCircle2 size={16} /> Validate</button><button className="phase7-primary" disabled={busy || job.status === "CALCULATING" || !job.source_prediction_run_id || Boolean(job.current_route_version_id)} onClick={() => openOptimizationDialog(false)}><Play size={16} /> Run Initial Optimization</button><button className="phase7-secondary" disabled={busy || job.status === "CALCULATING" || !job.current_route_version_id} onClick={() => openOptimizationDialog(true)}><RefreshCw size={16} /> Re-Optimize Now</button></div>
+          <div className="phase7-action-row"><button className="phase7-secondary" disabled={busy || job.status === "CALCULATING"} onClick={() => void validateWorkspace()}><CheckCircle2 size={16} /> Validate</button><button className="phase7-primary" disabled={busy || job.status === "CALCULATING" || !job.source_prediction_run_id || Boolean(job.current_route_version_id)} onClick={() => void openOptimizationDialog(false)}><Play size={16} /> Run Initial Optimization</button><button className="phase7-secondary" disabled={busy || job.status === "CALCULATING" || !job.current_route_version_id} onClick={() => void openOptimizationDialog(true)}><RefreshCw size={16} /> Re-Optimize Now</button></div>
           {job.initial_optimization_reference_time && <div className="phase7-note"><CalendarClock size={16} /> Initial reference: {displayDateTime(job.initial_optimization_reference_time, job.depot_timezone)} ({job.depot_timezone}). Re-optimize date remains locked to {initialReferenceParts?.date}.</div>}
         </Section>
         <Section title="Current Plan Stability" description="V1 is baseline; the latest route version is the current operational plan.">
@@ -1391,13 +1607,13 @@ export function Phase7OptimizationPage({ depots, products }: { depots: Depot[]; 
       </div>}
 
       {tab === "lo" && <Section title="LO Management" description="Phase 6 fields remain read-only; Phase 7 current assignment and operational status are separate." action={<div className="phase7-action-row"><select value={bulkLOStatus} onChange={(event) => setBulkLOStatus(event.target.value as LoadingOrder["status"])}><option>PLANNED</option><option>ONGOING</option><option>DONE</option></select><button className="phase7-primary" disabled={!selectedLO.size || busy} onClick={() => void applyLOUpdate()}>Apply Operational Update ({selectedLO.size})</button></div>}>
-        {!!loadingOrders.length && <div className="phase7-management-search"><Search size={16} /><input value={loSearch} placeholder="Search LO ID, SPBU, product, shipment, MT, status, or frozen reason" onChange={(event) => setLOSearch(event.target.value)} /></div>}
-        {!loadingOrders.length ? <EmptyState title="No LO loaded" description="Open Job Overview and load a Phase 6 Prediction Run." /> : !filteredLO.length ? <EmptyState title="No matching LO" description="Change or clear the search text." /> : <><div className="phase7-table-wrap"><table className="phase7-table is-dense phase7-operational-table"><thead><tr><th><input type="checkbox" aria-label="Select all LO on this page" checked={pagedLO.length > 0 && pagedLO.every((row) => selectedLO.has(row.loading_order_id))} onChange={(event) => setSelectedLO((current) => { const next = new Set(current); pagedLO.forEach((row) => event.target.checked ? next.add(row.loading_order_id) : next.delete(row.loading_order_id)); return next; })} /></th><th>{loSortButton("LO ID", "loading_order_id")}</th><th>{loSortButton("SPBU", "spbu")}</th><th>{loSortButton("Product", "product")}</th><th>{loSortButton("Volume", "volume_kl")}</th><th>{loSortButton("Phase 6 Shipment", "phase6_shipment")}</th><th>{loSortButton("Phase 6 MT", "phase6_mt")}</th><th>{loSortButton("Current MT", "current_mt")}</th><th>{loSortButton("Trip / Compartment", "trip")}</th><th>{loSortButton("Planned Gate Out", "planned_gate_out")}</th><th>{loSortButton("Status", "status")}</th><th>{loSortButton("Frozen", "frozen")}</th></tr></thead><tbody>{pagedLO.map((row) => <tr key={row.loading_order_id}><td><input type="checkbox" checked={selectedLO.has(row.loading_order_id)} onChange={(event) => setSelectedLO((current) => { const next = new Set(current); event.target.checked ? next.add(row.loading_order_id) : next.delete(row.loading_order_id); return next; })} /></td><td><strong>{row.loading_order_id}</strong></td><td>{row.spbu_name || row.spbu_id}<small>{row.spbu_id}</small></td><td>{row.product_name || row.product_id || "—"}</td><td>{row.volume_kl} KL</td><td>{row.phase6_shipment || "—"}</td><td>{row.phase6_mt || "—"}</td><td>{row.current_mt || "—"}</td><td>{row.current_trip ? `Trip ${row.current_trip}` : "—"}<small>{row.current_compartment || ""}</small></td><td>{displayDateTime(row.planned_gate_out)}</td><td><span className={badgeClass(row.status)}>{row.status}</span></td><td>{row.frozen ? <span className="phase7-badge is-warning">{row.frozen_reason}</span> : "No"}</td></tr>)}</tbody></table></div><div className="phase7-pagination"><span>Showing {loRangeStart}–{loRangeEnd} of {filteredLO.length} LO</span><label><span>Rows</span><select value={loPerPage} onChange={(event) => setLOPerPage(Number(event.target.value))}><option value={10}>10</option><option value={25}>25</option><option value={50}>50</option><option value={100}>100</option></select></label><div><button className="phase7-secondary" disabled={loPage <= 1} onClick={() => setLOPage((page) => Math.max(1, page - 1))}><ChevronLeft size={15} /> Previous</button><strong>Page {loPage} of {loPageCount}</strong><button className="phase7-secondary" disabled={loPage >= loPageCount} onClick={() => setLOPage((page) => Math.min(loPageCount, page + 1))}>Next <ChevronRight size={15} /></button></div></div></>}
+        {!!loadingOrders.length && <div className="phase7-management-search"><Search size={16} /><input value={loSearch} placeholder="Search LO ID, SPBU, product, shipment, MT, System ETA, status, or frozen reason" onChange={(event) => setLOSearch(event.target.value)} /></div>}
+        {!loadingOrders.length ? <EmptyState title="No LO loaded" description="Open Job Overview and load a Phase 6 Prediction Run." /> : !filteredLO.length ? <EmptyState title="No matching LO" description="Change or clear the search text." /> : <><div className="phase7-table-wrap"><table className="phase7-table is-dense phase7-operational-table"><thead><tr><th><input type="checkbox" aria-label="Select all LO on this page" checked={pagedLO.length > 0 && pagedLO.every((row) => selectedLO.has(row.loading_order_id))} onChange={(event) => setSelectedLO((current) => { const next = new Set(current); pagedLO.forEach((row) => event.target.checked ? next.add(row.loading_order_id) : next.delete(row.loading_order_id)); return next; })} /></th><th>{loSortButton("LO ID", "loading_order_id")}</th><th>{loSortButton("SPBU", "spbu")}</th><th>{loSortButton("Product", "product")}</th><th>{loSortButton("Volume", "volume_kl")}</th><th>{loSortButton("Phase 6 Shipment", "phase6_shipment")}</th><th>{loSortButton("Phase 6 MT", "phase6_mt")}</th><th>{loSortButton("Current MT", "current_mt")}</th><th>{loSortButton("Trip / Compartment", "trip")}</th><th>{loSortButton("Planned Gate Out", "planned_gate_out")}</th><th>{loSortButton("System ETA Depot", "system_eta_depot")}</th><th>{loSortButton("Status", "status")}</th><th>{loSortButton("Frozen", "frozen")}</th></tr></thead><tbody>{pagedLO.map((row) => <tr key={row.loading_order_id}><td><input type="checkbox" checked={selectedLO.has(row.loading_order_id)} onChange={(event) => setSelectedLO((current) => { const next = new Set(current); event.target.checked ? next.add(row.loading_order_id) : next.delete(row.loading_order_id); return next; })} /></td><td><strong>{row.loading_order_id}</strong></td><td>{row.spbu_name || row.spbu_id}<small>{row.spbu_id}</small></td><td>{row.product_name || row.product_id || "—"}</td><td>{row.volume_kl} KL</td><td>{row.phase6_shipment || "—"}</td><td>{row.phase6_mt || "—"}</td><td>{row.current_mt || "—"}</td><td>{row.current_trip ? `Trip ${row.current_trip}` : "—"}<small>{row.current_compartment || ""}</small></td><td>{displayDateTime(row.planned_gate_out, job.depot_timezone)}</td><td>{displayDateTime(row.system_eta_depot, job.depot_timezone)}</td><td><span className={badgeClass(row.status)}>{row.status}</span></td><td>{row.frozen ? <span className="phase7-badge is-warning">{row.frozen_reason}</span> : "No"}</td></tr>)}</tbody></table></div><div className="phase7-pagination"><span>Showing {loRangeStart}–{loRangeEnd} of {filteredLO.length} LO</span><label><span>Rows</span><select value={loPerPage} onChange={(event) => setLOPerPage(Number(event.target.value))}><option value={10}>10</option><option value={25}>25</option><option value={50}>50</option><option value={100}>100</option></select></label><div><button className="phase7-secondary" disabled={loPage <= 1} onClick={() => setLOPage((page) => Math.max(1, page - 1))}><ChevronLeft size={15} /> Previous</button><strong>Page {loPage} of {loPageCount}</strong><button className="phase7-secondary" disabled={loPage >= loPageCount} onClick={() => setLOPage((page) => Math.min(loPageCount, page + 1))}>Next <ChevronRight size={15} /></button></div></div></>}
       </Section>}
 
       {tab === "mt" && <Section title="MT Management" description="Planned ETA is the required availability input and is cleared after success. System ETA is empty before V1, then shows the calculated return of the ongoing trip or Trip 1 when no trip is ongoing." action={<div className="phase7-action-row"><button className="phase7-secondary" onClick={() => void loadMasterMT()}><Database size={15} /> Load MT from Master Data</button><button className="phase7-secondary" disabled={!vehicles.length || busy} onClick={openPlannedETADemoDialog}><CalendarClock size={15} /> Planned ETA Depot Demo</button><button className="phase7-primary" disabled={!vehicles.length || busy} onClick={() => void applyVehicleUpdates()}><Save size={15} /> Apply MT Update</button></div>}>
-        {!!vehicles.length && <div className="phase7-management-search"><Search size={16} /><input value={mtSearch} placeholder="Search MT, registration, class, tag, capacity, or status" onChange={(event) => setMTSearch(event.target.value)} /></div>}
-        {!vehicles.length ? <EmptyState title="No MT loaded" description="Load active vehicles for this Job depot from canonical master data." /> : !filteredMT.length ? <EmptyState title="No matching MT" description="Change or clear the search text." /> : <><div className="phase7-table-wrap"><table className="phase7-table is-dense phase7-operational-table"><thead><tr><th>{mtSortButton("MT / Registration", "registration")}</th><th>{mtSortButton("Class / Tags", "class_tags")}</th><th>{mtSortButton("Capacity", "capacity_kl")}</th><th>{mtSortButton("Compartments", "compartments")}</th><th>{mtSortButton("Planned ETA Depot", "planned_eta")}</th><th>{mtSortButton("System ETA Depot", "system_eta")}</th><th>{mtSortButton("Effective ETA", "effective_eta")}</th><th>{mtSortButton("Status", "status")}</th><th>{mtSortButton("Working Time", "working_time")}</th></tr></thead><tbody>{pagedMT.map((row) => <tr key={row.mt_id}><td><strong>{row.registration || row.mt_id}</strong><small>{row.mt_id}</small></td><td>Class {row.vehicle_class ?? "—"}<small>{row.tags.join(", ") || "No tags"}</small></td><td>{row.capacity_kl} KL</td><td>{row.number_of_compartments}<small>{row.compartments.map((item) => `${item.compartment_id} ${item.capacity_kl} KL`).join(" · ")}</small></td><td><input type="datetime-local" value={vehicleDrafts[row.mt_id]?.planned || ""} onChange={(event) => setVehicleDrafts((current) => ({ ...current, [row.mt_id]: { ...(current[row.mt_id] || { status: row.operational_status }), planned: event.target.value } }))} /></td><td>{displayDateTime(row.system_eta_depot)}</td><td><strong>{displayDateTime(row.effective_eta_depot)}</strong></td><td><select value={vehicleDrafts[row.mt_id]?.status || row.operational_status} onChange={(event) => setVehicleDrafts((current) => ({ ...current, [row.mt_id]: { ...(current[row.mt_id] || { planned: "" }), status: event.target.value } }))}>{["READY", "ON_TRIP", "RETURNING", "QUEUEING", "LOADING", "UNAVAILABLE"].map((status) => <option key={status}>{status}</option>)}</select></td><td>{row.working_time_used} / {row.working_time_limit} min<small>{row.working_time_remaining} min remaining</small></td></tr>)}</tbody></table></div><div className="phase7-pagination"><span>Showing {mtRangeStart}–{mtRangeEnd} of {filteredMT.length} MT</span><label><span>Rows</span><select value={mtPerPage} onChange={(event) => setMTPerPage(Number(event.target.value))}><option value={10}>10</option><option value={25}>25</option><option value={50}>50</option><option value={100}>100</option></select></label><div><button className="phase7-secondary" disabled={mtPage <= 1} onClick={() => setMTPage((page) => Math.max(1, page - 1))}><ChevronLeft size={15} /> Previous</button><strong>Page {mtPage} of {mtPageCount}</strong><button className="phase7-secondary" disabled={mtPage >= mtPageCount} onClick={() => setMTPage((page) => Math.min(mtPageCount, page + 1))}>Next <ChevronRight size={15} /></button></div></div></>}
+        {!!vehicles.length && <div className="phase7-management-search"><Search size={16} /><input value={mtSearch} placeholder="Search MT, registration, class, tag, capacity, delivery status, or operational status" onChange={(event) => setMTSearch(event.target.value)} /></div>}
+        {!vehicles.length ? <EmptyState title="No MT loaded" description="Load active vehicles for this Job depot from canonical master data." /> : !filteredMT.length ? <EmptyState title="No matching MT" description="Change or clear the search text." /> : <><div className="phase7-table-wrap"><table className="phase7-table is-dense phase7-operational-table"><thead><tr><th>{mtSortButton("MT / Registration", "registration")}</th><th>{mtSortButton("Class / Tags", "class_tags")}</th><th>{mtSortButton("Capacity", "capacity_kl")}</th><th>{mtSortButton("Compartments", "compartments")}</th><th>{mtSortButton("Planned ETA Depot", "planned_eta")}</th><th>{mtSortButton("System ETA Depot", "system_eta")}</th><th>{mtSortButton("Effective ETA", "effective_eta")}</th><th>{mtSortButton("Delivery Status", "delivery_status")}</th><th>{mtSortButton("Operational Status", "status")}</th><th>{mtSortButton("Working Time", "working_time")}</th></tr></thead><tbody>{pagedMT.map((row) => <tr key={row.mt_id}><td><strong>{row.registration || row.mt_id}</strong><small>{row.mt_id}</small></td><td>Class {row.vehicle_class ?? "—"}<small>{row.tags.join(", ") || "No tags"}</small></td><td>{row.capacity_kl} KL</td><td>{row.number_of_compartments}<small>{row.compartments.map((item) => `${item.compartment_id} ${item.capacity_kl} KL`).join(" · ")}</small></td><td><input type="datetime-local" value={vehicleDrafts[row.mt_id]?.planned || ""} onChange={(event) => setVehicleDrafts((current) => ({ ...current, [row.mt_id]: { ...(current[row.mt_id] || { status: row.operational_status }), planned: event.target.value } }))} /></td><td>{displayDateTime(row.system_eta_depot, job.depot_timezone)}</td><td><strong>{displayDateTime(row.effective_eta_depot, job.depot_timezone)}</strong></td><td><span className={badgeClass(row.delivery_status)}>{row.delivery_status}</span></td><td><select value={vehicleDrafts[row.mt_id]?.status || row.operational_status} onChange={(event) => setVehicleDrafts((current) => ({ ...current, [row.mt_id]: { ...(current[row.mt_id] || { planned: "" }), status: event.target.value } }))}>{["READY", "ON_TRIP", "RETURNING", "QUEUEING", "LOADING", "UNAVAILABLE"].map((status) => <option key={status}>{status}</option>)}</select></td><td>{row.working_time_used} / {row.working_time_limit} min<small>{row.working_time_remaining} min remaining</small></td></tr>)}</tbody></table></div><div className="phase7-pagination"><span>Showing {mtRangeStart}–{mtRangeEnd} of {filteredMT.length} MT</span><label><span>Rows</span><select value={mtPerPage} onChange={(event) => setMTPerPage(Number(event.target.value))}><option value={10}>10</option><option value={25}>25</option><option value={50}>50</option><option value={100}>100</option></select></label><div><button className="phase7-secondary" disabled={mtPage <= 1} onClick={() => setMTPage((page) => Math.max(1, page - 1))}><ChevronLeft size={15} /> Previous</button><strong>Page {mtPage} of {mtPageCount}</strong><button className="phase7-secondary" disabled={mtPage >= mtPageCount} onClick={() => setMTPage((page) => Math.min(mtPageCount, page + 1))}>Next <ChevronRight size={15} /></button></div></div></>}
       </Section>}
 
       {tab === "bay" && <div className="phase7-grid-2">
@@ -1445,7 +1661,7 @@ export function Phase7OptimizationPage({ depots, products }: { depots: Depot[]; 
 
       {tab === "route" && <div className="phase7-route-page"><Section title="Route Plan" description="Version-aware MT → Trip → SPBU sequence. MT filter and pagination are shared by the operational Gantt and route details." action={<div className="phase7-action-row"><select value={selectedVersion} onChange={(event) => void selectRouteVersion(event.target.value)}>{versions.map((version) => <option key={String(version.route_version_id)} value={String(version.route_version_id)}>{String(version.version_label)} · {String(version.reason)}</option>)}</select><select value={selectedMT} onChange={(event) => { setSelectedMT(event.target.value); setSelectedTrip("ALL"); setRouteMTPage(1); }}><option value="">All MT</option>{routeVehicleOptions.map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select><select value={selectedTrip} onChange={(event) => setSelectedTrip(event.target.value === "ALL" ? "ALL" : Number(event.target.value))}><option value="ALL">All Trips</option>{Array.from(new Set((routeVersion?.trips || []).filter((row) => !selectedMT || row.vehicle_id === selectedMT).map((row) => row.trip_number))).map((number) => <option key={number} value={number}>Trip {number}</option>)}</select></div>}>
         {!routeVersion ? <EmptyState title="No route version" description="Run the initial optimization to create V1." /> : <>
-          <div className="phase7-route-filters"><label><span>LO</span><input value={routeLOFilter} placeholder="Filter LO ID" onChange={(event) => setRouteLOFilter(event.target.value)} /></label><label><span>SPBU</span><input value={routeSPBUFilter} placeholder="Code or name" onChange={(event) => setRouteSPBUFilter(event.target.value)} /></label><label><span>Product</span><input value={routeProductFilter} placeholder="Product name or ID" onChange={(event) => setRouteProductFilter(event.target.value)} /></label></div>
+          <div className="phase7-route-filters"><label><span>MT</span><input value={routeMTSearch} placeholder="Search MT number or ID" onChange={(event) => setRouteMTSearch(event.target.value)} /></label><label><span>LO</span><input value={routeLOFilter} placeholder="Filter LO ID" onChange={(event) => setRouteLOFilter(event.target.value)} /></label><label><span>SPBU</span><input value={routeSPBUFilter} placeholder="Code or name" onChange={(event) => setRouteSPBUFilter(event.target.value)} /></label><label><span>Product</span><input value={routeProductFilter} placeholder="Product name or ID" onChange={(event) => setRouteProductFilter(event.target.value)} /></label></div>
           <KpiGrid values={[{ label: "Solver Status", value: routeVersion.solver_status }, { label: "First Loading", value: displayDateTime(routeVersion.first_loading_start) }, { label: "First Gate Out", value: displayDateTime(routeVersion.first_gate_out) }, { label: "Last Gate Out", value: displayDateTime(routeVersion.last_gate_out) }, { label: "Depot Operation Span", value: `${routeVersion.depot_dispatch_span_minutes} min` }]} />
           <div className="phase7-pagination"><span>Showing MT {routeMTRangeStart}–{routeMTRangeEnd} of {routeFilteredVehicleOptions.length}; only this page is rendered in the Gantt and route list.</span><label><span>MT per page</span><select value={routeMTPerPage} onChange={(event) => setRouteMTPerPage(Number(event.target.value))}><option value={1}>1</option><option value={5}>5</option><option value={10}>10</option><option value={25}>25</option></select></label><div><button className="phase7-secondary" disabled={routeMTPage <= 1} onClick={() => setRouteMTPage((page) => Math.max(1, page - 1))}><ChevronLeft size={15} /> Previous</button><strong>Page {routeMTPage} of {routeMTPageCount}</strong><button className="phase7-secondary" disabled={routeMTPage >= routeMTPageCount} onClick={() => setRouteMTPage((page) => Math.min(routeMTPageCount, page + 1))}>Next <ChevronRight size={15} /></button></div></div>
         </>}
@@ -1458,7 +1674,7 @@ export function Phase7OptimizationPage({ depots, products }: { depots: Depot[]; 
           </div>
       </Section>}
       {routeVersion && <Section title="Route Details" description="Trip and loading-order details for the same MT displayed in the Vehicle Multi-Trip Timeline.">
-          {!filteredTrips.length ? <EmptyState title="No matching route" description="Adjust the MT, Trip, LO, SPBU, or Product filters." /> : <div className="phase7-trip-stack">{filteredTrips.map((trip) => <div className="phase7-trip-card" key={trip.route_version_trip_id}>
+          {!filteredTrips.length ? <EmptyState title="No matching route" description="Adjust the MT search, MT selection, Trip, LO, SPBU, or Product filters." /> : <div className="phase7-trip-stack">{filteredTrips.map((trip) => <div className="phase7-trip-card" key={trip.route_version_trip_id}>
             <div className="phase7-trip-head"><div><Truck size={18} /><strong>{trip.registration || trip.vehicle_id}</strong><span>Trip {trip.trip_number}</span><span>{trip.shipment_id}</span></div><span className={badgeClass(trip.assignment_status)}>{trip.assignment_status}</span></div>
             <div className="phase7-timeline"><span><small>READY</small>{displayDateTime(trip.vehicle_ready_at_depot)}</span><i /><span><small>QUEUE</small>{displayDateTime(trip.queue_start)}<small>{trip.queue_minutes} min</small></span><i /><span><small>LOADING</small>{displayDateTime(trip.loading_start)}<small>finish {displayDateTime(trip.loading_finish)}</small></span><i /><span><small>GATE OUT</small>{displayDateTime(trip.gate_out)}</span><i /><span><small>RETURN</small>{displayDateTime(trip.return_depot)}</span></div>
             <div className="phase7-table-wrap"><table className="phase7-table is-dense"><thead><tr><th>MT</th><th>Trip</th><th>Gate Out</th><th>LO</th><th>SPBU</th><th>Product</th><th>Volume</th><th>Sequence</th><th>ETA</th><th>ETD</th><th>Return Depot</th><th>Distance</th><th>Travel Time</th><th>Compartment</th><th>Frozen</th></tr></thead><tbody>{trip.loading_orders.filter(loMatchesRouteFilters).sort((a, b) => a.stop_sequence - b.stop_sequence).map((row) => { const stop = trip.stops.find((item) => item.sequence === row.stop_sequence); return <tr key={row.loading_order_id}><td>{trip.registration || trip.vehicle_id}</td><td>{trip.trip_number}</td><td>{displayDateTime(trip.gate_out)}</td><td>{row.loading_order_id}</td><td>{row.spbu_name || row.spbu_id}</td><td>{row.product_name || row.product_id || "—"}</td><td>{row.volume_kl} KL</td><td>{row.stop_sequence}</td><td>{displayDateTime(stop?.arrival_time || row.eta)}</td><td>{displayDateTime(stop?.departure_time)}</td><td>{displayDateTime(trip.return_depot)}</td><td>{stop ? `${(stop.distance_from_previous_meters / 1000).toFixed(1)} km` : "—"}</td><td>{stop ? `${Math.round(stop.travel_from_previous_seconds / 60)} min` : "—"}</td><td>{row.compartment_id}</td><td>{row.frozen ? "Yes" : "No"}</td></tr>; })}</tbody></table></div>
@@ -1466,6 +1682,43 @@ export function Phase7OptimizationPage({ depots, products }: { depots: Depot[]; 
             {Array.isArray(trip.cost_breakdown.constraint_violations) && trip.cost_breakdown.constraint_violations.length > 0 && <div className="phase7-constraint-violations"><strong>Soft constraint violations</strong>{(trip.cost_breakdown.constraint_violations as Array<Record<string, unknown>>).map((violation, index) => <span key={`${String(violation.constraint_id)}-${index}`}>{String(violation.constraint_id).replace(/_/g, " ")} · penalty {Number(violation.penalty || 0).toLocaleString("id-ID")}</span>)}</div>}
           </div>)}</div>}
       </Section>}
+      </div>}
+
+      {tab === "comparison" && <div className="phase7-comparison-stack">
+        <Section title="LO List Comparison" description="Compare the immutable Phase 6 prediction list with V1/V2/… or compare any two Phase 7 Route Versions.">
+          <div className="phase7-comparison-controls">
+            <label className="phase7-field"><span>LO List A</span><select value={comparisonSourceA} onChange={(event) => { setComparisonSourceA(event.target.value); setComparisonResult(null); }}><option value="">Select LO List A</option>{comparisonSourceOptions.map((source) => <option key={`a-${source.source_id}`} value={source.source_id}>{source.label}</option>)}</select></label>
+            <GitCompareArrows size={24} />
+            <label className="phase7-field"><span>LO List B</span><select value={comparisonSourceB} onChange={(event) => { setComparisonSourceB(event.target.value); setComparisonResult(null); }}><option value="">Select LO List B</option>{comparisonSourceOptions.map((source) => <option key={`b-${source.source_id}`} value={source.source_id}>{source.label}</option>)}</select></label>
+            <button className="phase7-primary" disabled={busy || comparisonSourceOptions.length < 2 || !comparisonSourceA || !comparisonSourceB || comparisonSourceA === comparisonSourceB} onClick={() => void applyLOComparison()}>{busy ? <LoaderCircle className="animate-spin" size={16} /> : <GitCompareArrows size={16} />} Apply Comparison</button>
+          </div>
+          {comparisonSourceOptions.length < 2 && <div className="phase7-note"><AlertTriangle size={16} /> At least two LO List snapshots are required. Load Phase 6 and create V1, or create another Route Version.</div>}
+          {comparisonSourceA && comparisonSourceA === comparisonSourceB && <div className="phase7-inline-alert is-warning"><AlertTriangle size={16} /> LO List A and LO List B must be different.</div>}
+        </Section>
+
+        {!comparisonResult ? <Section title="Comparison Dashboard" description="Choose two different LO Lists, then click Apply Comparison."><EmptyState title="No comparison applied" description="Available sources are the locked Phase 6 LO List and every immutable Phase 7 Route Version for this Job." /></Section> : <>
+          <Section title={`${comparisonResult.source_a.label} ↔ ${comparisonResult.source_b.label}`} description="Dashboard metrics are calculated per Loading Order ID. Time deltas are B minus A.">
+            <KpiGrid values={[
+              { label: "Total LO A", value: comparisonResult.summary.total_lo_a, hint: comparisonResult.source_a.label },
+              { label: "Total LO B", value: comparisonResult.summary.total_lo_b, hint: comparisonResult.source_b.label },
+              { label: "Common LO", value: comparisonResult.summary.common_lo_count },
+              { label: "Only in A / B", value: `${comparisonResult.summary.only_a_count} / ${comparisonResult.summary.only_b_count}` },
+              { label: "MT Changed", value: comparisonResult.summary.changed_mt_count, hint: `${comparisonResult.summary.mt_change_pct}% of comparable assigned LO` },
+              { label: "Same MT", value: comparisonResult.summary.same_mt_count },
+              { label: "Gate-Out Changed", value: comparisonResult.summary.gate_out_changed_count, hint: `Avg |Δ| ${comparisonResult.summary.average_abs_gate_out_delta_minutes} min` },
+              { label: "ETA Depot Changed", value: comparisonResult.summary.eta_depot_changed_count, hint: `Avg |Δ| ${comparisonResult.summary.average_abs_eta_depot_delta_minutes} min` },
+            ]} />
+            <div className="phase7-grid-2 phase7-comparison-charts">
+              <div><h4>Assignment Coverage</h4><ReactECharts style={{ height: 300 }} option={{ tooltip: { trigger: "axis" }, legend: { data: ["Assigned", "Dropped / Unassigned"] }, xAxis: { type: "category", data: ["LO List A", "LO List B"] }, yAxis: { type: "value", minInterval: 1 }, series: [{ name: "Assigned", type: "bar", stack: "total", itemStyle: { color: "#0b73bf" }, data: [comparisonResult.summary.assigned_lo_a, comparisonResult.summary.assigned_lo_b] }, { name: "Dropped / Unassigned", type: "bar", stack: "total", itemStyle: { color: "#ea4a43" }, data: [comparisonResult.summary.dropped_or_unassigned_a, comparisonResult.summary.dropped_or_unassigned_b] }] }} /></div>
+              <div><h4>MT Assignment Stability</h4><ReactECharts style={{ height: 300 }} option={{ tooltip: { trigger: "item" }, legend: { orient: "vertical", right: 12, top: "middle" }, series: [{ type: "pie", radius: ["45%", "70%"], center: ["38%", "50%"], data: [{ name: "Same MT", value: comparisonResult.summary.same_mt_count, itemStyle: { color: "#8aaa18" } }, { name: "Changed MT", value: comparisonResult.summary.changed_mt_count, itemStyle: { color: "#ea4a43" } }, { name: "Not comparable", value: Math.max(0, comparisonResult.summary.union_lo_count - comparisonResult.summary.comparable_mt_count), itemStyle: { color: "#cbd5e1" } }] }] }} /></div>
+            </div>
+          </Section>
+
+          <Section title="LO Comparison Detail" description="Destination SPBU, MT assignment, gate-out, and ETA Depot are shown side by side for each LO.">
+            <div className="phase7-management-search"><Search size={16} /><input value={comparisonSearch} placeholder="Search LO, SPBU, product, MT, status, or dropped reason" onChange={(event) => setComparisonSearch(event.target.value)} /></div>
+            {!filteredComparisonRows.length ? <EmptyState title="No matching LO" description="Change or clear the comparison search text." /> : <><div className="phase7-table-wrap"><table className="phase7-table is-dense phase7-comparison-table"><thead><tr><th>{comparisonSortButton("LO ID", "loading_order_id")}</th><th>{comparisonSortButton("Destination SPBU", "spbu")}</th><th>{comparisonSortButton("Product", "product")}</th><th>{comparisonSortButton("MT LO A", "mt_a")}</th><th>{comparisonSortButton("MT LO B", "mt_b")}</th><th>{comparisonSortButton("Gate Out LO A", "gate_out_a")}</th><th>{comparisonSortButton("Gate Out LO B", "gate_out_b")}</th><th>{comparisonSortButton("ETA Depot LO A", "eta_a")}</th><th>{comparisonSortButton("ETA Depot LO B", "eta_b")}</th><th>{comparisonSortButton("Change", "delta")}</th></tr></thead><tbody>{pagedComparisonRows.map((row) => <tr key={row.loading_order_id} className={row.mt_changed ? "is-comparison-changed" : ""}><td><strong>{row.loading_order_id}</strong></td><td>{row.spbu_name || row.spbu_id || "—"}<small>{row.spbu_id || ""}</small></td><td>{row.product_name || row.product_id || "—"}<small>{row.volume_kl} KL</small></td><td>{row.a.mt_registration || row.a.mt_id || "—"}<small><span className={badgeClass(row.a.status)}>{row.a.status}</span>{row.a.trip_number ? ` · Trip ${row.a.trip_number}` : ""}</small></td><td>{row.b.mt_registration || row.b.mt_id || "—"}<small><span className={badgeClass(row.b.status)}>{row.b.status}</span>{row.b.trip_number ? ` · Trip ${row.b.trip_number}` : ""}</small></td><td>{displayDateTime(row.a.gate_out, job.depot_timezone)}</td><td>{displayDateTime(row.b.gate_out, job.depot_timezone)}</td><td>{displayDateTime(row.a.eta_depot, job.depot_timezone)}</td><td>{displayDateTime(row.b.eta_depot, job.depot_timezone)}</td><td><strong className={row.mt_changed ? "phase7-comparison-delta is-changed" : "phase7-comparison-delta"}>{row.mt_changed ? "MT changed" : "MT same / N.A."}</strong><small>Gate {displayMinuteDelta(row.gate_out_delta_minutes)} · ETA {displayMinuteDelta(row.eta_depot_delta_minutes)}</small></td></tr>)}</tbody></table></div><div className="phase7-pagination"><span>Showing {comparisonRangeStart}–{comparisonRangeEnd} of {filteredComparisonRows.length} LO</span><label><span>Rows</span><select value={comparisonPerPage} onChange={(event) => setComparisonPerPage(Number(event.target.value))}><option value={10}>10</option><option value={25}>25</option><option value={50}>50</option><option value={100}>100</option></select></label><div><button className="phase7-secondary" disabled={comparisonPage <= 1} onClick={() => setComparisonPage((page) => Math.max(1, page - 1))}><ChevronLeft size={15} /> Previous</button><strong>Page {comparisonPage} of {comparisonPageCount}</strong><button className="phase7-secondary" disabled={comparisonPage >= comparisonPageCount} onClick={() => setComparisonPage((page) => Math.min(comparisonPageCount, page + 1))}>Next <ChevronRight size={15} /></button></div></div></>}
+          </Section>
+        </>}
       </div>}
 
       {tab === "simulation" && <div className="phase7-grid-2">
@@ -1516,7 +1769,22 @@ export function Phase7OptimizationPage({ depots, products }: { depots: Depot[]; 
       {deleteBayTarget && <div className="phase7-modal-backdrop"><div className="phase7-modal" role="alertdialog" aria-modal="true" aria-labelledby="phase7-delete-bay-title"><button type="button" className="phase7-modal-close" disabled={busy} onClick={() => setDeleteBayTarget(null)} aria-label="Close delete Bay dialog"><X size={18} /></button><span className="phase7-overline">Delete Loading Bay</span><h3 id="phase7-delete-bay-title">Hapus {String(deleteBayTarget.bay_name || deleteBayTarget.bay_id || "Bay")}?</h3><div className="phase7-delete-warning"><AlertTriangle size={20} /><div><strong>Bay akan dikeluarkan dari konfigurasi aktif depot.</strong><span>Riwayat route dan bay assignment lama tetap dipertahankan untuk audit. Pastikan bay ini tidak lagi dipakai dalam kondisi operasional saat ini.</span></div></div><div className="phase7-action-row is-modal-actions"><button className="phase7-secondary" disabled={busy} onClick={() => setDeleteBayTarget(null)}>Batal</button><button className="phase7-delete-confirm" disabled={busy} onClick={() => void deleteSelectedBay()}>{busy ? <LoaderCircle className="animate-spin" size={16} /> : <Trash2 size={16} />} Delete Bay</button></div></div></div>}
       {plannedETADemoDialog && <div className="phase7-modal-backdrop"><div className="phase7-modal" role="dialog" aria-modal="true" aria-labelledby="phase7-planned-eta-demo-title"><button type="button" className="phase7-modal-close" disabled={busy} onClick={() => setPlannedETADemoDialog(null)} aria-label="Close Planned ETA Depot Demo dialog"><X size={18} /></button><span className="phase7-overline">MT Management Demo</span><h3 id="phase7-planned-eta-demo-title">Planned ETA Depot Demo</h3><p className="phase7-modal-intro">Tanggal dan waktu ini akan mengganti Planned ETA Depot untuk seluruh {vehicles.length} MT pada Job ini.</p><div className="phase7-reference-grid"><label><span>Tanggal Planned ETA</span><input type="date" value={plannedETADemoDialog.date} disabled={busy} onChange={(event) => setPlannedETADemoDialog((current) => current ? { ...current, date: event.target.value } : current)} /></label><label><span>Waktu Planned ETA</span><input type="time" step="60" value={plannedETADemoDialog.time} disabled={busy} onChange={(event) => setPlannedETADemoDialog((current) => current ? { ...current, time: event.target.value } : current)} /></label></div><div className="phase7-reference-summary"><span><small>MT yang diperbarui</small><strong>{vehicles.length} MT</strong></span><span><small>Timezone Depot</small><strong>{job.depot_timezone}</strong></span><span><small>Operating Date Job</small><strong>{job.operating_date}</strong></span></div><div className="phase7-reference-impact"><strong>Lifecycle Planned ETA:</strong><span>Initial dan Re-Optimize hanya menggunakan nilai ini untuk availability MT. Semua MT wajib memiliki Planned ETA yang sama atau lebih lambat dari waktu optimasi; nilai akan otomatis menjadi null setelah run berhasil.</span></div><div className="phase7-action-row is-modal-actions"><button type="button" className="phase7-secondary" disabled={busy} onClick={() => setPlannedETADemoDialog(null)}>Batal</button><button type="button" className="phase7-primary" disabled={busy || !plannedETADemoDialog.date || !plannedETADemoDialog.time} onClick={() => void applyPlannedETADemo()}>{busy ? <LoaderCircle className="animate-spin" size={16} /> : <CalendarClock size={16} />} Terapkan ke Semua MT</button></div></div></div>}
       {readinessOpen && validation && <div className="phase7-modal-backdrop"><div className="phase7-modal is-readiness" role="dialog" aria-modal="true" aria-labelledby="phase7-readiness-title"><button type="button" className="phase7-modal-close" onClick={() => setReadinessOpen(false)} aria-label="Close optimization readiness dialog"><X size={18} /></button><span className="phase7-overline">Pre-Optimization Validation</span><h3 id="phase7-readiness-title">Optimization Readiness</h3><p className="phase7-modal-intro">Hasil ini dihitung dari LO, MT, bay state, loading duration, dan draft constraint yang sedang aktif.</p><div className="phase7-readiness-summary"><span className={badgeClass(validation.status)}>{validation.status}</span><strong>{validation.status === "BLOCKED" ? "Perbaiki semua blocker sebelum menjalankan optimization." : validation.status === "WARNING" ? "Optimization dapat dilanjutkan setelah warning ditinjau." : "Input siap digunakan untuk optimization."}</strong></div><div className="phase7-validation">{validation.messages.map((message) => <div key={message.code} className={`phase7-validation-row is-${message.level.toLowerCase()}`}><strong>{message.code}</strong><span>{message.message}</span></div>)}</div><div className="phase7-action-row is-modal-actions"><button type="button" className="phase7-primary" onClick={() => setReadinessOpen(false)}>Tutup</button></div></div></div>}
-      {optimizationDialog && <div className="phase7-modal-backdrop"><div className="phase7-modal is-optimization" role="dialog" aria-modal="true" aria-labelledby="phase7-optimization-time-title"><button type="button" className="phase7-modal-close" disabled={busy} onClick={() => setOptimizationDialog(null)} aria-label="Close optimization time dialog"><X size={18} /></button><span className="phase7-overline">{optimizationDialog.reroute ? "Re-Optimize Operational Plan" : "Initial Optimization"}</span><h3 id="phase7-optimization-time-title">Tentukan tanggal dan waktu optimasi</h3><p className="phase7-modal-intro">Waktu ini bukan sekadar waktu pencatatan. Backend menggunakannya sebagai patokan availability MT, Bay State Effective, waktu departure dan route, serta freeze window saat Re-optimize.</p><div className="phase7-reference-grid"><label><span>Tanggal Optimasi</span><input type="date" value={optimizationDialog.date} disabled={optimizationDialog.reroute || busy} onChange={(event) => setOptimizationDialog((current) => current ? { ...current, date: event.target.value } : current)} /></label><label><span>Waktu Optimasi</span><input type="time" step="60" value={optimizationDialog.time} disabled={busy} onChange={(event) => setOptimizationDialog((current) => current ? { ...current, time: event.target.value } : current)} /></label></div><div className="phase7-reference-summary"><span><small>Timezone Depot</small><strong>{job.depot_timezone}</strong></span><span><small>Operating Date Job</small><strong>{job.operating_date}</strong></span><span><small>Initial Reference</small><strong>{job.initial_optimization_reference_time ? displayDateTime(job.initial_optimization_reference_time, job.depot_timezone) : "Belum ada"}</strong></span><span><small>Latest Reference</small><strong>{job.latest_optimization_reference_time ? displayDateTime(job.latest_optimization_reference_time, job.depot_timezone) : "Belum ada"}</strong></span></div><div className="phase7-reference-impact">{optimizationDialog.reroute ? <><strong>Patokan freeze dan bay:</strong><span>DONE dan ONGOING tetap frozen. PLANNED di dalam window mengikuti mode Freeze Window, sedangkan state/queue bay berlaku tepat pada waktu reroute ini.</span></> : <><strong>Patokan availability, bay, dan route:</strong><span>Route tidak dimulai sebelum waktu referensi ini. State/queue bay juga berlaku pada waktu ini; ETA MT dan jam operasional mengikuti mode constraint yang dipilih.</span></>}</div>{(optimizationDialogError || error) && <div className="phase7-inline-alert is-error"><AlertTriangle size={17} />{optimizationDialogError || error}</div>}<div className="phase7-action-row is-modal-actions"><button type="button" className="phase7-secondary" disabled={busy} onClick={() => setOptimizationDialog(null)}>Batal</button><button type="button" className="phase7-primary" disabled={busy || Boolean(optimizationDialogError)} onClick={() => void optimize(optimizationDialog.reroute, `${optimizationDialog.date}T${optimizationDialog.time}:00`)}>{busy ? <LoaderCircle className="animate-spin" size={16} /> : optimizationDialog.reroute ? <RefreshCw size={16} /> : <Play size={16} />}{optimizationDialog.reroute ? "Jalankan Re-Optimize" : "Jalankan Initial Optimization"}</button></div></div></div>}
+      {optimizationDialog && <div className="phase7-modal-backdrop"><div className="phase7-modal is-optimization" role="dialog" aria-modal="true" aria-labelledby="phase7-optimization-time-title">
+        <button type="button" className="phase7-modal-close" disabled={busy} onClick={() => setOptimizationDialog(null)} aria-label="Close optimization time dialog"><X size={18} /></button>
+        <span className="phase7-overline">{optimizationDialog.reroute ? "Re-Optimize Operational Plan" : "Initial Optimization"}</span>
+        <h3 id="phase7-optimization-time-title">Tentukan tanggal dan waktu optimasi</h3>
+        <p className="phase7-modal-intro">Waktu ini menjadi patokan availability MT, Bay State Effective, departure/route, serta freeze window. Sistem juga menghitung saran Route Time Limit dari beban LO dan MT saat ini.</p>
+        <div className="phase7-reference-grid"><label><span>Tanggal Optimasi</span><input type="date" value={optimizationDialog.date} disabled={optimizationDialog.reroute || busy} onChange={(event) => setOptimizationDialog((current) => current ? { ...current, date: event.target.value } : current)} /></label><label><span>Waktu Optimasi</span><input type="time" step="60" value={optimizationDialog.time} disabled={busy} onChange={(event) => setOptimizationDialog((current) => current ? { ...current, time: event.target.value } : current)} /></label></div>
+        <div className="phase7-reference-summary"><span><small>Timezone Depot</small><strong>{job.depot_timezone}</strong></span><span><small>Operating Date Job</small><strong>{job.operating_date}</strong></span><span><small>Initial Reference</small><strong>{job.initial_optimization_reference_time ? displayDateTime(job.initial_optimization_reference_time, job.depot_timezone) : "Belum ada"}</strong></span><span><small>Latest Reference</small><strong>{job.latest_optimization_reference_time ? displayDateTime(job.latest_optimization_reference_time, job.depot_timezone) : "Belum ada"}</strong></span></div>
+        <div className="phase7-reference-impact">{optimizationDialog.reroute ? <><strong>Patokan freeze dan bay:</strong><span>DONE dan ONGOING tetap frozen. PLANNED di dalam window mengikuti mode Freeze Window, sedangkan state/queue bay berlaku tepat pada waktu reroute ini.</span></> : <><strong>Patokan availability, bay, dan route:</strong><span>Route tidak dimulai sebelum waktu referensi ini. State/queue bay juga berlaku pada waktu ini; ETA MT dan jam operasional mengikuti mode constraint yang dipilih.</span></>}</div>
+        {routeTimeRecommendation && <div className={`phase7-route-limit-advice ${routeTimeRecommendation.below_recommendation ? "is-warning" : "is-ready"}`}>
+          <div><Clock3 size={18} /><span><small>Route Time Limit saat ini</small><strong>{routeTimeRecommendation.configured_seconds} detik</strong></span><span><small>Saran minimum sistem</small><strong>{routeTimeRecommendation.recommended_minimum_seconds} detik</strong></span></div>
+          <p>Dihitung kasar dari {routeTimeRecommendation.lo_count} LO optimizable, {routeTimeRecommendation.mt_count} MT tersedia, dan estimasi {routeTimeRecommendation.estimated_lo_per_mt} LO/MT. Saran ini mengurangi risiko TIMEOUT, tetapi bukan jaminan feasibility.</p>
+          {routeTimeRecommendation.requires_confirmation && <label className="phase7-check"><input type="checkbox" checked={optimizationDialog.routeTimeLimitConfirmed} onChange={(event) => setOptimizationDialog((current) => current ? { ...current, routeTimeLimitConfirmed: event.target.checked } : current)} /><span>Saya sudah meninjau saran sistem dan tetap menjalankan Route Time Limit {routeTimeRecommendation.configured_seconds} detik.</span></label>}
+        </div>}
+        {(optimizationDialogError || error) && <div className="phase7-inline-alert is-error"><AlertTriangle size={17} />{optimizationDialogError || error}</div>}
+        <div className="phase7-action-row is-modal-actions"><button type="button" className="phase7-secondary" disabled={busy} onClick={() => setOptimizationDialog(null)}>Batal</button><button type="button" className="phase7-primary" disabled={busy || Boolean(optimizationDialogError)} onClick={() => void optimize(optimizationDialog.reroute, `${optimizationDialog.date}T${optimizationDialog.time}:00`, optimizationDialog.routeTimeLimitConfirmed)}>{busy ? <LoaderCircle className="animate-spin" size={16} /> : optimizationDialog.reroute ? <RefreshCw size={16} /> : <Play size={16} />}{optimizationDialog.reroute ? "Jalankan Re-Optimize" : "Jalankan Initial Optimization"}</button></div>
+      </div></div>}
     </div>
   );
 }

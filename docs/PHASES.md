@@ -108,9 +108,10 @@ The repository includes read-only Phase 2–4 intelligence, persisted Phase 5 ML
 - Google role: prebuilt distance/time matrix, cache, final selected-leg geometry, and map display only; Google is never called from a solver callback
 - Hard compatibility: Phase 1 vehicle-class limit, canonical tag subset, depot, capacity, compartments, availability, working time, SPBU window, frozen assignment, and bay products
 - Soft evidence: Phase 3 pairing, Phase 4 MT affinity, Phase 6 vehicle/grouping, and previous-plan stability penalties
-- Reroute: freeze DONE, ONGOING, and near-term PLANNED; actual ETA/bay/queue overrides previous prediction; never rerun Phase 6 automatically
+- Reroute: current Route Version seeds the next version; copy DONE, retain ONGOING with actual return ETA, lock on-time near-term MT/sequence with recalculated time, and release late/unavailable future work; never rerun Phase 6 automatically
+- Operational UI: LO System ETA resolves the current trip's return-to-depot time; MT Delivery Status is derived from assigned LO state with `ONGOING > DONE > PLANNED`; Comparison audits Phase 6 against V1/V2/... or two Route Versions per LO, MT, gate-out, and ETA Depot
 - Versioning: every optimization appends V1/V2/... plus state snapshot, parameter snapshot/checksum, solver metadata, cost, dropped reason, and comparison
 - End of day: all-DONE closes the Job without a new version; remaining LO at depot close is explicit `UNSERVED_END_OF_DAY`
 - Schema: migration `0019_phase7_dynamic_vrp`
-- Algorithm: `phase7.dynamic_multitrip_vrp_bay.v4` (`FIFO_BALANCED` operational bay scheduling plus post-bay alternative-MT retry)
+- Algorithm: `phase7.dynamic_multitrip_vrp_bay.v6` (`FIFO_BALANCED`, per-trip candidate-audited post-bay repair, current Route Version reroute seed, and actual-state-aware future-trip release)
 - Technical documentation: `docs/PHASE_7_DYNAMIC_VRP.md`

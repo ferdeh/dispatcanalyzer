@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import heapq
 import math
 from collections import defaultdict
@@ -229,6 +230,49 @@ class VRPOptimizationService:
                 routes.append({"vehicle_index": vehicle_index, "node_indices": selected, "start_minutes": start_minutes})
         return routes, served, "FEASIBLE", 0.0
 
+    @staticmethod
+    def _build_warm_routes(
+        remaining: list[dict],
+        vehicles: list[dict],
+        *,
+        source: str,
+    ) -> tuple[list[list[int]], int]:
+        """Build the per-round seed without turning it into a hard plan.
+
+        Initial optimization follows the immutable Phase 6 MT preference.
+        Reroute follows the next not-yet-executed trip from the current Route
+        Version for each physical MT. Later current-version trips are seeded in
+        later multi-trip rounds after completed_trip_count advances.
+        """
+        source = str(source or "PHASE6").upper()
+        mt_index_by_id = {str(vehicle["mt_id"]): index for index, vehicle in enumerate(vehicles)}
+        candidates: list[list[tuple[int, str, int]]] = [[] for _ in vehicles]
+        for node, lo in enumerate(remaining, start=1):
+            if source == "CURRENT_ROUTE":
+                vehicle_id = lo.get("current_vehicle_id")
+                trip_number = lo.get("current_trip_number")
+                if vehicle_id not in mt_index_by_id or trip_number is None:
+                    continue
+                vehicle_index = mt_index_by_id[str(vehicle_id)]
+                expected_trip = int(vehicles[vehicle_index].get("completed_trip_count") or 0) + 1
+                if int(trip_number) != expected_trip:
+                    continue
+                sequence = int(lo.get("current_stop_sequence") or 0)
+            else:
+                vehicle_id = lo.get("phase6_predicted_vehicle_id")
+                if vehicle_id not in mt_index_by_id:
+                    continue
+                vehicle_index = mt_index_by_id[str(vehicle_id)]
+                sequence = node
+            if str(vehicle_id) not in {str(mt_id) for mt_id in lo.get("allowed_vehicle_ids") or []}:
+                continue
+            candidates[vehicle_index].append((sequence, str(lo["loading_order_id"]), node))
+        routes = [
+            [node for _, _, node in sorted(vehicle_rows)]
+            for vehicle_rows in candidates
+        ]
+        return routes, sum(len(route) for route in routes)
+
     def _solve_round(
         self,
         *,
@@ -389,6 +433,7 @@ class VRPOptimizationService:
                 )
 
         mt_index_by_id = {vehicle["mt_id"]: index for index, vehicle in enumerate(vehicles)}
+        locked_nodes_by_trip: dict[tuple[str, int], list[tuple[int, int]]] = defaultdict(list)
         for node, lo in enumerate(remaining, start=1):
             index = manager.NodeToIndex(node)
             allowed = [mt_index_by_id[mt_id] for mt_id in lo.get("allowed_vehicle_ids") or [] if mt_id in mt_index_by_id]
@@ -396,6 +441,14 @@ class VRPOptimizationService:
             if constraint_is_hard(parameters, "phase6_vehicle_preference") and preferred in mt_index_by_id:
                 allowed = [vehicle_index for vehicle_index in allowed if vehicle_index == mt_index_by_id[preferred]]
             current_vehicle = lo.get("current_vehicle_id")
+            current_trip_number = lo.get("current_trip_number")
+            reroute_locked = bool(lo.get("reroute_assignment_locked"))
+            locked_for_this_round = False
+            if reroute_locked and current_vehicle in mt_index_by_id and current_trip_number is not None:
+                current_vehicle_index = mt_index_by_id[current_vehicle]
+                expected_trip_number = int(vehicles[current_vehicle_index].get("completed_trip_count") or 0) + 1
+                locked_for_this_round = int(current_trip_number) == expected_trip_number
+                allowed = [current_vehicle_index] if locked_for_this_round else []
             if constraint_is_hard(parameters, "previous_vehicle_stability") and current_vehicle in mt_index_by_id:
                 allowed = [vehicle_index for vehicle_index in allowed if vehicle_index == mt_index_by_id[current_vehicle]]
             if constraint_is_hard(parameters, "historical_mt_affinity_preference") and allowed:
@@ -410,7 +463,16 @@ class VRPOptimizationService:
                 # unserved; OR-Tools otherwise interprets an omitted vehicle
                 # restriction as "all vehicles allowed".
                 routing.ActiveVar(index).SetValue(0)
-            if constraint_is_hard(parameters, "serve_loading_order"):
+            if reroute_locked and not locked_for_this_round:
+                # Preserve a later V1/V2 trip for the corresponding later
+                # physical multi-trip round instead of merging it early.
+                routing.ActiveVar(index).SetValue(0)
+            elif reroute_locked:
+                routing.ActiveVar(index).SetValue(1)
+                locked_nodes_by_trip[(str(current_vehicle), int(current_trip_number))].append(
+                    (int(lo.get("current_stop_sequence") or 0), index)
+                )
+            elif constraint_is_hard(parameters, "serve_loading_order"):
                 routing.ActiveVar(index).SetValue(1)
             else:
                 routing.AddDisjunction([index], constraint_penalty(parameters, "serve_loading_order"))
@@ -422,6 +484,20 @@ class VRPOptimizationService:
                 elif constraint_is_soft(parameters, "spbu_time_window"):
                     time_dimension.SetCumulVarSoftLowerBound(index, start, constraint_penalty(parameters, "spbu_time_window"))
                     time_dimension.SetCumulVarSoftUpperBound(index, end, constraint_penalty(parameters, "spbu_time_window"))
+
+        # Hard-freeze retains the relative V1/V2 stop sequence while allowing
+        # actual availability and the bay scheduler to recalculate timestamps.
+        for locked_nodes in locked_nodes_by_trip.values():
+            by_sequence: dict[int, list[int]] = defaultdict(list)
+            for sequence, index in locked_nodes:
+                by_sequence[sequence].append(index)
+            ordered_sequences = sorted(by_sequence)
+            for source_sequence, target_sequence in zip(ordered_sequences, ordered_sequences[1:]):
+                for source_index in by_sequence[source_sequence]:
+                    for target_index in by_sequence[target_sequence]:
+                        routing.solver().Add(
+                            time_dimension.CumulVar(source_index) <= time_dimension.CumulVar(target_index)
+                        )
 
         for grouping_constraint, grouping_key in (
             ("phase6_shipment_preference", "phase6_predicted_shipment_id"),
@@ -466,11 +542,11 @@ class VRPOptimizationService:
         )
         search.log_search = False
 
-        warm_routes: list[list[int]] = [[] for _ in vehicles]
-        for node, lo in enumerate(remaining, start=1):
-            preferred_index = mt_index_by_id.get(lo.get("phase6_predicted_vehicle_id"))
-            if preferred_index is not None and lo.get("phase6_predicted_vehicle_id") in set(lo.get("allowed_vehicle_ids") or []):
-                warm_routes[preferred_index].append(node)
+        warm_routes, _ = self._build_warm_routes(
+            remaining,
+            vehicles,
+            source=str(parameters.get("route_warm_start_source") or "PHASE6"),
+        )
         warm_assignment = routing.ReadAssignmentFromRoutes(warm_routes, True) if any(warm_routes) else None
         solution = routing.SolveFromAssignmentWithParameters(warm_assignment, search) if warm_assignment else routing.SolveWithParameters(search)
         if solution is None:
@@ -521,6 +597,7 @@ class VRPOptimizationService:
         trips: list[dict] = []
         dropped: list[dict] = []
         solver_statuses: list[str] = []
+        warm_start_rounds: list[dict] = []
         objective_value = 0.0
         depot_close_minutes = _minutes_between(day_start, depot_close)
         max_trips = int(parameters.get("maximum_trips_per_mt", 6))
@@ -557,6 +634,17 @@ class VRPOptimizationService:
             matrix_indexes = [0, *[original_index[str(row["loading_order_id"])] for row in remaining]]
             round_distance = [[distance_matrix[i][j] for j in matrix_indexes] for i in matrix_indexes]
             round_time = [[time_matrix[i][j] for j in matrix_indexes] for i in matrix_indexes]
+            warm_routes, warm_seeded_lo_count = self._build_warm_routes(
+                remaining,
+                active_vehicles,
+                source=str(parameters.get("route_warm_start_source") or "PHASE6"),
+            )
+            warm_start_rounds.append({
+                "round": trip_round,
+                "source": str(parameters.get("route_warm_start_source") or "PHASE6").upper(),
+                "seeded_lo_count": warm_seeded_lo_count,
+                "seeded_vehicle_count": sum(bool(route) for route in warm_routes),
+            })
             raw_routes, _, status, round_objective = self._solve_round(
                 remaining=remaining,
                 vehicles=active_vehicles,
@@ -736,6 +824,9 @@ class VRPOptimizationService:
                 "route_time_limit_reached": time_limit_reached,
                 "time_limit_reached": time_limit_reached,
                 "duration_ms": round((perf_counter() - solve_started) * 1000),
+                "route_warm_start_source": str(parameters.get("route_warm_start_source") or "PHASE6").upper(),
+                "route_warm_start_version_id": parameters.get("route_warm_start_version_id"),
+                "warm_start_rounds": warm_start_rounds,
                 "constraint_violation_count": sum(len(trip.get("constraint_violations") or []) for trip in trips),
                 "constraint_penalty_cost": sum(float(trip.get("constraint_penalty_cost") or 0) for trip in trips),
             },
@@ -1061,11 +1152,15 @@ class BayQueueOptimizationService:
                 "trip_index": trip_index,
                 "master_bay_id": bay_id,
                 "vehicle_ready_at_depot": ready_at,
-                "queue_start": ready_at,
+                # A ready MT may remain parked until it is operationally
+                # released to the selected bay. Future system-planned work
+                # therefore starts at queue entry/loading readiness, not at
+                # its passive availability ETA.
+                "queue_start": selected["loading_start"],
                 "loading_start": selected["loading_start"],
                 "loading_finish": selected["loading_finish"],
                 "gate_out": selected["gate_out"],
-                "queue_minutes": _minutes_between(ready_at, selected["loading_start"]),
+                "queue_minutes": 0,
                 "loading_minutes": int(selected["loading_minutes"]),
                 "constraint_violations": selected["violations"],
                 "fifo_sequence": fifo_sequence,
@@ -1584,8 +1679,11 @@ class OptimizationCoordinatorService:
                     float(row.get("penalty") or 0) for row in trip["constraint_violations"]
                 )
                 trip["estimated_return_depot"] = _utc(trip["estimated_return_depot"]) + shift
+                trip["working_start_at"] = _utc(
+                    trip.get("queue_start") or trip.get("loading_start") or trip["vehicle_ready_at_depot"]
+                )
                 trip["operating_minutes"] = _minutes_between(
-                    trip["vehicle_ready_at_depot"], trip["estimated_return_depot"]
+                    trip["working_start_at"], trip["estimated_return_depot"]
                 )
                 current_gateouts.append(_utc(trip["gate_out"]))
             if previous_gateouts and len(previous_gateouts) == len(current_gateouts):
@@ -1631,7 +1729,11 @@ class OptimizationCoordinatorService:
             )
             for index in dropped
         }
-        retryable_time_failures: set[int] = set()
+        retryable_failures: set[int] = {
+            index
+            for index, reason_code in bay_drop_reason_codes.items()
+            if reason_code in {"BAY_WINDOW_EXHAUSTED", "BAY_CONGESTION", "BAY_PRODUCT_CONSTRAINT"}
+        }
         tolerance = int(parameters.get("departure_time_tolerance_minutes", 5))
         working_limit = {row["mt_id"]: int(row["working_time_limit_minutes"]) for row in vehicles}
         cumulative_working = {row["mt_id"]: int(row.get("working_time_used_minutes") or 0) for row in vehicles}
@@ -1648,7 +1750,7 @@ class OptimizationCoordinatorService:
             if projected > working_limit.get(vehicle_id, 0):
                 if constraint_is_hard(parameters, "vehicle_working_time"):
                     dropped.add(trip_index)
-                    retryable_time_failures.add(trip_index)
+                    retryable_failures.add(trip_index)
                     reasons[trip_index] = (
                         "VEHICLE_TIME_EXHAUSTED",
                         "The assigned MT exceeded its hard working-time limit after bay scheduling; alternative compatible MT will be attempted before final drop.",
@@ -1700,7 +1802,7 @@ class OptimizationCoordinatorService:
             trip["constraint_penalty_cost"] = sum(
                 float(row.get("penalty") or 0) for row in trip.get("constraint_violations") or []
             )
-        return dropped, reasons, retryable_time_failures
+        return dropped, reasons, retryable_failures
 
     @staticmethod
     def _vehicles_after_retained_trips(vehicles: list[dict], trips: list[dict]) -> list[dict]:
@@ -1799,7 +1901,7 @@ class OptimizationCoordinatorService:
             bay_result["dropped_trip_reasons"] = {
                 index: "BAY_CONGESTION" for index in range(len(trips))
             }
-        bay_dropped, hard_drop_reasons, retryable_time_failures = self._post_bay_failures(
+        bay_dropped, hard_drop_reasons, retryable_failures = self._post_bay_failures(
             trips=trips,
             bay_result=bay_result,
             vehicles=vehicles,
@@ -1817,6 +1919,8 @@ class OptimizationCoordinatorService:
         post_bay_reassignment_timeout_lo_ids: set[str] = set()
         post_bay_final_drop_groups: set[tuple[str, ...]] = set()
         post_bay_route_statuses: list[str] = []
+        post_bay_candidate_audit: list[dict] = []
+        post_bay_split_group_count = 0
         route_retry_time_limit = max(
             1,
             int(parameters.get("route_optimization_time_limit", parameters.get("optimization_time_limit", 30))),
@@ -1832,255 +1936,294 @@ class OptimizationCoordinatorService:
                 "reason_description": reason_description,
             }
 
-        # A route is only preliminary until the bay schedule has supplied its
-        # authoritative queue/loading/gate-out times.  If that shift exhausts
-        # an MT's hard working time, return the trip's LO to routing, block the
-        # failed MT for those LO, and recompute candidates from the retained
-        # post-bay vehicle state.  Every retry is then scheduled globally with
-        # all retained trips so it cannot introduce an overlapping bay plan.
-        while retryable_time_failures:
-            retained_trips = [
-                trip for index, trip in enumerate(trips)
-                if index not in bay_dropped
+        # A route remains preliminary until FIFO bay scheduling validates it.
+        # Return every retryable post-bay failure to an isolated physical-trip
+        # repair queue. Each group is tested against one compatible MT at a
+        # time, then globally re-scheduled with retained trips. This prevents
+        # one infeasible retry group from forcing all other retry LO to drop.
+        pending_groups: list[dict] = []
+        retained_trips: list[dict] = []
+        for trip_index, trip in enumerate(trips):
+            if trip_index not in bay_dropped:
+                retained_trips.append(trip)
+                continue
+            reason_code, reason_description = hard_drop_reasons.get(
+                trip_index,
+                ("NO_FEASIBLE_ROUTE", "Trip violates an active hard post-bay constraint."),
+            )
+            orders = [
+                {key: value for key, value in assignment.items() if key != "compartment_id"}
+                for assignment in trip.get("lo_assignments") or []
             ]
-            retry_orders_by_id: dict[str, dict] = {}
+            if trip_index in retryable_failures and orders:
+                for order in orders:
+                    failed_vehicle_ids_by_lo[str(order["loading_order_id"])].add(str(trip["vehicle_id"]))
+                pending_groups.append({
+                    "orders": orders,
+                    "original_reason_code": reason_code,
+                    "original_reason_description": reason_description,
+                    "failed_vehicle_id": str(trip["vehicle_id"]),
+                })
+                continue
+            group_ids = tuple(sorted(str(order["loading_order_id"]) for order in orders))
+            if group_ids:
+                post_bay_final_drop_groups.add(group_ids)
+            for order in orders:
+                record_post_bay_drop(order, reason_code=reason_code, reason_description=reason_description)
+        trips = retained_trips
+        bay_dropped = set()
+        hard_drop_reasons = {}
+        retryable_failures = set()
 
-            for trip_index in sorted(bay_dropped - retryable_time_failures):
-                trip = trips[trip_index]
-                group_ids = tuple(sorted(str(lo["loading_order_id"]) for lo in trip.get("lo_assignments") or []))
-                if group_ids:
-                    post_bay_final_drop_groups.add(group_ids)
-                reason_code, reason_description = hard_drop_reasons.get(
-                    trip_index,
-                    ("NO_FEASIBLE_ROUTE", "Trip violates an active hard post-bay constraint."),
+        while pending_groups:
+            pending = pending_groups.pop(0)
+            retry_orders = list(pending["orders"])
+            group_ids = tuple(sorted(str(order["loading_order_id"]) for order in retry_orders))
+            split_blocked = (
+                (
+                    constraint_is_hard(parameters, "phase6_shipment_preference")
+                    and any(order.get("phase6_predicted_shipment_id") for order in retry_orders)
                 )
-                for lo in trip.get("lo_assignments") or []:
-                    record_post_bay_drop(
-                        lo,
-                        reason_code=reason_code,
-                        reason_description=reason_description,
-                    )
-
-            for trip_index in sorted(retryable_time_failures):
-                trip = trips[trip_index]
-                failed_vehicle_id = str(trip["vehicle_id"])
-                exhausted_in_group = False
-                group_ids = tuple(sorted(str(lo["loading_order_id"]) for lo in trip.get("lo_assignments") or []))
-                for assignment in trip.get("lo_assignments") or []:
-                    loading_order_id = str(assignment["loading_order_id"])
-                    failed_vehicle_ids_by_lo[loading_order_id].add(failed_vehicle_id)
-                    allowed_vehicle_ids = [
-                        str(mt_id)
-                        for mt_id in assignment.get("allowed_vehicle_ids") or []
-                        if str(mt_id) not in failed_vehicle_ids_by_lo[loading_order_id]
-                    ]
-                    retry_order = {
-                        key: value for key, value in assignment.items()
-                        if key != "compartment_id"
-                    }
-                    retry_order["allowed_vehicle_ids"] = allowed_vehicle_ids
-                    if not allowed_vehicle_ids:
-                        exhausted_in_group = True
-                        post_bay_reassignment_exhausted_lo_ids.add(loading_order_id)
-                        record_post_bay_drop(
-                            retry_order,
-                            reason_code="VEHICLE_TIME_EXHAUSTED",
-                            reason_description=(
-                                "Every compatible alternative MT was attempted or excluded by its actual "
-                                "post-bay working-time state; no reassignment remained feasible."
-                            ),
-                        )
-                        continue
-                    retry_orders_by_id[loading_order_id] = retry_order
-                if exhausted_in_group and group_ids:
-                    post_bay_final_drop_groups.add(group_ids)
-
-            trips = retained_trips
-            bay_dropped = set()
-            hard_drop_reasons = {}
-            retryable_time_failures = set()
-            retry_orders = list(retry_orders_by_id.values())
-            if not retry_orders:
-                break
-
-            remaining_route_retry_seconds = route_retry_time_limit - route_retry_time_used_seconds
-            remaining_bay_seconds = coordination_time_limit - bay_time_used_seconds
-            if remaining_route_retry_seconds <= 0 or remaining_bay_seconds <= 0:
-                coordination_time_limit_reached = coordination_time_limit_reached or remaining_bay_seconds <= 0
-                terminal_solver_status = terminal_solver_status or "TIMEOUT"
-                for lo in retry_orders:
-                    loading_order_id = str(lo["loading_order_id"])
-                    post_bay_reassignment_timeout_lo_ids.add(loading_order_id)
-                    record_post_bay_drop(
-                        lo,
-                        reason_code="POST_BAY_REASSIGNMENT_TIMEOUT",
-                        reason_description=(
-                            "Post-bay reassignment stopped when its independent route or bay time budget expired; "
-                            "candidate infeasibility was not proven."
-                        ),
-                    )
-                post_bay_final_drop_groups.add(tuple(sorted(retry_orders_by_id)))
-                break
-
+                or (
+                    constraint_is_hard(parameters, "previous_shipment_stability")
+                    and any(order.get("current_shipment_id") for order in retry_orders)
+                )
+                or (
+                    constraint_is_hard(parameters, "freeze_window")
+                    and any(order.get("freeze_window_candidate") for order in retry_orders)
+                )
+            )
             retry_vehicles = self._vehicles_after_retained_trips(vehicles, trips)
-            retry_distance_matrix, retry_time_matrix = self._retry_matrix(
-                loading_orders,
-                retry_orders,
-                distance_matrix,
-                time_matrix,
-            )
-            retry_constraint_rules = {
-                key: dict(value)
-                for key, value in (parameters.get("constraint_rules") or {}).items()
-            }
-            retry_constraint_rules["serve_loading_order"] = {
-                **retry_constraint_rules.get("serve_loading_order", {}),
-                "enabled": True,
-                "mode": "HARD",
-            }
-            retry_parameters = {
-                **parameters,
-                "constraint_rules": retry_constraint_rules,
-                "route_optimization_time_limit": max(1, math.ceil(remaining_route_retry_seconds)),
-            }
-            route_retry_started = perf_counter()
-            retry_result = self.vrp.solve(
-                loading_orders=retry_orders,
-                vehicles=retry_vehicles,
-                distance_matrix=retry_distance_matrix,
-                time_matrix=retry_time_matrix,
-                day_start=day_start,
-                depot_close=depot_close,
-                parameters=retry_parameters,
-            )
-            route_retry_time_used_seconds += perf_counter() - route_retry_started
-            post_bay_reassignment_attempts += 1
-            post_bay_route_statuses.append(str(retry_result.get("solver_status") or "UNKNOWN"))
-            vrp_result["objective_value"] = float(vrp_result.get("objective_value") or 0) + float(
-                retry_result.get("objective_value") or 0
-            )
-            retry_trips = list(retry_result.get("trips") or [])
-            reassigned_ids = {
-                str(lo["loading_order_id"])
-                for trip in retry_trips
-                for lo in trip.get("lo_assignments") or []
-            }
-            post_bay_reassigned_lo_ids.update(reassigned_ids)
+            retry_vehicle_by_id = {str(row["mt_id"]): row for row in retry_vehicles}
+            allowed_sets = [
+                {
+                    str(mt_id)
+                    for mt_id in order.get("allowed_vehicle_ids") or []
+                    if str(mt_id) not in failed_vehicle_ids_by_lo[str(order["loading_order_id"])]
+                }
+                for order in retry_orders
+            ]
+            candidate_ids = set.intersection(*allowed_sets) if allowed_sets else set()
+            candidate_ids &= set(retry_vehicle_by_id)
+            candidate_rows = [retry_vehicle_by_id[mt_id] for mt_id in candidate_ids]
+            candidate_rows.sort(key=lambda row: (
+                1 if int(row.get("working_time_used_minutes") or 0) > 0 or int(row.get("completed_trip_count") or 0) > 0 else 0,
+                _utc(row.get("effective_eta_depot") or row.get("availability_eta_depot") or day_start),
+                -int(row.get("working_time_remaining_minutes") or 0),
+                str(row["mt_id"]),
+            ))
+            group_candidate_reasons: list[str] = []
+            group_timed_out = False
+            accepted = False
 
-            retry_terminal_status = (
-                retry_result.get("solver_status")
-                if retry_result.get("solver_status") in {"TIMEOUT", "UNKNOWN", "FAILED"}
-                else None
-            )
-            if retry_terminal_status:
-                terminal_solver_status = retry_terminal_status
-            for dropped_lo in retry_result.get("dropped") or []:
-                loading_order_id = str(dropped_lo["loading_order_id"])
-                if loading_order_id in reassigned_ids:
+            for candidate in candidate_rows:
+                candidate_id = str(candidate["mt_id"])
+                audit = {
+                    "loading_order_ids": list(group_ids),
+                    "candidate_mt_id": candidate_id,
+                    "available_at": _utc(candidate.get("effective_eta_depot") or candidate.get("availability_eta_depot") or day_start).isoformat(),
+                    "working_time_remaining_minutes": int(candidate.get("working_time_remaining_minutes") or 0),
+                    "status": "REJECTED",
+                    "reason_code": None,
+                }
+                if (
+                    constraint_is_hard(parameters, "vehicle_capacity")
+                    and candidate.get("capacity_kl") is not None
+                    and sum(float(order["volume_kl"]) for order in retry_orders) > float(candidate["capacity_kl"]) + 1e-9
+                ):
+                    audit["reason_code"] = "INSUFFICIENT_CAPACITY"
+                    group_candidate_reasons.append("INSUFFICIENT_CAPACITY")
+                    post_bay_candidate_audit.append(audit)
                     continue
-                if retry_terminal_status:
-                    post_bay_reassignment_timeout_lo_ids.add(loading_order_id)
-                    record_post_bay_drop(
-                        dropped_lo,
-                        reason_code="POST_BAY_REASSIGNMENT_TIMEOUT",
-                        reason_description=(
-                            "Post-bay route reassignment ended as TIMEOUT/UNKNOWN before all compatible "
-                            "MT candidates could be proven infeasible."
-                        ),
-                    )
-                else:
-                    post_bay_reassignment_exhausted_lo_ids.add(loading_order_id)
-                    record_post_bay_drop(
-                        dropped_lo,
-                        reason_code="VEHICLE_TIME_EXHAUSTED",
-                        reason_description=(
-                            "The post-bay routing retry evaluated the remaining compatible MT pool using "
-                            "actual retained working time, but no alternative assignment was feasible."
-                        ),
-                    )
-            unserved_retry_ids = set(retry_orders_by_id) - reassigned_ids
-            if unserved_retry_ids:
-                post_bay_final_drop_groups.add(tuple(sorted(unserved_retry_ids)))
-            if not retry_trips:
-                # Defensive coverage for custom/fallback solvers that omit a
-                # dropped row while returning no route.
-                for loading_order_id in unserved_retry_ids:
-                    if loading_order_id in dropped_by_lo:
-                        continue
-                    lo = retry_orders_by_id[loading_order_id]
-                    post_bay_reassignment_exhausted_lo_ids.add(loading_order_id)
-                    record_post_bay_drop(
-                        lo,
-                        reason_code="VEHICLE_TIME_EXHAUSTED",
-                        reason_description=(
-                            "No remaining compatible MT produced a feasible route from the actual "
-                            "post-bay working-time state."
-                        ),
-                    )
+                if (
+                    constraint_is_hard(parameters, "vehicle_working_time")
+                    and int(candidate.get("working_time_remaining_minutes") or 0) <= 0
+                ):
+                    audit["reason_code"] = "VEHICLE_TIME_EXHAUSTED"
+                    group_candidate_reasons.append("VEHICLE_TIME_EXHAUSTED")
+                    post_bay_candidate_audit.append(audit)
+                    continue
+
+                remaining_route_retry_seconds = route_retry_time_limit - route_retry_time_used_seconds
+                remaining_bay_seconds = coordination_time_limit - bay_time_used_seconds
+                if remaining_route_retry_seconds <= 0 or remaining_bay_seconds <= 0:
+                    group_timed_out = True
+                    coordination_time_limit_reached = coordination_time_limit_reached or remaining_bay_seconds <= 0
+                    audit["reason_code"] = "POST_BAY_REASSIGNMENT_TIMEOUT"
+                    post_bay_candidate_audit.append(audit)
+                    break
+
+                candidate_orders = [
+                    {**order, "allowed_vehicle_ids": [candidate_id]}
+                    for order in retry_orders
+                ]
+                retry_distance_matrix, retry_time_matrix = self._retry_matrix(
+                    loading_orders,
+                    candidate_orders,
+                    distance_matrix,
+                    time_matrix,
+                )
+                retry_constraint_rules = {
+                    key: dict(value)
+                    for key, value in (parameters.get("constraint_rules") or {}).items()
+                }
+                retry_constraint_rules["serve_loading_order"] = {
+                    **retry_constraint_rules.get("serve_loading_order", {}),
+                    "enabled": True,
+                    "mode": "HARD",
+                }
+                candidate_time_limit = max(1, min(5, math.ceil(remaining_route_retry_seconds)))
+                retry_parameters = {
+                    **parameters,
+                    "constraint_rules": retry_constraint_rules,
+                    "maximum_trips_per_mt": 1,
+                    "route_optimization_time_limit": candidate_time_limit,
+                }
+                route_retry_started = perf_counter()
+                retry_result = self.vrp.solve(
+                    loading_orders=candidate_orders,
+                    vehicles=[candidate],
+                    distance_matrix=retry_distance_matrix,
+                    time_matrix=retry_time_matrix,
+                    day_start=day_start,
+                    depot_close=depot_close,
+                    parameters=retry_parameters,
+                )
+                route_retry_time_used_seconds += perf_counter() - route_retry_started
+                post_bay_reassignment_attempts += 1
+                retry_status = str(retry_result.get("solver_status") or "UNKNOWN")
+                post_bay_route_statuses.append(retry_status)
+                retry_trips = list(retry_result.get("trips") or [])
+                reassigned_ids = {
+                    str(order["loading_order_id"])
+                    for retry_trip in retry_trips
+                    for order in retry_trip.get("lo_assignments") or []
+                }
+                if retry_status in {"TIMEOUT", "UNKNOWN", "FAILED"}:
+                    group_timed_out = True
+                    audit["reason_code"] = "POST_BAY_REASSIGNMENT_TIMEOUT"
+                    post_bay_candidate_audit.append(audit)
+                    continue
+                if reassigned_ids != set(group_ids):
+                    reason_code = str((retry_result.get("dropped") or [{}])[0].get("reason_code") or "NO_FEASIBLE_ROUTE")
+                    audit["reason_code"] = reason_code
+                    group_candidate_reasons.append(reason_code)
+                    post_bay_candidate_audit.append(audit)
+                    continue
+
+                trial_trips = copy.deepcopy([*trips, *retry_trips])
+                bay_eval_rules = {
+                    key: dict(value)
+                    for key, value in (parameters.get("constraint_rules") or {}).items()
+                }
+                bay_eval_rules["serve_loading_order"] = {
+                    **bay_eval_rules.get("serve_loading_order", {}),
+                    "enabled": True,
+                    "mode": "SOFT",
+                }
+                bay_eval_parameters = {**parameters, "constraint_rules": bay_eval_rules}
+                bay_retry_started = perf_counter()
+                trial_bay_result, retry_iterations, retry_bay_time_limit_reached = self._schedule_bays(
+                    trips=trial_trips,
+                    bays=bays,
+                    actual_bay_states=actual_bay_states,
+                    initial_queue=initial_queue,
+                    loading_durations=loading_durations,
+                    day_start=day_start,
+                    depot_close=depot_close,
+                    parameters=bay_eval_parameters,
+                    deadline=bay_retry_started + remaining_bay_seconds,
+                )
+                bay_time_used_seconds += perf_counter() - bay_retry_started
+                total_coordination_iterations += retry_iterations
+                coordination_time_limit_reached = coordination_time_limit_reached or retry_bay_time_limit_reached
+                trial_dropped, trial_reasons, _ = self._post_bay_failures(
+                    trips=trial_trips,
+                    bay_result=trial_bay_result,
+                    vehicles=vehicles,
+                    parameters=bay_eval_parameters,
+                    day_start=day_start,
+                )
+                if trial_bay_result.get("solver_status") in {"TIMEOUT", "UNKNOWN", "FAILED"}:
+                    group_timed_out = True
+                    audit["reason_code"] = "POST_BAY_REASSIGNMENT_TIMEOUT"
+                    post_bay_candidate_audit.append(audit)
+                    continue
+                if trial_dropped:
+                    candidate_start_index = len(trips)
+                    candidate_failures = [index for index in trial_dropped if index >= candidate_start_index]
+                    if candidate_failures:
+                        reason_code = trial_reasons.get(candidate_failures[0], ("NO_FEASIBLE_ROUTE", ""))[0]
+                    else:
+                        reason_code = "BAY_CONGESTION"
+                    audit["reason_code"] = reason_code
+                    group_candidate_reasons.append(reason_code)
+                    post_bay_candidate_audit.append(audit)
+                    continue
+
+                trips = trial_trips
+                bay_result = trial_bay_result
+                vrp_result["objective_value"] = float(vrp_result.get("objective_value") or 0) + float(
+                    retry_result.get("objective_value") or 0
+                )
+                post_bay_reassigned_lo_ids.update(reassigned_ids)
+                for loading_order_id in reassigned_ids:
+                    dropped_by_lo.pop(loading_order_id, None)
+                audit["status"] = "ACCEPTED"
+                audit["reason_code"] = "REASSIGNED"
+                post_bay_candidate_audit.append(audit)
+                accepted = True
                 break
 
-            trips_before_retry = list(trips)
-            trips.extend(retry_trips)
-            remaining_bay_seconds = coordination_time_limit - bay_time_used_seconds
-            if remaining_bay_seconds <= 0:
-                coordination_time_limit_reached = True
+            if accepted:
+                continue
+            if len(retry_orders) > 1 and not split_blocked:
+                post_bay_split_group_count += 1
+                pending_groups[0:0] = [
+                    {
+                        "orders": [order],
+                        "original_reason_code": pending["original_reason_code"],
+                        "original_reason_description": pending["original_reason_description"],
+                        "failed_vehicle_id": pending["failed_vehicle_id"],
+                    }
+                    for order in retry_orders
+                ]
+                continue
+
+            if group_timed_out:
+                final_reason_code = "POST_BAY_REASSIGNMENT_TIMEOUT"
+                final_description = (
+                    "Post-bay repair exhausted its route or bay budget before every compatible MT candidate "
+                    "could be proven infeasible. Review the candidate audit and increase Route Time Limit."
+                )
                 terminal_solver_status = terminal_solver_status or "TIMEOUT"
-                trips = trips_before_retry
-                for loading_order_id in reassigned_ids:
-                    lo = retry_orders_by_id[loading_order_id]
-                    post_bay_reassignment_timeout_lo_ids.add(loading_order_id)
-                    record_post_bay_drop(
-                        lo,
-                        reason_code="POST_BAY_REASSIGNMENT_TIMEOUT",
-                        reason_description="The alternative route was found, but no bay time budget remained to validate it.",
-                    )
-                post_bay_final_drop_groups.add(tuple(sorted(reassigned_ids)))
-                break
-
-            bay_retry_started = perf_counter()
-            bay_result, retry_iterations, retry_bay_time_limit_reached = self._schedule_bays(
-                trips=trips,
-                bays=bays,
-                actual_bay_states=actual_bay_states,
-                initial_queue=initial_queue,
-                loading_durations=loading_durations,
-                day_start=day_start,
-                depot_close=depot_close,
-                parameters=parameters,
-                deadline=bay_retry_started + remaining_bay_seconds,
-            )
-            bay_time_used_seconds += perf_counter() - bay_retry_started
-            total_coordination_iterations += retry_iterations
-            coordination_time_limit_reached = coordination_time_limit_reached or retry_bay_time_limit_reached
-            retry_bay_terminal_status = (
-                bay_result.get("solver_status")
-                if bay_result.get("solver_status") in {"TIMEOUT", "UNKNOWN", "FAILED"}
-                else None
-            )
-            if retry_bay_terminal_status and not bay_result.get("assignments"):
-                terminal_solver_status = retry_bay_terminal_status
-                trips = trips_before_retry
-                for loading_order_id in reassigned_ids:
-                    lo = retry_orders_by_id[loading_order_id]
-                    post_bay_reassignment_timeout_lo_ids.add(loading_order_id)
-                    record_post_bay_drop(
-                        lo,
-                        reason_code="POST_BAY_REASSIGNMENT_TIMEOUT",
-                        reason_description=(
-                            "The alternative route was found, but the global bay re-schedule ended as "
-                            "TIMEOUT/UNKNOWN before it could be validated."
-                        ),
-                    )
-                post_bay_final_drop_groups.add(tuple(sorted(reassigned_ids)))
-                bay_dropped = set()
-                break
-            bay_dropped, hard_drop_reasons, retryable_time_failures = self._post_bay_failures(
-                trips=trips,
-                bay_result=bay_result,
-                vehicles=vehicles,
-                parameters=parameters,
-                day_start=day_start,
-            )
+                post_bay_reassignment_timeout_lo_ids.update(group_ids)
+            elif group_candidate_reasons and all(reason == "VEHICLE_TIME_EXHAUSTED" for reason in group_candidate_reasons):
+                final_reason_code = "VEHICLE_TIME_EXHAUSTED"
+                final_description = "Every compatible alternative MT failed its actual retained working-time limit after FIFO bay scheduling."
+                post_bay_reassignment_exhausted_lo_ids.update(group_ids)
+            elif "BAY_WINDOW_EXHAUSTED" in group_candidate_reasons:
+                final_reason_code = "BAY_WINDOW_EXHAUSTED"
+                final_description = "Every compatible alternative MT was tested, but each FIFO loading/gate-out exceeded an active bay or depot window."
+                post_bay_reassignment_exhausted_lo_ids.update(group_ids)
+            elif "BAY_PRODUCT_CONSTRAINT" in group_candidate_reasons:
+                final_reason_code = "BAY_PRODUCT_CONSTRAINT"
+                final_description = "Every compatible alternative MT was tested, but no eligible bay could load this LO product composition."
+                post_bay_reassignment_exhausted_lo_ids.update(group_ids)
+            else:
+                final_reason_code = str(pending["original_reason_code"] or "NO_FEASIBLE_ROUTE")
+                final_description = (
+                    f"All {len(candidate_rows)} remaining compatible MT candidates were evaluated individually "
+                    "against retained working time, route, compartment, and global FIFO bay scheduling; none was feasible."
+                )
+                post_bay_reassignment_exhausted_lo_ids.update(group_ids)
+            post_bay_final_drop_groups.add(group_ids)
+            for order in retry_orders:
+                record_post_bay_drop(
+                    order,
+                    reason_code=final_reason_code,
+                    reason_description=final_description,
+                )
 
         if bay_dropped:
             kept, extra_dropped = [], []
@@ -2138,6 +2281,10 @@ class OptimizationCoordinatorService:
                 "post_bay_reassignment_route_statuses": post_bay_route_statuses,
                 "post_bay_route_time_limit_seconds": route_retry_time_limit,
                 "post_bay_route_time_used_ms": round(route_retry_time_used_seconds * 1000),
+                "post_bay_split_group_count": post_bay_split_group_count,
+                "post_bay_candidate_evaluation_count": len(post_bay_candidate_audit),
+                "post_bay_candidate_audit": post_bay_candidate_audit,
+                "vehicle_working_time_start_basis": "SYSTEM_PLANNED_QUEUE_ENTRY",
                 "constraint_violation_count": final_violation_count,
                 "constraint_penalty_cost": final_constraint_penalty,
             },

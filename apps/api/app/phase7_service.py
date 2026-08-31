@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import uuid
 from collections import Counter, defaultdict
 from datetime import date, datetime, time, timedelta, timezone
@@ -45,6 +46,7 @@ from .models import (
     PredictionRun,
     PredictionShipment,
     PredictionShipmentLine,
+    PredictionTrip,
     ProductCompartmentLoadingDuration,
     RouteAPIRequestLog,
     RouteVersion,
@@ -637,6 +639,22 @@ def list_job_los(db: Session, job_id: str) -> list[dict]:
     rows = db.scalars(select(LOOperationalState).where(LOOperationalState.job_id == job.job_id).order_by(LOOperationalState.loading_order_id)).all()
     mt_ids = {row.phase6_predicted_vehicle_id for row in rows if row.phase6_predicted_vehicle_id} | {row.current_vehicle_id for row in rows if row.current_vehicle_id}
     mts = {row.mt_id: row for row in db.scalars(select(MasterMT).where(MasterMT.mt_id.in_(mt_ids))).all()} if mt_ids else {}
+    system_eta_by_lo: dict[str, datetime] = {}
+    if job.current_route_version_id:
+        system_eta_by_lo = {
+            loading_order_id: estimated_return_depot
+            for loading_order_id, estimated_return_depot in db.execute(
+                select(
+                    RouteVersionLOAssignment.loading_order_id,
+                    RouteVersionTrip.estimated_return_depot,
+                )
+                .join(
+                    RouteVersionTrip,
+                    RouteVersionTrip.route_version_trip_id == RouteVersionLOAssignment.route_version_trip_id,
+                )
+                .where(RouteVersionLOAssignment.route_version_id == job.current_route_version_id)
+            ).all()
+        }
     return [
         {
             "lo_state_id": row.lo_state_id,
@@ -658,6 +676,11 @@ def list_job_los(db: Session, job_id: str) -> list[dict]:
             "current_shipment": row.current_shipment_id,
             "current_compartment": row.current_compartment_id,
             "planned_gate_out": _iso(row.planned_gate_out),
+            # This is intentionally resolved from the LO's exact trip instead
+            # of VehicleOperationalState.system_eta_depot.  The latter is a
+            # one-value MT summary, while a multi-trip LO needs the return ETA
+            # of Trip 1, Trip 2, and so on independently.
+            "system_eta_depot": _iso(system_eta_by_lo.get(row.loading_order_id)),
             "status": row.status,
             "frozen": row.frozen,
             "frozen_reason": row.frozen_reason,
@@ -742,6 +765,59 @@ def load_mt_from_master(db: Session, job_id: str, *, actor: str = "local-user") 
 def list_job_vehicles(db: Session, job_id: str) -> list[dict]:
     job = _require_job(db, job_id)
     rows = db.scalars(select(VehicleOperationalState).where(VehicleOperationalState.job_id == job.job_id).order_by(VehicleOperationalState.registration_snapshot)).all()
+    lo_statuses_by_mt: dict[str, set[str]] = defaultdict(set)
+    for mt_id, lo_status in db.execute(
+        select(LOOperationalState.current_vehicle_id, LOOperationalState.status).where(
+            LOOperationalState.job_id == job.job_id,
+            LOOperationalState.current_vehicle_id.is_not(None),
+        )
+    ).all():
+        lo_statuses_by_mt[str(mt_id)].add(str(lo_status).upper())
+
+    ongoing_eta_by_mt: dict[str, tuple[int, datetime]] = {}
+    if job.current_route_version_id:
+        ongoing_trip_rows = db.execute(
+            select(
+                RouteVersionLOAssignment.vehicle_id,
+                RouteVersionTrip.trip_number,
+                RouteVersionTrip.estimated_return_depot,
+            )
+            .join(
+                RouteVersionTrip,
+                RouteVersionTrip.route_version_trip_id == RouteVersionLOAssignment.route_version_trip_id,
+            )
+            .join(
+                LOOperationalState,
+                LOOperationalState.loading_order_id == RouteVersionLOAssignment.loading_order_id,
+            )
+            .where(
+                RouteVersionLOAssignment.route_version_id == job.current_route_version_id,
+                LOOperationalState.job_id == job.job_id,
+                LOOperationalState.status == "ONGOING",
+            )
+        ).all()
+        for mt_id, trip_number, estimated_return_depot in ongoing_trip_rows:
+            if estimated_return_depot is None:
+                continue
+            key = str(mt_id)
+            candidate = (int(trip_number), estimated_return_depot)
+            if key not in ongoing_eta_by_mt or candidate[0] > ongoing_eta_by_mt[key][0]:
+                ongoing_eta_by_mt[key] = candidate
+
+    def delivery_status(mt_id: str) -> str:
+        statuses = lo_statuses_by_mt.get(mt_id, set())
+        if "ONGOING" in statuses:
+            return "ONGOING"
+        if "DONE" in statuses:
+            return "DONE"
+        return "PLANNED"
+
+    def displayed_system_eta(mt_id: str) -> datetime | None:
+        if delivery_status(mt_id) != "ONGOING":
+            return None
+        ongoing = ongoing_eta_by_mt.get(mt_id)
+        return ongoing[1] if ongoing else None
+
     return [
         {
             "vehicle_state_id": row.vehicle_state_id,
@@ -753,9 +829,13 @@ def list_job_vehicles(db: Session, job_id: str) -> list[dict]:
             "number_of_compartments": row.number_of_compartments,
             "compartments": row.compartment_configuration,
             "planned_eta_depot": _iso(row.planned_eta_depot),
-            "system_eta_depot": _iso(row.system_eta_depot),
+            # MT Management shows a System ETA only while this physical MT has
+            # an ONGOING LO. Resolve it from that LO's exact current-version
+            # trip, so multi-trip MTs display the matching Trip 1/2/... return.
+            "system_eta_depot": _iso(displayed_system_eta(row.mt_id)),
             "effective_eta_depot": _iso(row.planned_eta_depot or row.system_eta_depot),
             "operational_status": row.operational_status,
+            "delivery_status": delivery_status(row.mt_id),
             "working_time_used": row.working_time_used_minutes,
             "working_time_remaining": row.working_time_remaining_minutes,
             "working_time_limit": row.working_time_limit_minutes,
@@ -1007,6 +1087,36 @@ def _planned_eta_issues(
     return missing, before_reference
 
 
+def route_time_limit_recommendation(
+    lo_count: int,
+    mt_count: int,
+    configured_seconds: int,
+) -> dict:
+    """Return a conservative, explainable routing-search budget suggestion.
+
+    This is intentionally a sizing heuristic, not a solver feasibility claim.
+    LO count represents routing nodes while ceil(LO / MT) approximates the
+    number of allocation decisions/search depth per available vehicle.  The
+    result is rounded to 30-second operational increments.
+    """
+    normalized_lo_count = max(0, int(lo_count))
+    normalized_mt_count = max(0, int(mt_count))
+    lo_per_mt = math.ceil(normalized_lo_count / normalized_mt_count) if normalized_mt_count else normalized_lo_count
+    raw_seconds = 15 + math.ceil(normalized_lo_count * 0.25) + (10 * lo_per_mt)
+    recommended_seconds = max(30, min(3600, math.ceil(raw_seconds / 30) * 30))
+    configured = max(1, int(configured_seconds))
+    return {
+        "lo_count": normalized_lo_count,
+        "mt_count": normalized_mt_count,
+        "estimated_lo_per_mt": lo_per_mt,
+        "configured_seconds": configured,
+        "recommended_minimum_seconds": recommended_seconds,
+        "below_recommendation": configured < recommended_seconds,
+        "requires_confirmation": configured < recommended_seconds,
+        "calculation_basis": "round30(15 + 0.25 x LO + 10 x ceil(LO / MT))",
+    }
+
+
 def validate_job(db: Session, job_id: str, parameters: dict | None = None) -> dict:
     job = _require_job(db, job_id)
     ensure_default_parameter_profiles(db)
@@ -1017,6 +1127,17 @@ def validate_job(db: Session, job_id: str, parameters: dict | None = None) -> di
     lo_rows = db.scalars(select(LOOperationalState).where(LOOperationalState.job_id == job.job_id)).all()
     depot = db.get(MasterDepot, job.depot_id)
     vehicles = db.scalars(select(VehicleOperationalState).where(VehicleOperationalState.job_id == job.job_id)).all()
+    optimizable_lo_count = sum(
+        1
+        for row in lo_rows
+        if row.status == "PLANNED" and not row.frozen and not row.user_cancelled
+    )
+    available_mt_count = sum(1 for row in vehicles if row.operational_status != "UNAVAILABLE")
+    route_limit = route_time_limit_recommendation(
+        optimizable_lo_count,
+        available_mt_count,
+        int(parameters["route_optimization_time_limit"]),
+    )
     bays = db.scalars(select(MasterLoadingBay).where(MasterLoadingBay.depot_id == job.depot_id, MasterLoadingBay.active_status == "ACTIVE")).all()
     durations = {row.product_id for row in db.scalars(select(ProductCompartmentLoadingDuration).where(ProductCompartmentLoadingDuration.depot_id == job.depot_id, ProductCompartmentLoadingDuration.active_status == "ACTIVE")).all()}
     if not job.source_prediction_run_id:
@@ -1101,12 +1222,28 @@ def validate_job(db: Session, job_id: str, parameters: dict | None = None) -> di
     routes_config = get_google_routes_configuration(db)
     if not routes_config or not routes_config.encrypted_api_key:
         add("GOOGLE_ROUTES_NOT_CONFIGURED", "WARNING", "Google Routes API is not configured; cached/master Haversine fallback will be used and marked in the audit.")
+    if route_limit["below_recommendation"]:
+        add(
+            "ROUTE_TIME_LIMIT_BELOW_RECOMMENDATION",
+            "WARNING",
+            (
+                f"Route Time Limit is {route_limit['configured_seconds']} seconds; the rough minimum for "
+                f"{route_limit['lo_count']} optimizable LO and {route_limit['mt_count']} available MT is "
+                f"{route_limit['recommended_minimum_seconds']} seconds. Increase the parameter or explicitly "
+                "confirm the shorter search budget before optimization."
+            ),
+        )
     if not messages:
         add("VALIDATION_READY", "READY", "All pre-optimization requirements are complete.")
     status = "BLOCKED" if any(row["level"] == "BLOCKED" for row in messages) else "WARNING" if any(row["level"] == "WARNING" for row in messages) else "READY"
     job.status = "READY" if status in {"READY", "WARNING"} and job.status == "DRAFT" else job.status
     db.commit()
-    return {"status": status, "messages": messages, "checked_at": datetime.now(timezone.utc).isoformat()}
+    return {
+        "status": status,
+        "messages": messages,
+        "route_time_limit_recommendation": route_limit,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def _tags(db: Session, mt_ids: list[str], spbu_ids: list[str]) -> tuple[dict[str, set[str]], dict[str, set[str]], dict[str, str]]:
@@ -1141,15 +1278,116 @@ def _solver_inputs(db: Session, job: OptimizationJob, parameters: dict, *, curre
         for row in rows:
             row.frozen = row.status in {"ONGOING", "DONE"}
             row.frozen_reason = row.status if row.frozen else None
-    optimizable = [row for row in rows if row.status == "PLANNED" and not row.frozen and not row.user_cancelled]
     vehicle_rows = db.scalars(select(VehicleOperationalState).where(VehicleOperationalState.job_id == job.job_id)).all()
     working_time_limit = constraint_limit_minutes(parameters, "vehicle_working_time")
     for row in vehicle_rows:
         row.working_time_limit_minutes = working_time_limit
-        row.working_time_remaining_minutes = max(0, working_time_limit - row.working_time_used_minutes)
         # Pre-run validation guarantees this value exists and is not earlier
         # than the dispatcher-selected optimization reference time.
         row.effective_eta_depot = row.planned_eta_depot
+    vehicle_by_id = {row.mt_id: row for row in vehicle_rows}
+
+    # Executed/current trips are copied into the next immutable version.  A
+    # future trip inside the hard freeze window is different: its assignment
+    # and sequence remain locked, but it must pass through route/bay scheduling
+    # again so the dispatcher-provided MT availability can recalculate time.
+    executed_trip_keys = {
+        (row.current_vehicle_id, int(row.current_trip_number))
+        for row in rows
+        if row.status in {"DONE", "ONGOING"}
+        and row.current_vehicle_id
+        and row.current_trip_number is not None
+    }
+    ongoing_trip_keys = {
+        (row.current_vehicle_id, int(row.current_trip_number))
+        for row in rows
+        if row.status == "ONGOING"
+        and row.current_vehicle_id
+        and row.current_trip_number is not None
+    }
+    copy_frozen_loading_order_ids = {
+        row.loading_order_id
+        for row in rows
+        if row.status in {"DONE", "ONGOING"}
+        or (
+            row.current_vehicle_id
+            and row.current_trip_number is not None
+            and (row.current_vehicle_id, int(row.current_trip_number)) in executed_trip_keys
+        )
+    }
+    future_frozen_groups = {
+        (row.current_vehicle_id, int(row.current_trip_number))
+        for row in rows
+        if row.frozen
+        and row.status == "PLANNED"
+        and row.current_vehicle_id
+        and row.current_trip_number is not None
+        and (row.current_vehicle_id, int(row.current_trip_number)) not in executed_trip_keys
+    }
+    departure_tolerance = int(parameters.get("departure_time_tolerance_minutes", 5))
+    for vehicle_id, trip_number in future_frozen_groups:
+        group_rows = [
+            row for row in rows
+            if row.current_vehicle_id == vehicle_id and row.current_trip_number == trip_number
+        ]
+        planned_gate_outs = [_utc(row.planned_gate_out) for row in group_rows if row.planned_gate_out]
+        vehicle = vehicle_by_id.get(str(vehicle_id))
+        actual_availability = _utc(vehicle.planned_eta_depot) if vehicle and vehicle.planned_eta_depot else None
+        latest_allowed_arrival = (
+            min(planned_gate_outs) + timedelta(minutes=departure_tolerance)
+            if planned_gate_outs else None
+        )
+        mt_is_late = bool(
+            vehicle is None
+            or vehicle.operational_status == "UNAVAILABLE"
+            or (actual_availability and latest_allowed_arrival and actual_availability > latest_allowed_arrival)
+        )
+        for row in group_rows:
+            if mt_is_late:
+                row.frozen = False
+                row.frozen_reason = None
+                setattr(row, "_reroute_release_reason", "MT_LATE")
+            else:
+                setattr(row, "_reroute_assignment_locked", True)
+
+    # VehicleOperationalState is also used as the MT Management summary, but
+    # a previous Route Version contains both executed and future work.  Only
+    # DONE/ONGOING physical trips consume the retained working-time budget in
+    # a reroute; future trips must be calculated again by the new solver run.
+    retained_working_minutes_by_mt: dict[str, int] = defaultdict(int)
+    if reroute and job.current_route_version_id and executed_trip_keys:
+        current_trips = db.scalars(
+            select(RouteVersionTrip).where(
+                RouteVersionTrip.route_version_id == job.current_route_version_id
+            )
+        ).all()
+        for trip in current_trips:
+            trip_key = (trip.vehicle_id, int(trip.trip_number))
+            if trip_key not in executed_trip_keys:
+                continue
+            effective_return = _utc(trip.estimated_return_depot)
+            if trip_key in ongoing_trip_keys:
+                vehicle = vehicle_by_id.get(trip.vehicle_id)
+                if vehicle and vehicle.planned_eta_depot:
+                    effective_return = max(_utc(vehicle.planned_eta_depot), _utc(trip.gate_out))
+            working_start = trip.queue_start or trip.loading_start or trip.vehicle_ready_at_depot
+            retained_working_minutes_by_mt[trip.vehicle_id] += max(
+                0,
+                round((effective_return - _utc(working_start)).total_seconds() / 60),
+            )
+    for row in vehicle_rows:
+        row.working_time_used_minutes = retained_working_minutes_by_mt[row.mt_id]
+        row.working_time_remaining_minutes = max(
+            0,
+            working_time_limit - row.working_time_used_minutes,
+        )
+
+    optimizable = [
+        row for row in rows
+        if row.status == "PLANNED"
+        and (not row.frozen or bool(getattr(row, "_reroute_assignment_locked", False)))
+        and not row.user_cancelled
+    ]
     mts = {row.mt_id: db.get(MasterMT, row.mt_id) for row in vehicle_rows}
     spbu_ids = sorted({row.spbu_id for row in optimizable})
     spbus = {spbu_id: db.get(MasterSPBU, spbu_id) for spbu_id in spbu_ids}
@@ -1205,7 +1443,7 @@ def _solver_inputs(db: Session, job: OptimizationJob, parameters: dict, *, curre
     # (vehicle, trip_number) identities.
     completed_trip_count_by_mt: dict[str, int] = defaultdict(int)
     for row in rows:
-        if row.frozen and row.current_vehicle_id and row.current_trip_number is not None:
+        if row.loading_order_id in copy_frozen_loading_order_ids and row.current_vehicle_id and row.current_trip_number is not None:
             completed_trip_count_by_mt[row.current_vehicle_id] = max(
                 completed_trip_count_by_mt[row.current_vehicle_id],
                 int(row.current_trip_number),
@@ -1237,6 +1475,11 @@ def _solver_inputs(db: Session, job: OptimizationJob, parameters: dict, *, curre
             if any(constraint_is_hard(parameters, constraint_id) for constraint_id in violations):
                 continue
             allowed.append(vehicle.mt_id)
+        if bool(getattr(row, "_reroute_assignment_locked", False)):
+            # Preserve the hard freeze contract beyond the first route solve.
+            # Post-bay repair consumes this same candidate list and therefore
+            # must not silently reassign an on-time frozen trip to another MT.
+            allowed = [row.current_vehicle_id] if row.current_vehicle_id in allowed else []
         start_minutes, end_minutes = None, None
         if spbu and spbu.official_window_start and spbu.official_window_end:
             zone = _timezone(depot)
@@ -1266,6 +1509,7 @@ def _solver_inputs(db: Session, job: OptimizationJob, parameters: dict, *, curre
                     for other_spbu_id in spbu_ids if other_spbu_id != row.spbu_id
                 },
                 "current_vehicle_id": row.current_vehicle_id,
+                "current_trip_number": row.current_trip_number,
                 "current_shipment_id": row.current_shipment_id,
                 "current_stop_sequence": latest_assignment_by_lo[row.loading_order_id].stop_sequence if row.loading_order_id in latest_assignment_by_lo else None,
                 "current_bay_id": current_bay_by_trip.get(latest_assignment_by_lo[row.loading_order_id].route_version_trip_id) if row.loading_order_id in latest_assignment_by_lo and latest_assignment_by_lo[row.loading_order_id].route_version_trip_id else None,
@@ -1280,6 +1524,8 @@ def _solver_inputs(db: Session, job: OptimizationJob, parameters: dict, *, curre
                 "mandatory": True,
                 "user_cancelled": row.user_cancelled,
                 "freeze_window_candidate": bool(getattr(row, "_soft_freeze_candidate", False)),
+                "reroute_assignment_locked": bool(getattr(row, "_reroute_assignment_locked", False)),
+                "reroute_release_reason": getattr(row, "_reroute_release_reason", None),
             }
         )
     vehicles = [
@@ -1336,6 +1582,9 @@ def _solver_inputs(db: Session, job: OptimizationJob, parameters: dict, *, curre
         "actual_bay_states": [{"master_bay_id": row.master_bay_id, "state_effective_at": _utc(current_time), "remaining_loading_minutes": row.remaining_loading_minutes, "actual_queue_length": row.actual_queue_length, "current_vehicle_id": row.current_vehicle_id} for row in actual],
         "initial_queue": [{"master_bay_id": row.master_bay_id, "queue_position": row.queue_position, "vehicle_id": row.vehicle_id, "compartment_id": row.compartment_id, "product_id": row.product_id, "estimated_loading_duration_minutes": row.estimated_loading_duration_minutes, "state_effective_at": _utc(current_time)} for row in queue],
         "loading_durations": {row["product_id"]: row["duration_minutes_per_compartment"] for row in bay_config["loading_durations"] if row["active_status"] == "ACTIVE"},
+        "route_warm_start_source": "CURRENT_ROUTE" if reroute and job.current_route_version_id else "PHASE6",
+        "route_warm_start_version_id": job.current_route_version_id if reroute else None,
+        "copy_frozen_loading_order_ids": sorted(copy_frozen_loading_order_ids),
     }
 
 
@@ -1542,22 +1791,52 @@ def _complete_vehicle_eta_state(
     return system_eta
 
 
-def _copy_frozen_plan(db: Session, job: OptimizationJob, version: RouteVersion, frozen_rows: list[LOOperationalState]) -> tuple[list[RouteVersionTrip], set[str]]:
+def _copy_frozen_plan(
+    db: Session,
+    job: OptimizationJob,
+    version: RouteVersion,
+    frozen_rows: list[LOOperationalState],
+    *,
+    ongoing_return_by_mt: dict[str, datetime] | None = None,
+) -> tuple[list[RouteVersionTrip], set[str]]:
     if not job.current_route_version_id or not frozen_rows:
         return [], set()
     previous_assignments = {row.loading_order_id: row for row in db.scalars(select(RouteVersionLOAssignment).where(RouteVersionLOAssignment.route_version_id == job.current_route_version_id)).all()}
     previous_trip_ids = {row.route_version_trip_id for lo in frozen_rows if (row := previous_assignments.get(lo.loading_order_id)) and row.route_version_trip_id}
+    ongoing_trip_ids = {
+        row.route_version_trip_id
+        for lo in frozen_rows
+        if lo.status == "ONGOING"
+        and (row := previous_assignments.get(lo.loading_order_id))
+        and row.route_version_trip_id
+    }
     previous_trips = db.scalars(select(RouteVersionTrip).where(RouteVersionTrip.route_version_trip_id.in_(previous_trip_ids))).all() if previous_trip_ids else []
     trip_map: dict[str, RouteVersionTrip] = {}
     for old in previous_trips:
+        estimated_return_depot = old.estimated_return_depot
+        operating_minutes = old.operating_minutes
+        cost_breakdown = dict(old.cost_breakdown or {})
+        actual_return = (ongoing_return_by_mt or {}).get(old.vehicle_id) if old.route_version_trip_id in ongoing_trip_ids else None
+        if actual_return is not None:
+            estimated_return_depot = max(_utc(actual_return), _utc(old.gate_out))
+            working_start = old.queue_start or old.loading_start or old.vehicle_ready_at_depot
+            operating_minutes = max(
+                0,
+                round((estimated_return_depot - _utc(working_start)).total_seconds() / 60),
+            )
+            cost_breakdown["actual_state_adjustment"] = {
+                "source": "REROUTE_PLANNED_ETA_DEPOT",
+                "previous_return_depot": _iso(old.estimated_return_depot),
+                "effective_return_depot": _iso(estimated_return_depot),
+            }
         new = RouteVersionTrip(
             route_version_trip_id=uuid.uuid4().hex, route_version_id=version.route_version_id, vehicle_id=old.vehicle_id,
             trip_number=old.trip_number, shipment_id=old.shipment_id, vehicle_ready_at_depot=old.vehicle_ready_at_depot,
             queue_start=old.queue_start, loading_start=old.loading_start, loading_finish=old.loading_finish, gate_out=old.gate_out,
-            estimated_return_depot=old.estimated_return_depot, distance_meters=old.distance_meters, driving_seconds=old.driving_seconds,
+            estimated_return_depot=estimated_return_depot, distance_meters=old.distance_meters, driving_seconds=old.driving_seconds,
             service_seconds=old.service_seconds, queue_minutes=old.queue_minutes, loading_minutes=old.loading_minutes,
-            operating_minutes=old.operating_minutes, assignment_status="FROZEN", route_geometry=old.route_geometry,
-            route_geometry_source=old.route_geometry_source, cost_breakdown=old.cost_breakdown,
+            operating_minutes=operating_minutes, assignment_status="FROZEN", route_geometry=old.route_geometry,
+            route_geometry_source=old.route_geometry_source, cost_breakdown=cost_breakdown,
         )
         db.add(new)
         # SessionLocal disables autoflush and these models use scalar FK ids
@@ -1800,6 +2079,27 @@ def _prepare_optimization(
     validation = validate_job(db, job.job_id, parameters)
     if validation["status"] == "BLOCKED":
         raise HTTPException(status_code=422, detail={"code": "JOB_VALIDATION_BLOCKED", "message": "Phase 7 Job validation is blocked.", "validation": validation})
+    route_limit = validation.get("route_time_limit_recommendation") or route_time_limit_recommendation(
+        sum(
+            1
+            for row in current_lo_rows
+            if row.status == "PLANNED" and not row.frozen and not row.user_cancelled
+        ),
+        sum(1 for row in vehicle_rows if row.operational_status != "UNAVAILABLE"),
+        int(parameters["route_optimization_time_limit"]),
+    )
+    if route_limit["requires_confirmation"] and not bool(payload.get("route_time_limit_confirmed")):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "ROUTE_TIME_LIMIT_CONFIRMATION_REQUIRED",
+                "message": (
+                    "Route Time Limit is below the rough minimum calculated from the current LO and MT workload. "
+                    "Increase the parameter or explicitly confirm the shorter budget."
+                ),
+                "route_time_limit_recommendation": route_limit,
+            },
+        )
     reason = str(payload.get("reason") or ("Reroute" if reroute else "Initial Plan"))
     return {
         "job": job,
@@ -1808,6 +2108,8 @@ def _prepare_optimization(
         "profile_id": profile_id,
         "parameters": parameters,
         "reason": reason,
+        "route_time_limit_recommendation": route_limit,
+        "route_time_limit_confirmed": bool(payload.get("route_time_limit_confirmed")),
     }
 
 
@@ -1825,6 +2127,8 @@ def enqueue_optimization(db: Session, job_id: str, payload: dict, *, reroute: bo
         "status": job.status,
         "run_type": "REROUTE" if reroute else "INITIAL",
         "optimization_reference_time": _iso(prepared["current_time"]),
+        "route_time_limit_recommendation": prepared["route_time_limit_recommendation"],
+        "route_time_limit_confirmed": prepared["route_time_limit_confirmed"],
         "message": "Phase 7 optimization was accepted and will continue in the background.",
     }
 
@@ -1851,6 +2155,8 @@ def run_optimization(
     profile_id = prepared["profile_id"]
     parameters = prepared["parameters"]
     reason = prepared["reason"]
+    route_limit = prepared["route_time_limit_recommendation"]
+    route_limit_confirmed = prepared["route_time_limit_confirmed"]
     _align_bay_state_reference_time(db, job, current_time)
     job.status = "CALCULATING"
     job.error_message = None
@@ -1884,6 +2190,10 @@ def run_optimization(
                 "progress_pct": 5,
                 "optimization_reference_time": _iso(current_time),
                 "optimization_timezone": _timezone(depot).key,
+                "route_time_limit_recommendation": route_limit,
+                "route_time_limit_confirmed": route_limit_confirmed,
+                "route_warm_start_source": inputs["route_warm_start_source"],
+                "route_warm_start_version_id": inputs["route_warm_start_version_id"],
                 "constraint_summary": {
                     constraint_id: {
                         **constraint_rule(parameters, constraint_id),
@@ -1926,11 +2236,16 @@ def run_optimization(
             progress_pct=45,
             metadata={"route_matrix": matrix["metadata"]},
         )
+        solver_parameters = {
+            **parameters,
+            "route_warm_start_source": inputs["route_warm_start_source"],
+            "route_warm_start_version_id": inputs["route_warm_start_version_id"],
+        }
         result = OptimizationCoordinatorService().optimize(
             loading_orders=inputs["loading_orders"], vehicles=inputs["vehicles"], distance_matrix=matrix["distance_matrix"],
             time_matrix=matrix["time_matrix"], bays=inputs["bays"], actual_bay_states=inputs["actual_bay_states"],
             initial_queue=inputs["initial_queue"], loading_durations=inputs["loading_durations"], day_start=inputs["day_start"],
-            depot_close=inputs["operational_end"], parameters=parameters,
+            depot_close=inputs["operational_end"], parameters=solver_parameters,
         )
         _set_optimization_stage(
             db,
@@ -1972,8 +2287,20 @@ def run_optimization(
         )
         db.add(route_version)
         db.flush()
-        frozen_rows = [row for row in inputs["all_lo_rows"] if row.frozen]
-        frozen_trips, copied_frozen_ids = _copy_frozen_plan(db, job, route_version, frozen_rows)
+        copy_frozen_ids = set(inputs["copy_frozen_loading_order_ids"])
+        frozen_rows = [row for row in inputs["all_lo_rows"] if row.loading_order_id in copy_frozen_ids]
+        ongoing_return_by_mt = {
+            row["mt_id"]: row["availability_eta_depot"]
+            for row in inputs["vehicles"]
+            if row.get("availability_eta_depot") is not None
+        }
+        frozen_trips, copied_frozen_ids = _copy_frozen_plan(
+            db,
+            job,
+            route_version,
+            frozen_rows,
+            ongoing_return_by_mt=ongoing_return_by_mt,
+        )
         persisted_trips: list[RouteVersionTrip] = []
         geometry_started = perf_counter()
         geometry_request_budget = int(parameters.get("route_geometry_google_request_budget", 500))
@@ -2015,7 +2342,7 @@ def run_optimization(
                 for lo in stop_los:
                     assignment = lo_by_id[lo["loading_order_id"]]
                     phase6_deviation = {"vehicle_changed": bool(lo.get("phase6_predicted_vehicle_id") and lo["phase6_predicted_vehicle_id"] != trip["vehicle_id"]), "shipment_changed": bool(lo.get("phase6_predicted_shipment_id") and lo["phase6_predicted_shipment_id"] != trip["shipment_id"])}
-                    db.add(RouteVersionLOAssignment(route_version_lo_assignment_id=uuid.uuid4().hex, route_version_id=route_version.route_version_id, route_version_trip_id=entity.route_version_trip_id, loading_order_id=lo["loading_order_id"], vehicle_id=trip["vehicle_id"], trip_number=trip["trip_number"], shipment_id=trip["shipment_id"], compartment_id=assignment["compartment_id"], spbu_id=lo["spbu_id"], product_id=lo.get("product_id"), volume_kl=lo["volume_kl"], stop_sequence=stop["sequence"], planned_gate_out=trip["gate_out"], eta=stop["arrival"] + (_utc(trip["gate_out"]) - _utc(trip["preliminary_gate_out"])), frozen=False, assignment_status="PLANNED", phase6_deviation=phase6_deviation))
+                    db.add(RouteVersionLOAssignment(route_version_lo_assignment_id=uuid.uuid4().hex, route_version_id=route_version.route_version_id, route_version_trip_id=entity.route_version_trip_id, loading_order_id=lo["loading_order_id"], vehicle_id=trip["vehicle_id"], trip_number=trip["trip_number"], shipment_id=trip["shipment_id"], compartment_id=assignment["compartment_id"], spbu_id=lo["spbu_id"], product_id=lo.get("product_id"), volume_kl=lo["volume_kl"], stop_sequence=stop["sequence"], planned_gate_out=trip["gate_out"], eta=stop["arrival"] + (_utc(trip["gate_out"]) - _utc(trip["preliminary_gate_out"])), frozen=bool(lo.get("reroute_assignment_locked", False)), assignment_status="PLANNED", phase6_deviation=phase6_deviation))
                     state = next(row for row in inputs["all_lo_rows"] if row.loading_order_id == lo["loading_order_id"])
                     state.current_vehicle_id = trip["vehicle_id"]
                     state.current_trip_number = trip["trip_number"]
@@ -2054,6 +2381,13 @@ def run_optimization(
             and row.current_vehicle_id
             and row.current_trip_number is not None
         }
+        executed_trip_keys = {
+            (row.current_vehicle_id, int(row.current_trip_number))
+            for row in inputs["all_lo_rows"]
+            if row.status in {"DONE", "ONGOING"}
+            and row.current_vehicle_id
+            and row.current_trip_number is not None
+        }
         vehicle_rows = {row.mt_id: row for row in db.scalars(select(VehicleOperationalState).where(VehicleOperationalState.job_id == job.job_id)).all()}
         for mt_id, state in vehicle_rows.items():
             mt_trips = trips_by_vehicle[mt_id]
@@ -2064,10 +2398,15 @@ def run_optimization(
                 trips=mt_trips,
                 ongoing_trip_keys=ongoing_trip_keys,
             )
-            used_minutes = sum(trip.operating_minutes for trip in mt_trips)
-            state.working_time_used_minutes = max(state.working_time_used_minutes, used_minutes)
+            planned_operating_minutes = sum(trip.operating_minutes for trip in mt_trips)
+            used_minutes = sum(
+                trip.operating_minutes
+                for trip in mt_trips
+                if (trip.vehicle_id, int(trip.trip_number)) in executed_trip_keys
+            )
+            state.working_time_used_minutes = used_minutes
             state.working_time_remaining_minutes = max(0, state.working_time_limit_minutes - state.working_time_used_minutes)
-            db.add(RouteVersionVehicleAssignment(route_version_vehicle_assignment_id=uuid.uuid4().hex, route_version_id=route_version.route_version_id, vehicle_id=mt_id, used=bool(mt_trips), trip_count=len(mt_trips), delivered_kl=delivered, total_distance_meters=sum(trip.distance_meters for trip in mt_trips), total_operating_minutes=used_minutes, working_time_remaining_minutes=state.working_time_remaining_minutes, activation_cost=OptimizationCoordinatorService().vrp._vehicle_cost(parameters, next((row for row in inputs["vehicles"] if row["mt_id"] == mt_id), {"vehicle_class": state.vehicle_class, "tags": state.tag_snapshot})), system_eta_depot=system_eta))
+            db.add(RouteVersionVehicleAssignment(route_version_vehicle_assignment_id=uuid.uuid4().hex, route_version_id=route_version.route_version_id, vehicle_id=mt_id, used=bool(mt_trips), trip_count=len(mt_trips), delivered_kl=delivered, total_distance_meters=sum(trip.distance_meters for trip in mt_trips), total_operating_minutes=planned_operating_minutes, working_time_remaining_minutes=state.working_time_remaining_minutes, activation_cost=OptimizationCoordinatorService().vrp._vehicle_cost(parameters, next((row for row in inputs["vehicles"] if row["mt_id"] == mt_id), {"vehicle_class": state.vehicle_class, "tags": state.tag_snapshot})), system_eta_depot=system_eta))
         gateouts = [trip.gate_out for trip in all_version_trips]
         loading_starts = [trip.loading_start for trip in all_version_trips if trip.loading_start]
         route_version.first_gate_out = min(gateouts) if gateouts else None
@@ -2205,6 +2544,289 @@ def list_route_versions(db: Session, job_id: str) -> list[dict]:
         if run.route_version_id
     }
     return [{"route_version_id": row.route_version_id, "version_number": row.version_number, "version_label": row.version_label, "created_at": _iso(row.created_at), "created_by": row.created_by, "reason": row.reason, "objective": row.objective, "solver_status": row.solver_status, "objective_value": row.objective_value, "optimization_reference_time": _iso(runs_by_version[row.route_version_id].optimization_reference_time or runs_by_version[row.route_version_id].start_time) if row.route_version_id in runs_by_version else None, "state_snapshot_id": row.state_snapshot_id, "parameter_snapshot_id": row.parameter_snapshot_id, "summary": row.summary_snapshot, "comparison": row.comparison_snapshot} for row in rows]
+
+
+def _comparison_source_descriptors(db: Session, job: OptimizationJob) -> list[dict]:
+    sources: list[dict] = []
+    if job.source_prediction_run_id:
+        prediction_run = db.get(PredictionRun, job.source_prediction_run_id)
+        if prediction_run:
+            sources.append(
+                {
+                    "source_id": "PHASE6",
+                    "source_type": "PHASE6",
+                    "label": f"Phase 6 · {prediction_run.prediction_run_no}",
+                    "prediction_run_id": prediction_run.id,
+                    "prediction_run_no": prediction_run.prediction_run_no,
+                    "version_number": None,
+                    "version_label": None,
+                    "created_at": _iso(prediction_run.completed_at or prediction_run.created_at),
+                }
+            )
+    versions = db.scalars(
+        select(RouteVersion)
+        .where(RouteVersion.job_id == job.job_id)
+        .order_by(RouteVersion.version_number)
+    ).all()
+    sources.extend(
+        {
+            "source_id": version.route_version_id,
+            "source_type": "PHASE7",
+            "label": f"Phase 7 · {version.version_label}",
+            "prediction_run_id": None,
+            "prediction_run_no": None,
+            "version_number": version.version_number,
+            "version_label": version.version_label,
+            "created_at": _iso(version.created_at),
+        }
+        for version in versions
+    )
+    return sources
+
+
+def _phase6_comparison_rows(db: Session, job: OptimizationJob) -> dict[str, dict]:
+    if not job.source_prediction_run_id:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "PHASE6_SOURCE_NOT_LOADED", "message": "Load and lock a Phase 6 Prediction Run before comparing it."},
+        )
+    shipments = db.scalars(
+        select(PredictionShipment).where(PredictionShipment.prediction_run_id == job.source_prediction_run_id)
+    ).all()
+    shipment_ids = [shipment.id for shipment in shipments]
+    lines = db.scalars(
+        select(PredictionShipmentLine)
+        .where(PredictionShipmentLine.prediction_run_id == job.source_prediction_run_id)
+        .order_by(PredictionShipmentLine.loading_order_no)
+    ).all()
+    assignments = {
+        row.prediction_shipment_id: row
+        for row in db.scalars(
+            select(PredictionAssignment).where(PredictionAssignment.prediction_shipment_id.in_(shipment_ids))
+        ).all()
+    } if shipment_ids else {}
+    trips = {
+        row.prediction_shipment_id: row
+        for row in db.scalars(
+            select(PredictionTrip).where(PredictionTrip.prediction_run_id == job.source_prediction_run_id)
+        ).all()
+    }
+    vehicles = {row.mt_id: row for row in db.scalars(select(MasterMT)).all()}
+    spbu_ids = {row.spbu_id for row in lines}
+    spbus = {
+        row.spbu_id: row
+        for row in db.scalars(select(MasterSPBU).where(MasterSPBU.spbu_id.in_(spbu_ids))).all()
+    } if spbu_ids else {}
+    product_ids = {row.product_id for row in lines if row.product_id}
+    products = {
+        row.product_id: row
+        for row in db.scalars(select(MasterProduct).where(MasterProduct.product_id.in_(product_ids))).all()
+    } if product_ids else {}
+    shipment_numbers = {shipment.id: shipment.predicted_shipment_id for shipment in shipments}
+    result: dict[str, dict] = {}
+    for line in lines:
+        assignment = assignments.get(line.prediction_shipment_id)
+        trip = trips.get(line.prediction_shipment_id)
+        vehicle_id = (trip.vehicle_id if trip else None) or (assignment.final_vehicle_id if assignment else None)
+        status = (trip.assignment_status if trip else None) or (assignment.assignment_status if assignment else None) or "UNASSIGNED"
+        result[line.loading_order_no] = {
+            "loading_order_id": line.loading_order_no,
+            "spbu_id": line.spbu_id,
+            "spbu_name": spbus[line.spbu_id].spbu_name if line.spbu_id in spbus else line.spbu_no or line.spbu_id,
+            "product_id": line.product_id,
+            "product_name": products[line.product_id].product_name if line.product_id in products else line.product_name or line.product_id,
+            "volume_kl": float(line.order_quantity_kl or 0),
+            "present": True,
+            "mt_id": vehicle_id,
+            "mt_registration": vehicles[vehicle_id].vehicle_registration if vehicle_id in vehicles else vehicle_id,
+            "trip_number": trip.trip_number if trip else None,
+            "shipment_id": shipment_numbers.get(line.prediction_shipment_id),
+            "gate_out": trip.predicted_departure_datetime if trip else None,
+            "eta_depot": trip.estimated_return_datetime if trip else None,
+            "status": status,
+            "dropped_reason_code": assignment.unassigned_reason if assignment else None,
+        }
+    return result
+
+
+def _route_version_comparison_rows(db: Session, job: OptimizationJob, version_id: str) -> dict[str, dict]:
+    version = db.get(RouteVersion, version_id)
+    if version is None or version.job_id != job.job_id:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "COMPARISON_SOURCE_NOT_FOUND", "message": "The selected Phase 7 route version does not belong to this Job."},
+        )
+    assignments = db.scalars(
+        select(RouteVersionLOAssignment)
+        .where(RouteVersionLOAssignment.route_version_id == version.route_version_id)
+        .order_by(RouteVersionLOAssignment.loading_order_id)
+    ).all()
+    trip_ids = {row.route_version_trip_id for row in assignments if row.route_version_trip_id}
+    trips = {
+        row.route_version_trip_id: row
+        for row in db.scalars(select(RouteVersionTrip).where(RouteVersionTrip.route_version_trip_id.in_(trip_ids))).all()
+    } if trip_ids else {}
+    vehicles = {row.mt_id: row for row in db.scalars(select(MasterMT)).all()}
+    spbu_ids = {row.spbu_id for row in assignments}
+    spbus = {
+        row.spbu_id: row
+        for row in db.scalars(select(MasterSPBU).where(MasterSPBU.spbu_id.in_(spbu_ids))).all()
+    } if spbu_ids else {}
+    product_ids = {row.product_id for row in assignments if row.product_id}
+    products = {
+        row.product_id: row
+        for row in db.scalars(select(MasterProduct).where(MasterProduct.product_id.in_(product_ids))).all()
+    } if product_ids else {}
+    result: dict[str, dict] = {}
+    for assignment in assignments:
+        trip = trips.get(assignment.route_version_trip_id) if assignment.route_version_trip_id else None
+        vehicle_id = assignment.vehicle_id or (trip.vehicle_id if trip else None)
+        result[assignment.loading_order_id] = {
+            "loading_order_id": assignment.loading_order_id,
+            "spbu_id": assignment.spbu_id,
+            "spbu_name": spbus[assignment.spbu_id].spbu_name if assignment.spbu_id in spbus else assignment.spbu_id,
+            "product_id": assignment.product_id,
+            "product_name": products[assignment.product_id].product_name if assignment.product_id in products else assignment.product_id,
+            "volume_kl": float(assignment.volume_kl or 0),
+            "present": True,
+            "mt_id": vehicle_id,
+            "mt_registration": vehicles[vehicle_id].vehicle_registration if vehicle_id in vehicles else vehicle_id,
+            "trip_number": assignment.trip_number or (trip.trip_number if trip else None),
+            "shipment_id": assignment.shipment_id or (trip.shipment_id if trip else None),
+            "gate_out": assignment.planned_gate_out or (trip.gate_out if trip else None),
+            "eta_depot": trip.estimated_return_depot if trip else None,
+            "status": assignment.assignment_status,
+            "dropped_reason_code": assignment.dropped_reason_code,
+        }
+    return result
+
+
+def _comparison_side_payload(row: dict | None) -> dict:
+    if row is None:
+        return {
+            "present": False,
+            "mt_id": None,
+            "mt_registration": None,
+            "trip_number": None,
+            "shipment_id": None,
+            "gate_out": None,
+            "eta_depot": None,
+            "status": "NOT_PRESENT",
+            "dropped_reason_code": None,
+        }
+    return {
+        "present": True,
+        "mt_id": row["mt_id"],
+        "mt_registration": row["mt_registration"],
+        "trip_number": row["trip_number"],
+        "shipment_id": row["shipment_id"],
+        "gate_out": _iso(row["gate_out"]),
+        "eta_depot": _iso(row["eta_depot"]),
+        "status": row["status"],
+        "dropped_reason_code": row["dropped_reason_code"],
+    }
+
+
+def _comparison_delta_minutes(left: datetime | None, right: datetime | None) -> int | None:
+    if left is None or right is None:
+        return None
+    return round((_utc(right) - _utc(left)).total_seconds() / 60)
+
+
+def get_lo_comparison(db: Session, job_id: str, source_a: str, source_b: str) -> dict:
+    job = _require_job(db, job_id)
+    if source_a == source_b:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "COMPARISON_SOURCE_DUPLICATE", "message": "LO List A and LO List B must be different."},
+        )
+    descriptors = _comparison_source_descriptors(db, job)
+    descriptors_by_id = {row["source_id"]: row for row in descriptors}
+    missing = [source for source in (source_a, source_b) if source not in descriptors_by_id]
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "COMPARISON_SOURCE_NOT_FOUND", "message": f"Comparison source was not found: {', '.join(missing)}."},
+        )
+
+    def load(source_id: str) -> dict[str, dict]:
+        return _phase6_comparison_rows(db, job) if source_id == "PHASE6" else _route_version_comparison_rows(db, job, source_id)
+
+    rows_a = load(source_a)
+    rows_b = load(source_b)
+    all_loading_orders = sorted(set(rows_a) | set(rows_b))
+    output_rows: list[dict] = []
+    same_mt_count = 0
+    changed_mt_count = 0
+    gate_out_deltas: list[int] = []
+    eta_depot_deltas: list[int] = []
+    for loading_order_id in all_loading_orders:
+        row_a = rows_a.get(loading_order_id)
+        row_b = rows_b.get(loading_order_id)
+        both_assigned = bool(row_a and row_b and row_a["mt_id"] and row_b["mt_id"])
+        mt_changed = bool(both_assigned and row_a["mt_id"] != row_b["mt_id"])
+        if both_assigned:
+            if mt_changed:
+                changed_mt_count += 1
+            else:
+                same_mt_count += 1
+        gate_out_delta = _comparison_delta_minutes(row_a.get("gate_out") if row_a else None, row_b.get("gate_out") if row_b else None)
+        eta_depot_delta = _comparison_delta_minutes(row_a.get("eta_depot") if row_a else None, row_b.get("eta_depot") if row_b else None)
+        if gate_out_delta is not None and gate_out_delta != 0:
+            gate_out_deltas.append(gate_out_delta)
+        if eta_depot_delta is not None and eta_depot_delta != 0:
+            eta_depot_deltas.append(eta_depot_delta)
+        identity = row_a or row_b or {}
+        output_rows.append(
+            {
+                "loading_order_id": loading_order_id,
+                "spbu_id": identity.get("spbu_id"),
+                "spbu_name": identity.get("spbu_name"),
+                "product_id": identity.get("product_id"),
+                "product_name": identity.get("product_name"),
+                "volume_kl": identity.get("volume_kl", 0),
+                "a": _comparison_side_payload(row_a),
+                "b": _comparison_side_payload(row_b),
+                "mt_changed": mt_changed,
+                "gate_out_delta_minutes": gate_out_delta,
+                "eta_depot_delta_minutes": eta_depot_delta,
+            }
+        )
+
+    def assigned_count(rows: dict[str, dict]) -> int:
+        return sum(1 for row in rows.values() if row["mt_id"] and row["status"] not in {"DROPPED", "UNASSIGNED"})
+
+    assigned_a = assigned_count(rows_a)
+    assigned_b = assigned_count(rows_b)
+    comparable_mt = same_mt_count + changed_mt_count
+    summary = {
+        "total_lo_a": len(rows_a),
+        "total_lo_b": len(rows_b),
+        "union_lo_count": len(all_loading_orders),
+        "common_lo_count": len(set(rows_a) & set(rows_b)),
+        "only_a_count": len(set(rows_a) - set(rows_b)),
+        "only_b_count": len(set(rows_b) - set(rows_a)),
+        "assigned_lo_a": assigned_a,
+        "assigned_lo_b": assigned_b,
+        "dropped_or_unassigned_a": len(rows_a) - assigned_a,
+        "dropped_or_unassigned_b": len(rows_b) - assigned_b,
+        "same_mt_count": same_mt_count,
+        "changed_mt_count": changed_mt_count,
+        "comparable_mt_count": comparable_mt,
+        "mt_change_pct": round(changed_mt_count / comparable_mt * 100, 2) if comparable_mt else 0,
+        "gate_out_changed_count": len(gate_out_deltas),
+        "average_abs_gate_out_delta_minutes": round(sum(abs(value) for value in gate_out_deltas) / len(gate_out_deltas), 2) if gate_out_deltas else 0,
+        "eta_depot_changed_count": len(eta_depot_deltas),
+        "average_abs_eta_depot_delta_minutes": round(sum(abs(value) for value in eta_depot_deltas) / len(eta_depot_deltas), 2) if eta_depot_deltas else 0,
+    }
+    return {
+        "job_id": job.job_id,
+        "available_sources": descriptors,
+        "source_a": descriptors_by_id[source_a],
+        "source_b": descriptors_by_id[source_b],
+        "summary": summary,
+        "rows": output_rows,
+    }
 
 
 def get_route_version(db: Session, job_id: str, version_id: str | None = None) -> dict:
