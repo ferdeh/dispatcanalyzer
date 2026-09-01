@@ -1,4 +1,4 @@
-from datetime import time
+from datetime import date, time
 
 from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, Time, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -187,6 +187,86 @@ class BridgeSPBUTag(Base):
     spbu_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_spbu.spbu_id"), primary_key=True)
     tag_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_tag.tag_id"), primary_key=True)
     source_import_id: Mapped[str | None] = mapped_column(String(64))
+
+
+class DepartureShiftAnalysisConfig(Base):
+    __tablename__ = "departure_shift_analysis_config"
+    __table_args__ = (
+        UniqueConstraint("depot_id", "normalized_name", name="uq_departure_shift_config_depot_name"),
+        Index("ix_departure_shift_config_depot_created", "depot_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    normalized_name: Mapped[str] = mapped_column(String(255))
+    depot_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_depot.depot_id"), index=True)
+    start_date: Mapped[date] = mapped_column(Date)
+    end_date: Mapped[date] = mapped_column(Date)
+    bucket_minutes: Mapped[int] = mapped_column(Integer)
+    search: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sort_column: Mapped[str] = mapped_column(String(80), default="observation_count")
+    sort_direction: Mapped[str] = mapped_column(String(10), default="desc")
+    assignment_method: Mapped[str] = mapped_column(String(60))
+    shift_config: Mapped[list] = mapped_column(JSON, default=list)
+    ui_state: Mapped[dict] = mapped_column(JSON, default=dict)
+    departure_analysis_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    shift_analysis_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_by: Mapped[str] = mapped_column(String(120), default="local-user")
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class PairingAnalysisConfig(Base):
+    __tablename__ = "pairing_analysis_config"
+    __table_args__ = (
+        UniqueConstraint("depot_id", "normalized_name", name="uq_pairing_config_depot_name"),
+        Index("ix_pairing_config_depot_created", "depot_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    normalized_name: Mapped[str] = mapped_column(String(255))
+    depot_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_depot.depot_id"), index=True)
+    start_date: Mapped[date] = mapped_column(Date)
+    end_date: Mapped[date] = mapped_column(Date)
+    product_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("master_product.product_id"), nullable=True)
+    search: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sort_column: Mapped[str] = mapped_column(String(80), default="evidence_strength")
+    sort_direction: Mapped[str] = mapped_column(String(10), default="desc")
+    ui_state: Mapped[dict] = mapped_column(JSON, default=dict)
+    pairing_analysis_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_by: Mapped[str] = mapped_column(String(120), default="local-user")
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class AffinityAnalysisConfig(Base):
+    __tablename__ = "affinity_analysis_config"
+    __table_args__ = (
+        UniqueConstraint("depot_id", "normalized_name", name="uq_affinity_config_depot_name"),
+        Index("ix_affinity_config_depot_created", "depot_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    normalized_name: Mapped[str] = mapped_column(String(255))
+    depot_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_depot.depot_id"), index=True)
+    start_date: Mapped[date] = mapped_column(Date)
+    end_date: Mapped[date] = mapped_column(Date)
+    product_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("master_product.product_id"), nullable=True)
+    minimum_observations: Mapped[int] = mapped_column(Integer, default=1)
+    confidence_filter: Mapped[str] = mapped_column(String(20), default="ALL")
+    temporal_bucket: Mapped[str] = mapped_column(String(20), default="WEEKLY")
+    recent_days: Mapped[int] = mapped_column(Integer, default=7)
+    top_n: Mapped[int] = mapped_column(Integer, default=5)
+    edge_metric: Mapped[str] = mapped_column(String(40), default="SHIPMENT_COUNT")
+    selected_spbu_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("master_spbu.spbu_id"), nullable=True)
+    selected_mt_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("master_mt.mt_id"), nullable=True)
+    ui_state: Mapped[dict] = mapped_column(JSON, default=dict)
+    affinity_analysis_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_by: Mapped[str] = mapped_column(String(120), default="local-user")
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class SpbuIdentifierAlias(Base):
@@ -578,6 +658,26 @@ class MLConcentrationAnalysisRun(Base):
     created_by: Mapped[str] = mapped_column(String(120), default="local-user")
     created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
     completed_at = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class MLConcentrationSavedAnalysis(Base):
+    __tablename__ = "ml_concentration_saved_analysis"
+    __table_args__ = (
+        UniqueConstraint("depot_id", "normalized_name", name="uq_ml_concentration_saved_depot_name"),
+        Index("ix_ml_concentration_saved_depot_created", "depot_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(255))
+    normalized_name: Mapped[str] = mapped_column(String(255))
+    depot_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_depot.depot_id"), index=True)
+    analysis_run_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("ml_concentration_analysis_run.analysis_run_id", ondelete="CASCADE"), index=True
+    )
+    ui_state: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_by: Mapped[str] = mapped_column(String(120), default="local-user")
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class MLSPBUConcentrationProfile(Base):
@@ -1538,6 +1638,140 @@ class RouteAPIRequestLog(Base):
     duration_ms: Mapped[int] = mapped_column(Integer, default=0)
     success: Mapped[bool] = mapped_column(Boolean, default=False)
     error_message: Mapped[str | None] = mapped_column(Text)
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# Phase 9 persists immutable, read-only evaluations. Source identifiers are
+# lineage snapshots rather than foreign keys so deleting an operational Phase 7
+# workspace never destroys or blocks retained evaluation evidence.
+class RouteAlignmentEvaluationRun(Base):
+    __tablename__ = "route_alignment_evaluation_run"
+    __table_args__ = (
+        UniqueConstraint(
+            "route_version_id",
+            "source_bundle_checksum",
+            "algorithm_version",
+            name="uq_route_alignment_run_source",
+        ),
+        Index("ix_route_alignment_run_depot_created", "depot_id", "created_at"),
+        Index("ix_route_alignment_run_route", "route_version_id", "created_at"),
+    )
+
+    evaluation_run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    evaluation_run_no: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    depot_id: Mapped[str] = mapped_column(String(64), ForeignKey("master_depot.depot_id"), index=True)
+    job_id: Mapped[str] = mapped_column(String(64), index=True)
+    route_version_id: Mapped[str] = mapped_column(String(64), index=True)
+    operating_date = mapped_column(Date, nullable=False, index=True)
+    source_prediction_run_id: Mapped[str] = mapped_column(String(64), index=True)
+    phase5_model_id: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(30), default="PREPARING", index=True)
+    source_bundle_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    source_bundle_checksum: Mapped[str] = mapped_column(String(64), index=True)
+    summary_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    data_quality_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
+    algorithm_version: Mapped[str] = mapped_column(String(100))
+    created_by: Mapped[str] = mapped_column(String(120), default="local-user")
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at = mapped_column(DateTime(timezone=True), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class RouteAlignmentEvaluationRow(Base):
+    __tablename__ = "route_alignment_evaluation_row"
+    __table_args__ = (
+        UniqueConstraint(
+            "evaluation_run_id",
+            "route_version_lo_assignment_id",
+            name="uq_route_alignment_row_assignment",
+        ),
+        Index("ix_route_alignment_row_run_gate", "evaluation_run_id", "planned_gate_out"),
+        Index("ix_route_alignment_row_run_trip", "evaluation_run_id", "route_version_trip_id"),
+        Index("ix_route_alignment_row_run_spbu", "evaluation_run_id", "spbu_id"),
+    )
+
+    evaluation_row_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    evaluation_run_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("route_alignment_evaluation_run.evaluation_run_id", ondelete="CASCADE"),
+        index=True,
+    )
+    route_version_lo_assignment_id: Mapped[str] = mapped_column(String(64))
+    route_version_trip_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    loading_order_id: Mapped[str] = mapped_column(String(120), index=True)
+    shipment_id: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    trip_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    stop_sequence: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    assignment_status: Mapped[str] = mapped_column(String(30), index=True)
+    planned_gate_out = mapped_column(DateTime(timezone=True), nullable=True)
+    spbu_id: Mapped[str] = mapped_column(String(64), index=True)
+    spbu_code: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    spbu_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    product_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    product_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    volume_kl: Mapped[float] = mapped_column(Float, default=0.0)
+    vehicle_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    vehicle_registration: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    cluster_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cluster_label: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    cluster_assignment_type: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    route_shift_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    route_shift_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    cluster_cohesion_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cluster_cohesion_status: Mapped[str] = mapped_column(String(40), default="NOT_EVALUATED")
+    cluster_evidence: Mapped[dict] = mapped_column(JSON, default=dict)
+    shift_alignment_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    shift_alignment_status: Mapped[str] = mapped_column(String(40), default="NOT_EVALUATED")
+    shift_evidence: Mapped[dict] = mapped_column(JSON, default=dict)
+    spbu_pairing_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    spbu_pairing_status: Mapped[str] = mapped_column(String(40), default="NOT_EVALUATED")
+    pairing_evidence: Mapped[dict] = mapped_column(JSON, default=dict)
+    mt_affinity_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mt_affinity_status: Mapped[str] = mapped_column(String(40), default="NOT_EVALUATED")
+    mt_affinity_evidence: Mapped[dict] = mapped_column(JSON, default=dict)
+    evaluable_category_count: Mapped[int] = mapped_column(Integer, default=0)
+    search_text: Mapped[str] = mapped_column(Text, default="")
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class RouteAlignmentPairEvidence(Base):
+    __tablename__ = "route_alignment_pair_evidence"
+    __table_args__ = (
+        UniqueConstraint(
+            "evaluation_run_id",
+            "route_version_trip_id",
+            "spbu_a_id",
+            "spbu_b_id",
+            name="uq_route_alignment_pair_trip",
+        ),
+        Index("ix_route_alignment_pair_run_trip", "evaluation_run_id", "route_version_trip_id"),
+    )
+
+    pair_evidence_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    evaluation_run_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("route_alignment_evaluation_run.evaluation_run_id", ondelete="CASCADE"),
+        index=True,
+    )
+    route_version_trip_id: Mapped[str] = mapped_column(String(64))
+    spbu_a_id: Mapped[str] = mapped_column(String(64))
+    spbu_b_id: Mapped[str] = mapped_column(String(64))
+    cluster_a_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cluster_b_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    same_cluster: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    probability_b_given_a: Mapped[float | None] = mapped_column(Float, nullable=True)
+    probability_a_given_b: Mapped[float | None] = mapped_column(Float, nullable=True)
+    symmetric_pairing_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    pair_count: Mapped[int] = mapped_column(Integer, default=0)
+    shipment_a_count: Mapped[int] = mapped_column(Integer, default=0)
+    shipment_b_count: Mapped[int] = mapped_column(Integer, default=0)
+    support: Mapped[float] = mapped_column(Float, default=0.0)
+    lift: Mapped[float] = mapped_column(Float, default=0.0)
+    confidence_score: Mapped[float] = mapped_column(Float, default=0.0)
+    confidence_level: Mapped[str] = mapped_column(String(40), default="INSUFFICIENT_DATA")
+    evidence_status: Mapped[str] = mapped_column(String(40), default="INSUFFICIENT_EVIDENCE")
+    evidence_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)
     created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

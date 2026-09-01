@@ -1,10 +1,10 @@
 # Dispatch Intelligence Platform
 
-Dispatch Intelligence Platform adalah aplikasi intelligence dan operational control distribusi BBM. Platform ini dibangun bertahap dari Phase 0 sampai Phase 8 untuk mengubah:
+Dispatch Intelligence Platform adalah aplikasi intelligence dan operational control distribusi BBM. Platform ini dibangun bertahap dari Phase 0 sampai Phase 9 untuk mengubah:
 
 Master Data + Loading Order + GPS Operational Data + Historical Dispatch
 
-menjadi trusted operational intelligence, saved prediction, dynamic multi-trip route plan, dan final human-reviewed dispatch yang auditable. Phase 6 menghasilkan warm start shipment/MT; Phase 7 memakai Google OR-Tools untuk optimasi fleet-wide dan depot bay scheduling; Phase 8 membuat snapshot untuk adjustment manual, per-trip recalculation, simulation, dashboard, audit, dan finalization. Google Routes API tetap hanya menjadi provider jarak, waktu, matrix, dan geometry—bukan optimization engine.
+menjadi trusted operational intelligence, saved prediction, dynamic multi-trip route plan, final human-reviewed dispatch, dan evaluasi keselarasan historis yang auditable. Phase 6 menghasilkan warm start shipment/MT; Phase 7 memakai Google OR-Tools untuk optimasi fleet-wide dan depot bay scheduling; Phase 8 membuat snapshot untuk adjustment manual, per-trip recalculation, simulation, dashboard, audit, dan finalization; Phase 9 mengukur empat kategori alignment secara deskriptif tanpa menilai route baik atau buruk. Google Routes API tetap hanya menjadi provider jarak, waktu, matrix, dan geometry—bukan optimization engine.
 
 Prinsip utama: jangan lanjut ke phase berikutnya sebelum phase berjalan benar, diuji, tervalidasi visual, terdokumentasi, dan usable.
 
@@ -43,6 +43,7 @@ WEB_PORT=3001 docker compose up -d web
 - Phase 6 - Shipment & MT Assignment Prediction: `/prediction-assignment`
 - Phase 7 - Dynamic Multi-Trip VRP & Depot Bay Queue: `/phase7-optimization`
 - Phase 8 - Manual Dispatching & Operational Simulation: `/phase-8/manual-dispatch`
+- Phase 9 - Route–Model Alignment Evaluation: `/phase9/route-model-alignment`
 - Settings - Google Maps Integration: `/settings/google-maps-integration`
 - Documentation - Panduan Pengguna: `/documentation`
 
@@ -142,6 +143,8 @@ Halaman Phase 4 mengukur historical vehicle-assignment behavior:
 #### Filter dan tombol Apply
 
 Card paling atas menentukan scope analisis. Perubahan filter belum mengubah hasil sampai tombol **Apply** ditekan.
+
+Tombol **Save** menyimpan filter yang sudah di-Apply, SPBU–MT detail aktif, viewport grafik, serta snapshot hasil analisis ke backend. Tombol **Load** memulihkan snapshot tersebut tanpa menghitung ulang, sehingga hasil yang dibuka tetap merepresentasikan kondisi saat konfigurasi disimpan. Nama yang sama dalam depot yang sama memperbarui konfigurasi tersimpan; tabel **Saved SPBU–MT Affinity Analysis Configurations** menyediakan pagination dan penghapusan konfigurasi.
 
 | Filter | Fungsi | Cara membaca atau menggunakan |
 |---|---|---|
@@ -498,6 +501,8 @@ Phase 4 methodology is documented in `docs/PHASE_4_SPBU_MT_AFFINITY.md`, with im
 Phase 7 architecture, workflow, hard/soft constraints, API, schema, dan operasi dispatcher didokumentasikan di `docs/PHASE_7_DYNAMIC_VRP.md`.
 
 Phase 8 snapshot boundary, MT–Trip–LO editing, eligibility, Apply, route legs, multi-trip availability, cascading recalculation, simulation KL/Gantt, daily dashboard, versioning, audit, dan finalization didokumentasikan di `docs/PHASE_8_MANUAL_DISPATCH.md`.
+
+Phase 9 Source-Aligned Bundle, empat metric alignment terpisah, evidence coverage, persistence, API, dashboard, tabel LO, dan aturan interpretasi netral didokumentasikan di `docs/PHASE_9_ROUTE_MODEL_ALIGNMENT.md`.
 
 ## Phase Roadmap
 
@@ -1172,6 +1177,33 @@ Endpoint Phase 8:
 - `GET /api/v1/phase8/manual-dispatch/jobs/{job_id}/validation`
 - `POST /api/v1/phase8/manual-dispatch/jobs/{job_id}/finalize`
 
+### Phase 9 — Route–Model Alignment Evaluation
+
+Phase 9 membaca satu immutable Route Version Phase 7 dan menjelaskan seberapa selaras route tersebut dengan bukti historis yang menjadi lineage analitisnya. User hanya memilih **TBBM** dan **Route Version**; system kemudian membentuk **Source-Aligned Bundle** otomatis dari source Phase 5 model/training snapshot serta historical MT affinity yang scope dan cutoff waktunya eligible. Tidak ada pemilihan saved analysis/model manual pada flow utama dan tidak ada silent recomputation saat hasil tersimpan dibuka kembali.
+
+Empat metric ditampilkan terpisah pada skala `0–100%`:
+
+- **Cluster Cohesion**: proporsi pasangan SPBU evaluable dalam trip yang berada pada cluster Phase 5 yang sama;
+- **Shift Alignment**: historical `P(route shift | SPBU)` berdasarkan planned gate-out dan shift snapshot source model;
+- **Historical SPBU Pairing**: mean symmetric dari `P(B|A)` dan `P(A|B)` untuk unique SPBU pair dalam trip;
+- **Historical MT Affinity**: raw historical `P(MT|SPBU)` untuk assigned MT.
+
+Metric tidak dicampurkan menjadi overall score, tidak memakai label baik/buruk, dan tidak menghasilkan rekomendasi operasional. `0%` berarti denominator historis tersedia tetapi pattern tidak pernah terlihat; `N/A` berarti bukti atau assignment yang diperlukan tidak cukup. Evidence coverage, resolution method, historical period, checksum bundle, dan detail numerator/denominator tetap ditampilkan terpisah agar hasil auditable.
+
+Dashboard menyediakan metric cards, overview/distribution, evidence coverage, Source-Aligned Bundle, **Trip Alignment Matrix**, dan Loading Order detail. Trip Alignment Matrix memiliki kolom **No. LO** dan **No. SPBU** terpisah dari jumlah LO/SPBU, server-side search untuk shipment/trip/MT/shift/LO/SPBU/nama SPBU, sorting per kolom, serta pagination `10/25/50/100`. Tabel Loading Order mempunyai search, sorting, pagination, dan evidence drawer sendiri; kontrol kedua tabel tidak mengubah aggregate route-level.
+
+Endpoint Phase 9:
+
+- `GET /api/v1/phase9/route-model-alignment/routes?depot_id=...`
+- `POST /api/v1/phase9/route-model-alignment/evaluations`
+- `GET /api/v1/phase9/route-model-alignment/evaluations/by-route/{route_version_id}`
+- `GET /api/v1/phase9/route-model-alignment/evaluations/{evaluation_run_id}`
+- `GET /api/v1/phase9/route-model-alignment/evaluations/{evaluation_run_id}/trips`
+- `GET /api/v1/phase9/route-model-alignment/evaluations/{evaluation_run_id}/rows`
+- `GET /api/v1/phase9/route-model-alignment/evaluations/{evaluation_run_id}/rows/{evaluation_row_id}`
+
+Persistence Phase 9 memakai evaluation run, one-row-per-LO alignment snapshot, dan unique trip-pair evidence. Idempotency menggunakan `route_version_id + source_bundle_checksum + algorithm_version`; perubahan source bundle atau algorithm version membuat run baru tanpa mengubah Route Version.
+
 ## Important Design Principles
 
 - Jangan overwrite master data secara diam-diam dari historical evidence.
@@ -1180,6 +1212,7 @@ Endpoint Phase 8:
 - Jangan menggunakan LLM untuk deterministic analytics.
 - Phase 7 route optimization hanya boleh membaca saved Phase 6 sebagai warm start; jangan menulis balik atau menjalankan Phase 6 otomatis saat reroute.
 - Phase 8 hanya boleh menyalin Phase 6/7 sebagai working snapshot; jangan menulis balik source dan jangan menjalankan global reoptimization otomatis.
+- Phase 9 hanya menjelaskan alignment terhadap historical evidence; jangan mengubahnya menjadi route quality score, pass/fail, ranking, atau recommendation.
 - Google Routes menyediakan travel data dan geometry saja; OR-Tools adalah satu-satunya optimization engine Phase 7.
 - Jangan tampilkan uncertainty sebagai fakta pasti; gunakan status seperti `UNKNOWN`, `UNMAPPED`, `AMBIGUOUS`, `LOW CONFIDENCE`, `PARTIAL`, atau `INSUFFICIENT DATA`.
 
@@ -1197,6 +1230,7 @@ Dokumen pendukung:
 - `docs/DATA_QUALITY.md`
 - `docs/PHASE_7_DYNAMIC_VRP.md`
 - `docs/PHASE_8_MANUAL_DISPATCH.md`
+- `docs/PHASE_9_ROUTE_MODEL_ALIGNMENT.md`
 - `docs/SHIPMENT_MODEL.md`
 - `docs/GPS_MODEL.md`
 - `docs/PHASES.md`

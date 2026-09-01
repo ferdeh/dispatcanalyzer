@@ -88,16 +88,46 @@ type ConcentrationRun = {
   baseline_end_date: string;
   minimum_shipment_observation: number;
   algorithm_version: string;
+  algorithm_parameters?: {
+    n_estimators?: number;
+    contamination?: string | number;
+    random_seed?: number;
+    classification_thresholds?: {
+      moderate?: number;
+      high?: number;
+      investigation?: number;
+    };
+  };
   status: string;
   created_by: string;
   created_at: string | null;
   summary: Record<string, number>;
   profiles: ConcentrationProfile[];
 };
-type RunSummary = Omit<
-  ConcentrationRun,
-  "summary" | "profiles" | "algorithm_version"
->;
+type SavedConcentrationAnalysis = {
+  id: string;
+  name: string;
+  depot_id: string;
+  depot_name: string;
+  analysis_run_id: string;
+  baseline_start_date: string;
+  baseline_end_date: string;
+  minimum_shipment_observation: number;
+  status: string;
+  spbu_count: number;
+  investigation_recommended_count: number;
+  created_by: string;
+  created_at: string | null;
+  updated_at: string | null;
+  ui_state?: Record<string, unknown>;
+  analysis_run?: ConcentrationRun;
+};
+type SavedConcentrationAnalysisResponse = {
+  total: number;
+  limit: number;
+  offset: number;
+  rows: SavedConcentrationAnalysis[];
+};
 type ShiftDefinition = {
   shift_id: string;
   name: string;
@@ -300,6 +330,7 @@ type ModelSummary = {
   algorithm_version: string;
   created_by: string;
   created_at: string | null;
+  updated_at: string | null;
 };
 type EvidenceFilter = "CORE" | "MARGINAL" | "ALL";
 type ModelDetail = ModelSummary & {
@@ -465,6 +496,10 @@ function score(value: number | null | undefined) {
   return value === null || value === undefined
     ? "-"
     : value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+}
+
+function dateTimeLabel(value: string | null | undefined) {
+  return value ? new Date(value).toLocaleString() : "-";
 }
 
 function label(value: string) {
@@ -1013,8 +1048,21 @@ export function MachineLearningIntelligencePage({
   const [engineALoading, setEngineALoading] = useState(false);
   const [concentrationRun, setConcentrationRun] =
     useState<ConcentrationRun | null>(null);
-  const [engineARuns, setEngineARuns] = useState<RunSummary[]>([]);
-  const [selectedSavedRun, setSelectedSavedRun] = useState("");
+  const [savedConcentrationAnalyses, setSavedConcentrationAnalyses] = useState<
+    SavedConcentrationAnalysis[]
+  >([]);
+  const [savedConcentrationTotal, setSavedConcentrationTotal] = useState(0);
+  const [savedConcentrationOffset, setSavedConcentrationOffset] = useState(0);
+  const [savedConcentrationLimit, setSavedConcentrationLimit] = useState(5);
+  const [savedConcentrationLoading, setSavedConcentrationLoading] =
+    useState(false);
+  const [selectedSavedConcentrationId, setSelectedSavedConcentrationId] =
+    useState("");
+  const [concentrationSaveDialog, setConcentrationSaveDialog] = useState(false);
+  const [concentrationLoadDialog, setConcentrationLoadDialog] = useState(false);
+  const [concentrationSaveName, setConcentrationSaveName] = useState("");
+  const [concentrationSavedMessage, setConcentrationSavedMessage] =
+    useState("");
   const [classificationFilter, setClassificationFilter] = useState("ALL");
   const [minimumScore, setMinimumScore] = useState("0");
   const [minimumObservationFilter, setMinimumObservationFilter] = useState("0");
@@ -1062,6 +1110,10 @@ export function MachineLearningIntelligencePage({
   const [openedModel, setOpenedModel] = useState<ModelDetail | null>(null);
   const [selectedClusteringModelId, setSelectedClusteringModelId] =
     useState("");
+  const [clusteringLoadDialog, setClusteringLoadDialog] = useState(false);
+  const [clusteringSavedMessage, setClusteringSavedMessage] = useState("");
+  const [clusteringSavedPage, setClusteringSavedPage] = useState(0);
+  const [clusteringSavedPageSize, setClusteringSavedPageSize] = useState(5);
   const [displayedSavedModel, setDisplayedSavedModel] =
     useState<ModelDetail | null>(null);
   const [clusteringModelLoading, setClusteringModelLoading] = useState(false);
@@ -1082,6 +1134,12 @@ export function MachineLearningIntelligencePage({
     setDisplayedSavedModel(null);
     setSelectedClusteringModelId("");
     setModels([]);
+    setSavedConcentrationAnalyses([]);
+    setSavedConcentrationTotal(0);
+    setSavedConcentrationOffset(0);
+    setSelectedSavedConcentrationId("");
+    setConcentrationSavedMessage("");
+    setClusteringSavedMessage("");
     setError(null);
     Promise.all([
       apiGet<Readiness>(
@@ -1090,14 +1148,10 @@ export function MachineLearningIntelligencePage({
       apiGet<{ min_date: string | null; max_date: string | null }>(
         `/api/v1/affinity-intelligence/available-dates?depot_id=${encodeURIComponent(depotId)}`,
       ),
-      apiGet<RunSummary[]>(
-        `/api/v1/phase5/engine-a/runs?depot_id=${encodeURIComponent(depotId)}`,
-      ),
     ])
-      .then(([gate, dates, runs]) => {
+      .then(([gate, dates]) => {
         setReadiness(gate);
         setDateRange(dates);
-        setEngineARuns(runs);
         if (dates.min_date && dates.max_date) {
           setBaselineStart(dates.min_date);
           setBaselineEnd(dates.max_date);
@@ -1114,6 +1168,15 @@ export function MachineLearningIntelligencePage({
       )
       .finally(() => setReadinessLoading(false));
   }, [depotId]);
+
+  useEffect(() => {
+    if (!depotId) return;
+    void refreshSavedConcentrationAnalyses(
+      savedConcentrationOffset,
+      savedConcentrationLimit,
+      depotId,
+    );
+  }, [depotId, savedConcentrationLimit, savedConcentrationOffset]);
 
   useEffect(() => {
     if (tab === "registry" || tab === "clustering") void refreshRegistry();
@@ -1168,11 +1231,8 @@ export function MachineLearningIntelligencePage({
         },
       );
       setConcentrationRun(payload);
-      setSelectedSavedRun(payload.analysis_run_id);
-      setEngineARuns(
-        await apiGet<RunSummary[]>(
-          `/api/v1/phase5/engine-a/runs?depot_id=${encodeURIComponent(depotId)}`,
-        ),
+      setConcentrationSavedMessage(
+        "Analysis completed. Use Save to store this result in the saved analysis list.",
       );
     } catch (reason) {
       setError(
@@ -1185,23 +1245,185 @@ export function MachineLearningIntelligencePage({
     }
   }
 
-  async function openSavedRun() {
-    if (!selectedSavedRun) return;
-    setEngineALoading(true);
+  async function refreshSavedConcentrationAnalyses(
+    nextOffset = savedConcentrationOffset,
+    nextLimit = savedConcentrationLimit,
+    targetDepotId = depotId,
+  ) {
+    setSavedConcentrationLoading(true);
     try {
-      setConcentrationRun(
-        await apiGet<ConcentrationRun>(
-          `/api/v1/phase5/engine-a/runs/${selectedSavedRun}`,
-        ),
+      const params = new URLSearchParams({
+        limit: String(nextLimit),
+        offset: String(nextOffset),
+      });
+      if (targetDepotId) params.set("depot_id", targetDepotId);
+      const payload = await apiGet<SavedConcentrationAnalysisResponse>(
+        `/api/v1/phase5/engine-a/saved-analyses?${params.toString()}`,
+      );
+      setSavedConcentrationAnalyses(payload.rows);
+      setSavedConcentrationTotal(payload.total);
+      setSavedConcentrationOffset(payload.offset);
+      setSavedConcentrationLimit(payload.limit);
+      setSelectedSavedConcentrationId((current) =>
+        payload.rows.some((row) => row.id === current)
+          ? current
+          : payload.rows[0]?.id ?? "",
       );
     } catch (reason) {
       setError(
         reason instanceof Error
           ? reason.message
-          : "Failed to open analysis run.",
+          : "Failed to load saved concentration analyses.",
       );
     } finally {
-      setEngineALoading(false);
+      setSavedConcentrationLoading(false);
+    }
+  }
+
+  function openConcentrationSaveDialog() {
+    if (!concentrationRun || concentrationRun.status !== "COMPLETED") {
+      setError("Run and complete a concentration analysis before saving it.");
+      return;
+    }
+    setConcentrationSaveName("");
+    setConcentrationSaveDialog(true);
+    setError(null);
+  }
+
+  function openConcentrationLoadDialog() {
+    if (!savedConcentrationAnalyses.length) {
+      setError("No saved concentration analysis is available for this depot.");
+      return;
+    }
+    setSelectedSavedConcentrationId(
+      (current) => current || savedConcentrationAnalyses[0]?.id || "",
+    );
+    setConcentrationLoadDialog(true);
+    setError(null);
+  }
+
+  async function saveCurrentConcentrationAnalysis() {
+    if (!concentrationRun || !concentrationSaveName.trim()) return;
+    setSavedConcentrationLoading(true);
+    setError(null);
+    try {
+      const saved = await apiSend<SavedConcentrationAnalysis>(
+        "/api/v1/phase5/engine-a/saved-analyses",
+        "POST",
+        {
+          name: concentrationSaveName.trim(),
+          analysis_run_id: concentrationRun.analysis_run_id,
+          ui_state: {
+            classification_filter: classificationFilter,
+            minimum_score: minimumScore,
+            minimum_observation_filter: minimumObservationFilter,
+            spbu_search: spbuSearch,
+            score_direction: scoreDirection,
+            table_page_size: concentrationPageSize,
+          },
+        },
+      );
+      setConcentrationSavedMessage(`Saved concentration analysis: ${saved.name}.`);
+      setConcentrationSaveDialog(false);
+      setConcentrationSaveName("");
+      setSavedConcentrationOffset(0);
+      await refreshSavedConcentrationAnalyses(0, savedConcentrationLimit, depotId);
+    } catch (reason) {
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : "Failed to save concentration analysis.",
+      );
+    } finally {
+      setSavedConcentrationLoading(false);
+    }
+  }
+
+  async function loadSavedConcentrationAnalysis(
+    savedAnalysisId = selectedSavedConcentrationId,
+  ) {
+    if (!savedAnalysisId) return;
+    setSavedConcentrationLoading(true);
+    setError(null);
+    try {
+      const saved = await apiGet<SavedConcentrationAnalysis>(
+        `/api/v1/phase5/engine-a/saved-analyses/${encodeURIComponent(savedAnalysisId)}`,
+      );
+      if (!saved.analysis_run) {
+        throw new Error("Saved analysis does not contain a concentration result.");
+      }
+      const run = saved.analysis_run;
+      const uiState = saved.ui_state ?? {};
+      const thresholds = run.algorithm_parameters?.classification_thresholds;
+      setConcentrationRun(run);
+      setBaselineStart(run.baseline_start_date);
+      setBaselineEnd(run.baseline_end_date);
+      setEngineAMinimum(String(run.minimum_shipment_observation));
+      setEngineAEstimators(String(run.algorithm_parameters?.n_estimators ?? 200));
+      setEngineAContamination(String(run.algorithm_parameters?.contamination ?? "auto"));
+      setEngineASeed(String(run.algorithm_parameters?.random_seed ?? 42));
+      setEngineAThresholds({
+        moderate: String(thresholds?.moderate ?? 40),
+        high: String(thresholds?.high ?? 60),
+        investigation: String(thresholds?.investigation ?? 80),
+      });
+      setClassificationFilter(String(uiState.classification_filter ?? "ALL"));
+      setMinimumScore(String(uiState.minimum_score ?? "0"));
+      setMinimumObservationFilter(
+        String(uiState.minimum_observation_filter ?? "0"),
+      );
+      setSpbuSearch(String(uiState.spbu_search ?? ""));
+      setScoreDirection(uiState.score_direction === "asc" ? "asc" : "desc");
+      setConcentrationPageSize(Number(uiState.table_page_size ?? 10));
+      setConcentrationPage(0);
+      setSelectedConcentration(null);
+      setSelectedSavedConcentrationId(saved.id);
+      setConcentrationSavedMessage(`Loaded concentration analysis: ${saved.name}.`);
+      setConcentrationLoadDialog(false);
+    } catch (reason) {
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : "Failed to load saved concentration analysis.",
+      );
+    } finally {
+      setSavedConcentrationLoading(false);
+    }
+  }
+
+  async function deleteSavedConcentrationAnalysis(
+    saved: SavedConcentrationAnalysis,
+  ) {
+    if (!window.confirm(`Delete saved concentration analysis "${saved.name}"?`))
+      return;
+    setSavedConcentrationLoading(true);
+    setError(null);
+    try {
+      await apiSend(
+        `/api/v1/phase5/engine-a/saved-analyses/${encodeURIComponent(saved.id)}`,
+        "DELETE",
+      );
+      setConcentrationSavedMessage(
+        `Deleted saved concentration analysis: ${saved.name}.`,
+      );
+      const nextOffset =
+        savedConcentrationAnalyses.length === 1
+          ? Math.max(0, savedConcentrationOffset - savedConcentrationLimit)
+          : savedConcentrationOffset;
+      setSavedConcentrationOffset(nextOffset);
+      await refreshSavedConcentrationAnalyses(
+        nextOffset,
+        savedConcentrationLimit,
+        depotId,
+      );
+    } catch (reason) {
+      setError(
+        reason instanceof Error
+          ? reason.message
+          : "Failed to delete saved concentration analysis.",
+      );
+    } finally {
+      setSavedConcentrationLoading(false);
     }
   }
 
@@ -1276,6 +1498,18 @@ export function MachineLearningIntelligencePage({
   const concentrationRangeEnd = Math.min(
     filteredConcentration.length,
     (concentrationPage + 1) * concentrationPageSize,
+  );
+  const savedConcentrationShowingStart =
+    savedConcentrationTotal === 0 ? 0 : savedConcentrationOffset + 1;
+  const savedConcentrationShowingEnd = Math.min(
+    savedConcentrationOffset + savedConcentrationLimit,
+    savedConcentrationTotal,
+  );
+  const savedConcentrationPage =
+    Math.floor(savedConcentrationOffset / savedConcentrationLimit) + 1;
+  const savedConcentrationPageCount = Math.max(
+    1,
+    Math.ceil(savedConcentrationTotal / savedConcentrationLimit),
   );
 
   const concentrationChartRows = useMemo(
@@ -1401,7 +1635,7 @@ export function MachineLearningIntelligencePage({
     if (!trainingRun || !modelName.trim()) return;
     setEngineBLoading(true);
     try {
-      await apiSend<ModelDetail>(
+      const savedModel = await apiSend<ModelDetail>(
         `/api/v1/phase5/engine-b/training-runs/${trainingRun.training_run_id}/save`,
         "POST",
         {
@@ -1413,7 +1647,12 @@ export function MachineLearningIntelligencePage({
       setModelName("");
       setModelDescription("");
       await refreshRegistry();
-      setTab("registry");
+      setTrainingRun(null);
+      setDisplayedSavedModel(savedModel);
+      setSelectedClusteringModelId(savedModel.model_id);
+      setClusteringSavedMessage(
+        `Saved behavioral analysis: ${savedModel.model_name} v${savedModel.model_version}.`,
+      );
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Model save failed.");
     } finally {
@@ -1456,18 +1695,35 @@ export function MachineLearningIntelligencePage({
     }
   }
 
-  async function openClusteringModel() {
-    if (!selectedClusteringModelId) return;
+  function openClusteringLoadDialog() {
+    if (!models.length) {
+      setError("No saved behavioral analysis is available for this depot.");
+      return;
+    }
+    setSelectedClusteringModelId((current) => current || models[0]?.model_id || "");
+    setClusteringLoadDialog(true);
+    setError(null);
+  }
+
+  async function openClusteringModel(
+    modelId = selectedClusteringModelId,
+  ) {
+    if (!modelId) return;
     setClusteringModelLoading(true);
     setError(null);
     try {
       const model = await apiGet<ModelDetail>(
-        `/api/v1/phase5/models/${selectedClusteringModelId}`,
+        `/api/v1/phase5/models/${modelId}`,
       );
       setTrainingRun(null);
       setSelectedCluster(null);
       setDisplayedSavedModel(model);
+      setSelectedClusteringModelId(model.model_id);
       setClusterMembershipPage(0);
+      setClusteringSavedMessage(
+        `Loaded behavioral analysis: ${model.model_name} v${model.model_version}.`,
+      );
+      setClusteringLoadDialog(false);
     } catch (reason) {
       setError(
         reason instanceof Error
@@ -1559,6 +1815,15 @@ export function MachineLearningIntelligencePage({
       return;
     try {
       await apiSend(`/api/v1/phase5/models/${model.model_id}`, "DELETE");
+      if (displayedSavedModel?.model_id === model.model_id) {
+        setDisplayedSavedModel(null);
+      }
+      if (selectedClusteringModelId === model.model_id) {
+        setSelectedClusteringModelId("");
+      }
+      setClusteringSavedMessage(
+        `Deleted behavioral analysis: ${model.model_name} v${model.model_version}.`,
+      );
       await refreshRegistry();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Delete failed.");
@@ -1641,6 +1906,26 @@ export function MachineLearningIntelligencePage({
     [displayedSavedModel],
   );
   const displayedClusterResult = savedModelResult ?? trainedResult;
+  const clusteringSavedPageCount = Math.max(
+    1,
+    Math.ceil(models.length / clusteringSavedPageSize),
+  );
+  const clusteringSavedSafePage = Math.min(
+    clusteringSavedPage,
+    clusteringSavedPageCount - 1,
+  );
+  const clusteringSavedRows = models.slice(
+    clusteringSavedSafePage * clusteringSavedPageSize,
+    (clusteringSavedSafePage + 1) * clusteringSavedPageSize,
+  );
+  const clusteringSavedRangeStart =
+    models.length === 0
+      ? 0
+      : clusteringSavedSafePage * clusteringSavedPageSize + 1;
+  const clusteringSavedRangeEnd = Math.min(
+    models.length,
+    (clusteringSavedSafePage + 1) * clusteringSavedPageSize,
+  );
   const evidenceCounts = useMemo(() => {
     const assignments = displayedClusterResult?.assignments ?? [];
     const historical = assignments.filter(hasHistoricalEvidence).length;
@@ -1807,6 +2092,10 @@ export function MachineLearningIntelligencePage({
     setEvidenceFilter("CORE");
   }, [displayedSavedModel?.model_id, trainingRun?.training_run_id]);
 
+  useEffect(() => {
+    setClusteringSavedPage(0);
+  }, [depotId, clusteringSavedPageSize]);
+
   return (
     <div className="space-y-5">
       {error && (
@@ -1942,30 +2231,36 @@ export function MachineLearningIntelligencePage({
                   classifier.
                 </p>
               </div>
-              <div className="flex gap-2">
-                <select
-                  className="border border-line bg-white px-3 py-2 text-sm"
-                  value={selectedSavedRun}
-                  onChange={(event) => setSelectedSavedRun(event.target.value)}
-                >
-                  <option value="">Saved analysis runs</option>
-                  {engineARuns.map((run) => (
-                    <option
-                      key={run.analysis_run_id}
-                      value={run.analysis_run_id}
-                    >
-                      {run.baseline_start_date}–{run.baseline_end_date} ·{" "}
-                      {run.status}
-                    </option>
-                  ))}
-                </select>
-                <button
-                  className="border border-line px-3 py-2 text-sm"
-                  onClick={openSavedRun}
-                  disabled={!selectedSavedRun}
-                >
-                  Open
-                </button>
+              <div className="flex flex-col items-end gap-2">
+                <div className="flex gap-2">
+                  <button
+                    className="inline-flex items-center gap-2 border border-line px-3 py-2 text-sm disabled:opacity-50"
+                    onClick={openConcentrationLoadDialog}
+                    disabled={
+                      savedConcentrationLoading || savedConcentrationTotal === 0
+                    }
+                    title="Load a saved concentration analysis"
+                  >
+                    <RefreshCw size={14} /> Load
+                  </button>
+                  <button
+                    className="inline-flex items-center gap-2 border border-line px-3 py-2 text-sm disabled:opacity-50"
+                    onClick={openConcentrationSaveDialog}
+                    disabled={
+                      engineALoading ||
+                      !concentrationRun ||
+                      concentrationRun.status !== "COMPLETED"
+                    }
+                    title="Save the current concentration analysis result"
+                  >
+                    <Save size={14} /> Save
+                  </button>
+                </div>
+                {concentrationSavedMessage && (
+                  <div className="max-w-md text-right text-xs text-slate-500">
+                    {concentrationSavedMessage}
+                  </div>
+                )}
               </div>
             </div>
             <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-5">
@@ -2094,6 +2389,130 @@ export function MachineLearningIntelligencePage({
                 </button>
               </div>
             )}
+            <div className="mt-4 border border-line">
+              <div className="flex flex-col gap-2 border-b border-line bg-slate-50 px-3 py-2 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                    Saved Historical MT–SPBU Concentration Analyses
+                  </div>
+                  <div className="mt-1 text-xs text-slate-500">
+                    Showing {savedConcentrationShowingStart}–
+                    {savedConcentrationShowingEnd} of {savedConcentrationTotal}
+                  </div>
+                </div>
+                <select
+                  className="border border-line bg-white px-2 py-1 text-xs"
+                  value={savedConcentrationLimit}
+                  onChange={(event) => {
+                    setSavedConcentrationOffset(0);
+                    setSavedConcentrationLimit(Number(event.target.value));
+                  }}
+                  title="Saved analyses per page"
+                >
+                  <option value={5}>5 rows</option>
+                  <option value={10}>10 rows</option>
+                  <option value={25}>25 rows</option>
+                </select>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full border-collapse text-sm">
+                  <thead>
+                    <tr className="border-b border-line text-left text-xs uppercase tracking-wide text-slate-500">
+                      <th className="whitespace-nowrap px-3 py-2">Name</th>
+                      <th className="whitespace-nowrap px-3 py-2">Depot</th>
+                      <th className="whitespace-nowrap px-3 py-2">Period</th>
+                      <th className="whitespace-nowrap px-3 py-2">Min. Obs.</th>
+                      <th className="whitespace-nowrap px-3 py-2">SPBU</th>
+                      <th className="whitespace-nowrap px-3 py-2">Investigation</th>
+                      <th className="whitespace-nowrap px-3 py-2">Saved</th>
+                      <th className="whitespace-nowrap px-3 py-2">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {savedConcentrationAnalyses.map((saved) => (
+                      <tr className="border-b border-line" key={saved.id}>
+                        <td className="whitespace-nowrap px-3 py-2 font-medium">
+                          {saved.name}
+                        </td>
+                        <td className="whitespace-nowrap px-3 py-2">
+                          {saved.depot_name}
+                        </td>
+                        <td className="whitespace-nowrap px-3 py-2">
+                          {saved.baseline_start_date} – {saved.baseline_end_date}
+                        </td>
+                        <td className="px-3 py-2">
+                          {saved.minimum_shipment_observation}
+                        </td>
+                        <td className="px-3 py-2">{saved.spbu_count}</td>
+                        <td className="px-3 py-2">
+                          {saved.investigation_recommended_count}
+                        </td>
+                        <td className="whitespace-nowrap px-3 py-2">
+                          {dateTimeLabel(saved.updated_at)}
+                        </td>
+                        <td className="px-3 py-2">
+                          <button
+                            className="inline-flex items-center justify-center border border-line p-2 text-rust disabled:opacity-40"
+                            onClick={() =>
+                              void deleteSavedConcentrationAnalysis(saved)
+                            }
+                            disabled={savedConcentrationLoading}
+                            title="Delete saved concentration analysis"
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                    {savedConcentrationAnalyses.length === 0 && (
+                      <tr>
+                        <td
+                          colSpan={8}
+                          className="px-3 py-8 text-center text-slate-500"
+                        >
+                          No saved concentration analysis for this depot.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+              <div className="flex items-center justify-between gap-3 px-3 py-2 text-sm">
+                <button
+                  className="border border-line px-3 py-2 disabled:opacity-50"
+                  onClick={() =>
+                    setSavedConcentrationOffset(
+                      Math.max(
+                        0,
+                        savedConcentrationOffset - savedConcentrationLimit,
+                      ),
+                    )
+                  }
+                  disabled={
+                    savedConcentrationOffset === 0 || savedConcentrationLoading
+                  }
+                >
+                  Previous
+                </button>
+                <span className="text-slate-500">
+                  Page {savedConcentrationPage} of {savedConcentrationPageCount}
+                </span>
+                <button
+                  className="border border-line px-3 py-2 disabled:opacity-50"
+                  onClick={() =>
+                    setSavedConcentrationOffset(
+                      savedConcentrationOffset + savedConcentrationLimit,
+                    )
+                  }
+                  disabled={
+                    savedConcentrationOffset + savedConcentrationLimit >=
+                      savedConcentrationTotal || savedConcentrationLoading
+                  }
+                >
+                  Next
+                </button>
+              </div>
+            </div>
           </section>
 
           {concentrationRun && (
@@ -2442,14 +2861,45 @@ export function MachineLearningIntelligencePage({
       {tab === "clustering" && (
         <>
           <section className="border border-line bg-white p-5">
-            <h2 className="font-display text-xl font-semibold">
-              SPBU Behavioral Clustering
-            </h2>
-            <p className="mt-1 text-sm text-slate-500">
-              Tag + full shift distribution + Phase 3 co-shipment graph +
-              Haversine geographic proximity. Only SUFFICIENT SPBUs determine
-              core clusters; clusters never override compatibility.
-            </p>
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+              <div>
+                <h2 className="font-display text-xl font-semibold">
+                  SPBU Behavioral Clustering
+                </h2>
+                <p className="mt-1 text-sm text-slate-500">
+                  Tag + full shift distribution + Phase 3 co-shipment graph +
+                  Haversine geographic proximity. Only SUFFICIENT SPBUs determine
+                  core clusters; clusters never override compatibility.
+                </p>
+              </div>
+              <div className="flex flex-col items-end gap-2">
+                <div className="flex gap-2">
+                  <button
+                    className="inline-flex items-center gap-2 border border-line px-3 py-2 text-sm disabled:opacity-50"
+                    onClick={openClusteringLoadDialog}
+                    disabled={registryLoading || models.length === 0}
+                    title="Load a saved behavioral analysis"
+                  >
+                    <RefreshCw size={14} /> Load
+                  </button>
+                  <button
+                    className="inline-flex items-center gap-2 border border-line px-3 py-2 text-sm disabled:opacity-50"
+                    onClick={() => setSaveDialog(true)}
+                    disabled={
+                      engineBLoading || !trainedResult || Boolean(displayedSavedModel)
+                    }
+                    title="Save the current trained behavioral analysis"
+                  >
+                    <Save size={14} /> Save
+                  </button>
+                </div>
+                {clusteringSavedMessage && (
+                  <div className="max-w-md text-right text-xs text-slate-500">
+                    {clusteringSavedMessage}
+                  </div>
+                )}
+              </div>
+            </div>
             <div className="mt-4 grid gap-3 md:grid-cols-2 lg:grid-cols-5">
               <label className="text-xs font-semibold uppercase tracking-wide text-slate-500">
                 Depot
@@ -2724,46 +3174,129 @@ export function MachineLearningIntelligencePage({
                 </div>
               </div>
             )}
-            <div className="mt-4 flex flex-col gap-3 border border-line bg-petrocloud/40 p-4 lg:flex-row lg:items-end">
-              <label className="min-w-0 flex-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
-                Saved Behavioral Model
+            <div className="mt-4 border border-line">
+              <div className="flex flex-col gap-2 border-b border-line bg-slate-50 px-3 py-2 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                    Saved SPBU Behavioral Clustering Analyses
+                  </div>
+                  <div className="mt-1 text-xs text-slate-500">
+                    Showing {clusteringSavedRangeStart}–{clusteringSavedRangeEnd} of{" "}
+                    {models.length}
+                  </div>
+                </div>
                 <select
-                  className="mt-1 w-full border border-line bg-white px-3 py-2 text-sm text-petroink"
-                  value={selectedClusteringModelId}
+                  className="border border-line bg-white px-2 py-1 text-xs"
+                  value={clusteringSavedPageSize}
                   onChange={(event) =>
-                    setSelectedClusteringModelId(event.target.value)
+                    setClusteringSavedPageSize(Number(event.target.value))
                   }
-                  disabled={registryLoading || models.length === 0}
-                  title="Select a saved Behavioral Clustering model"
+                  title="Saved analyses per page"
                 >
-                  <option value="">
-                    {registryLoading
-                      ? "Loading saved models…"
-                      : models.length
-                        ? "Select saved model"
-                        : "No saved model for this depot"}
-                  </option>
-                  {models.map((model) => (
-                    <option value={model.model_id} key={model.model_id}>
-                      {model.model_name} v{model.model_version} ·{" "}
-                      {label(model.model_status)} · {model.training_start_date}–
-                      {model.training_end_date}
-                    </option>
-                  ))}
+                  <option value={5}>5 rows</option>
+                  <option value={10}>10 rows</option>
+                  <option value={25}>25 rows</option>
                 </select>
-              </label>
-              <button
-                className="inline-flex items-center justify-center gap-2 bg-petroblue px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-40"
-                onClick={openClusteringModel}
-                disabled={!selectedClusteringModelId || clusteringModelLoading}
-              >
-                <Eye size={16} />{" "}
-                {clusteringModelLoading ? "Opening…" : "Open Saved Model"}
-              </button>
-              <p className="max-w-md text-xs leading-5 text-slate-500">
-                Display stored clusters, UMAP, geographic positions, profiles,
-                and membership without preparing or retraining a dataset.
-              </p>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full border-collapse text-sm">
+                  <thead>
+                    <tr className="border-b border-line text-left text-xs uppercase tracking-wide text-slate-500">
+                      <th className="whitespace-nowrap px-3 py-2">Name</th>
+                      <th className="whitespace-nowrap px-3 py-2">Version</th>
+                      <th className="whitespace-nowrap px-3 py-2">Depot</th>
+                      <th className="whitespace-nowrap px-3 py-2">Period</th>
+                      <th className="whitespace-nowrap px-3 py-2">SPBU</th>
+                      <th className="whitespace-nowrap px-3 py-2">Clusters</th>
+                      <th className="whitespace-nowrap px-3 py-2">Status</th>
+                      <th className="whitespace-nowrap px-3 py-2">Saved</th>
+                      <th className="whitespace-nowrap px-3 py-2">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {clusteringSavedRows.map((model) => (
+                      <tr className="border-b border-line" key={model.model_id}>
+                        <td className="whitespace-nowrap px-3 py-2 font-medium">
+                          {model.model_name}
+                        </td>
+                        <td className="px-3 py-2">v{model.model_version}</td>
+                        <td className="whitespace-nowrap px-3 py-2">
+                          {model.depot_name}
+                        </td>
+                        <td className="whitespace-nowrap px-3 py-2">
+                          {model.training_start_date} – {model.training_end_date}
+                        </td>
+                        <td className="px-3 py-2">{model.total_spbu_count}</td>
+                        <td className="px-3 py-2">{model.cluster_count}</td>
+                        <td className="px-3 py-2">
+                          <span
+                            className={`border px-2 py-1 text-xs ${badgeClass(model.model_status)}`}
+                          >
+                            {label(model.model_status)}
+                          </span>
+                        </td>
+                        <td className="whitespace-nowrap px-3 py-2">
+                          {dateTimeLabel(model.updated_at ?? model.created_at)}
+                        </td>
+                        <td className="px-3 py-2">
+                          <button
+                            className="inline-flex items-center justify-center border border-line p-2 text-rust disabled:opacity-30"
+                            onClick={() => void deleteModel(model)}
+                            disabled={
+                              model.model_status === "ACTIVE" || registryLoading
+                            }
+                            title={
+                              model.model_status === "ACTIVE"
+                                ? "Active model cannot be deleted"
+                                : "Delete saved behavioral analysis"
+                            }
+                          >
+                            <Trash2 size={14} />
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                    {clusteringSavedRows.length === 0 && (
+                      <tr>
+                        <td
+                          colSpan={9}
+                          className="px-3 py-8 text-center text-slate-500"
+                        >
+                          No saved behavioral analysis for this depot.
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+              <div className="flex items-center justify-between gap-3 px-3 py-2 text-sm">
+                <button
+                  className="border border-line px-3 py-2 disabled:opacity-50"
+                  onClick={() =>
+                    setClusteringSavedPage((current) => Math.max(0, current - 1))
+                  }
+                  disabled={clusteringSavedSafePage === 0 || registryLoading}
+                >
+                  Previous
+                </button>
+                <span className="text-slate-500">
+                  Page {clusteringSavedSafePage + 1} of {clusteringSavedPageCount}
+                </span>
+                <button
+                  className="border border-line px-3 py-2 disabled:opacity-50"
+                  onClick={() =>
+                    setClusteringSavedPage((current) =>
+                      Math.min(clusteringSavedPageCount - 1, current + 1),
+                    )
+                  }
+                  disabled={
+                    clusteringSavedSafePage + 1 >= clusteringSavedPageCount ||
+                    registryLoading
+                  }
+                >
+                  Next
+                </button>
+              </div>
             </div>
             <div className="mt-4 border border-line bg-slate-50 p-4">
               <div className="flex items-center justify-between gap-3">
@@ -3546,12 +4079,6 @@ export function MachineLearningIntelligencePage({
                 ) : (
                   <div className="mt-4 flex flex-wrap gap-2">
                     <button
-                      className="inline-flex items-center gap-2 bg-mint px-4 py-2 text-sm font-semibold text-white"
-                      onClick={() => setSaveDialog(true)}
-                    >
-                      <Save size={16} /> Save Model
-                    </button>
-                    <button
                       className="border border-line px-4 py-2 text-sm"
                       onClick={() => setTrainingRun(null)}
                     >
@@ -4319,6 +4846,170 @@ export function MachineLearningIntelligencePage({
                   </div>
                 )}
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {concentrationSaveDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/35 p-4">
+          <div className="w-full max-w-lg border border-line bg-white p-5 shadow-xl">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h2 className="text-lg font-semibold">
+                  Save Concentration Analysis
+                </h2>
+                <p className="mt-1 text-xs text-slate-500">
+                  Stores a named reference to the completed Engine A result and
+                  its current table filters. Loading does not rerun the analysis.
+                </p>
+              </div>
+              <button onClick={() => setConcentrationSaveDialog(false)}>
+                <X size={17} />
+              </button>
+            </div>
+            <label className="mt-4 block text-xs font-semibold uppercase tracking-wide text-slate-500">
+              Analysis Name *
+              <input
+                className="mt-1 w-full border border-line px-3 py-2 text-sm"
+                value={concentrationSaveName}
+                onChange={(event) => setConcentrationSaveName(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter")
+                    void saveCurrentConcentrationAnalysis();
+                }}
+                placeholder="Example: Medan concentration baseline"
+                autoFocus
+              />
+            </label>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                className="border border-line px-4 py-2 text-sm"
+                onClick={() => setConcentrationSaveDialog(false)}
+              >
+                Cancel
+              </button>
+              <button
+                className="inline-flex items-center gap-2 bg-mint px-4 py-2 text-sm font-semibold text-white disabled:opacity-40"
+                disabled={
+                  !concentrationSaveName.trim() || savedConcentrationLoading
+                }
+                onClick={() => void saveCurrentConcentrationAnalysis()}
+              >
+                <Save size={14} />
+                {savedConcentrationLoading ? "Saving…" : "Save"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {concentrationLoadDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/35 p-4">
+          <div className="w-full max-w-xl border border-line bg-white p-5 shadow-xl">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h2 className="text-lg font-semibold">
+                  Load Concentration Analysis
+                </h2>
+                <p className="mt-1 text-xs text-slate-500">
+                  Restores the saved result, analysis parameters, and table
+                  filters without running Engine A again.
+                </p>
+              </div>
+              <button onClick={() => setConcentrationLoadDialog(false)}>
+                <X size={17} />
+              </button>
+            </div>
+            <label className="mt-4 block text-xs font-semibold uppercase tracking-wide text-slate-500">
+              Saved Analysis
+              <select
+                className="mt-1 w-full border border-line bg-white px-3 py-2 text-sm font-normal normal-case tracking-normal"
+                value={selectedSavedConcentrationId}
+                onChange={(event) =>
+                  setSelectedSavedConcentrationId(event.target.value)
+                }
+              >
+                {savedConcentrationAnalyses.map((saved) => (
+                  <option value={saved.id} key={saved.id}>
+                    {saved.name} | {saved.depot_name} |{" "}
+                    {saved.baseline_start_date}–{saved.baseline_end_date}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                className="border border-line px-4 py-2 text-sm"
+                onClick={() => setConcentrationLoadDialog(false)}
+              >
+                Cancel
+              </button>
+              <button
+                className="inline-flex items-center gap-2 bg-petroblue px-4 py-2 text-sm font-semibold text-white disabled:opacity-40"
+                disabled={
+                  !selectedSavedConcentrationId || savedConcentrationLoading
+                }
+                onClick={() => void loadSavedConcentrationAnalysis()}
+              >
+                <RefreshCw size={14} />
+                {savedConcentrationLoading ? "Loading…" : "Load"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {clusteringLoadDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/35 p-4">
+          <div className="w-full max-w-xl border border-line bg-white p-5 shadow-xl">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h2 className="text-lg font-semibold">
+                  Load Behavioral Clustering Analysis
+                </h2>
+                <p className="mt-1 text-xs text-slate-500">
+                  Opens the stored cluster assignments, UMAP, geographic map,
+                  profiles, and membership without preparing or retraining data.
+                </p>
+              </div>
+              <button onClick={() => setClusteringLoadDialog(false)}>
+                <X size={17} />
+              </button>
+            </div>
+            <label className="mt-4 block text-xs font-semibold uppercase tracking-wide text-slate-500">
+              Saved Analysis
+              <select
+                className="mt-1 w-full border border-line bg-white px-3 py-2 text-sm font-normal normal-case tracking-normal"
+                value={selectedClusteringModelId}
+                onChange={(event) =>
+                  setSelectedClusteringModelId(event.target.value)
+                }
+              >
+                {models.map((model) => (
+                  <option value={model.model_id} key={model.model_id}>
+                    {model.model_name} v{model.model_version} |{" "}
+                    {label(model.model_status)} | {model.training_start_date}–
+                    {model.training_end_date}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                className="border border-line px-4 py-2 text-sm"
+                onClick={() => setClusteringLoadDialog(false)}
+              >
+                Cancel
+              </button>
+              <button
+                className="inline-flex items-center gap-2 bg-petroblue px-4 py-2 text-sm font-semibold text-white disabled:opacity-40"
+                disabled={!selectedClusteringModelId || clusteringModelLoading}
+                onClick={() => void openClusteringModel()}
+              >
+                <RefreshCw size={14} />
+                {clusteringModelLoading ? "Loading…" : "Load"}
+              </button>
             </div>
           </div>
         </div>

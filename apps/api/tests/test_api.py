@@ -300,6 +300,35 @@ def test_dashboard_counts_match_database() -> None:
     )
     assert hybrid_response.status_code == 200
     assert hybrid_response.json()["rows"][0]["shift_distribution"][0]["score"] is not None
+    save_response = client.post(
+        "/api/v1/departure-intelligence/saved-shift-configurations",
+        json={
+            "name": "Medan baseline shifts",
+            "depot_id": depot.depot_id,
+            "start_date": str(date_range[0]),
+            "end_date": str(date_range[1]),
+            "bucket_minutes": 30,
+            "assignment_method": "DOMINANT_SHIFT",
+            "shift_config": shift_config,
+            "ui_state": {"departure_limit": 25, "departure_offset": 0},
+            "departure_analysis_snapshot": departure_payload,
+            "shift_analysis_snapshot": shift_payload,
+        },
+    )
+    assert save_response.status_code == 200
+    saved_config = save_response.json()
+    assert saved_config["name"] == "Medan baseline shifts"
+    assert saved_config["shift_config"] == shift_config
+    assert saved_config["departure_analysis_snapshot"]["page_name"] == "Depot Departure Time Intelligence"
+    list_saved = client.get(f"/api/v1/departure-intelligence/saved-shift-configurations?depot_id={depot.depot_id}")
+    assert list_saved.status_code == 200
+    assert list_saved.json()["total"] == 1
+    load_saved = client.get(f"/api/v1/departure-intelligence/saved-shift-configurations/{saved_config['id']}")
+    assert load_saved.status_code == 200
+    assert load_saved.json()["shift_analysis_snapshot"]["section"] == "Operational Shift Intelligence"
+    delete_saved = client.delete(f"/api/v1/departure-intelligence/saved-shift-configurations/{saved_config['id']}")
+    assert delete_saved.status_code == 200
+    assert delete_saved.json()["status"] == "DELETED"
     invalid_shift_response = client.post(
         "/api/v1/departure-intelligence/shift-analysis",
         json={

@@ -12,6 +12,7 @@ import { AppSidebar, type AppPage } from "./components/AppSidebar";
 import { DocumentationPage } from "./components/DocumentationPage";
 import { Phase7OptimizationPage } from "./components/Phase7OptimizationPage";
 import { ManualDispatchPage } from "./components/ManualDispatchPage";
+import { RouteModelAlignmentPage } from "./components/RouteModelAlignmentPage";
 
 type Overview = Record<string, number>;
 type Charts = Record<string, SeriesPoint[]>;
@@ -132,6 +133,11 @@ const pageMetadata: Record<Page, { eyebrow: string; title: string; description: 
     eyebrow: "Phase 8 · Manual Dispatch & Simulation",
     title: "Manual Dispatching & Operational Simulation",
     description: "Human-in-the-loop trip adjustment, compatibility guardrails, route recalculation, fleet simulation, audit, and final dispatch.",
+  },
+  "route-model-alignment": {
+    eyebrow: "Phase 9 · Evaluation",
+    title: "Route–Model Alignment Evaluation",
+    description: "Neutral, source-aligned measurement of route similarity to historical cluster, shift, SPBU pairing, and MT affinity patterns.",
   },
   "google-maps-integration": {
     eyebrow: "Settings",
@@ -388,6 +394,63 @@ type ShiftAnalysis = {
   rows: ShiftAssignmentRow[];
   heatmap: { x_axis: string[]; y_axis: string[]; data: number[][] };
   notes: string[];
+};
+type SavedShiftAnalysisConfig = {
+  id: string;
+  name: string;
+  depot_id: string;
+  depot_name: string | null;
+  start_date: string;
+  end_date: string;
+  bucket_minutes: number;
+  search: string;
+  sort_column: string;
+  sort_direction: string;
+  assignment_method: ShiftAssignmentMethod;
+  assignment_method_label: string;
+  shift_count: number;
+  profile_count: number;
+  observation_count: number;
+  assigned_profile_count: number;
+  created_by: string;
+  created_at: string | null;
+  updated_at: string | null;
+  shift_config?: OperationalShiftConfig[];
+  ui_state?: Record<string, string | number | null>;
+  departure_analysis_snapshot?: DepartureAnalysis;
+  shift_analysis_snapshot?: ShiftAnalysis;
+};
+type SavedShiftAnalysisConfigResponse = {
+  total: number;
+  limit: number;
+  offset: number;
+  rows: SavedShiftAnalysisConfig[];
+};
+type SavedPairingAnalysisConfig = {
+  id: string;
+  name: string;
+  depot_id: string;
+  depot_name: string | null;
+  start_date: string;
+  end_date: string;
+  product_id: string | null;
+  product_name: string;
+  search: string;
+  sort_column: PairingSortColumn;
+  sort_direction: CrudSortDirection;
+  unique_spbu_pairs: number;
+  multi_spbu_shipments: number;
+  created_by: string;
+  created_at: string | null;
+  updated_at: string | null;
+  ui_state?: Record<string, string | number | null>;
+  pairing_analysis_snapshot?: PairingAnalysis;
+};
+type SavedPairingAnalysisConfigResponse = {
+  total: number;
+  limit: number;
+  offset: number;
+  rows: SavedPairingAnalysisConfig[];
 };
 type DepartureConfidenceFilter = "ALL" | "HIGH" | "MEDIUM" | "LOW";
 type ShiftSummaryFilter = "ALL" | `SHIFT:${string}` | `STATUS:${"AMBIGUOUS" | "INSUFFICIENT_DATA"}`;
@@ -786,6 +849,7 @@ function pageFromPath(pathname: string): Page {
   if (pathname === "/prediction-assignment") return "prediction-assignment";
   if (pathname === "/phase7-optimization") return "phase7-optimization";
   if (pathname === "/phase-8/manual-dispatch" || pathname.startsWith("/phase-8/manual-dispatch/")) return "manual-dispatch";
+  if (pathname === "/phase9/route-model-alignment") return "route-model-alignment";
   if (pathname === "/settings/google-maps-integration") return "google-maps-integration";
   if (pathname === "/documentation") return "documentation";
   return "dashboard";
@@ -1152,6 +1216,16 @@ function App() {
   const [shiftAnalysis, setShiftAnalysis] = useState<ShiftAnalysis | null>(null);
   const [shiftLoading, setShiftLoading] = useState(false);
   const [shiftHelpOpen, setShiftHelpOpen] = useState(false);
+  const [shiftConfigMessage, setShiftConfigMessage] = useState("");
+  const [savedShiftConfigs, setSavedShiftConfigs] = useState<SavedShiftAnalysisConfig[]>([]);
+  const [savedShiftConfigTotal, setSavedShiftConfigTotal] = useState(0);
+  const [savedShiftConfigOffset, setSavedShiftConfigOffset] = useState(0);
+  const [savedShiftConfigLimit, setSavedShiftConfigLimit] = useState(5);
+  const [savedShiftConfigLoading, setSavedShiftConfigLoading] = useState(false);
+  const [shiftSaveModalOpen, setShiftSaveModalOpen] = useState(false);
+  const [shiftSaveName, setShiftSaveName] = useState("");
+  const [shiftLoadModalOpen, setShiftLoadModalOpen] = useState(false);
+  const [selectedSavedShiftConfigId, setSelectedSavedShiftConfigId] = useState("");
   const [departureConfidenceFilter, setDepartureConfidenceFilter] = useState<DepartureConfidenceFilter>("ALL");
   const [shiftSummaryFilter, setShiftSummaryFilter] = useState<ShiftSummaryFilter>("ALL");
   const [boxPlotHighlightBy, setBoxPlotHighlightBy] = useState<"NONE" | "PRIMARY_SHIFT" | "ASSIGNMENT_STATUS" | "CONFIDENCE">("NONE");
@@ -1174,6 +1248,16 @@ function App() {
   const [pairingSortDirection, setPairingSortDirection] = useState<CrudSortDirection>("desc");
   const [selectedPairingSpbuId, setSelectedPairingSpbuId] = useState<string | null>(null);
   const [selectedPairingPair, setSelectedPairingPair] = useState<{ spbu_a_id: string; spbu_b_id: string } | null>(null);
+  const [savedPairingConfigs, setSavedPairingConfigs] = useState<SavedPairingAnalysisConfig[]>([]);
+  const [savedPairingConfigTotal, setSavedPairingConfigTotal] = useState(0);
+  const [savedPairingConfigOffset, setSavedPairingConfigOffset] = useState(0);
+  const [savedPairingConfigLimit, setSavedPairingConfigLimit] = useState(5);
+  const [savedPairingConfigLoading, setSavedPairingConfigLoading] = useState(false);
+  const [pairingSaveModalOpen, setPairingSaveModalOpen] = useState(false);
+  const [pairingSaveName, setPairingSaveName] = useState("");
+  const [pairingLoadModalOpen, setPairingLoadModalOpen] = useState(false);
+  const [selectedSavedPairingConfigId, setSelectedSavedPairingConfigId] = useState("");
+  const [pairingConfigMessage, setPairingConfigMessage] = useState("");
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const crudRequestRef = useRef(0);
@@ -1444,6 +1528,52 @@ function App() {
     }
   }
 
+  async function fetchSavedShiftConfigs(nextOffset = savedShiftConfigOffset, nextLimit = savedShiftConfigLimit) {
+    setSavedShiftConfigLoading(true);
+    try {
+      const params = new URLSearchParams({
+        limit: String(nextLimit),
+        offset: String(nextOffset)
+      });
+      if (departureFilters.depotId) params.set("depot_id", departureFilters.depotId);
+      const payload = await apiGet<SavedShiftAnalysisConfigResponse>(`/api/v1/departure-intelligence/saved-shift-configurations?${params.toString()}`);
+      setSavedShiftConfigs(payload.rows);
+      setSavedShiftConfigTotal(payload.total);
+      setSavedShiftConfigOffset(payload.offset);
+      setSavedShiftConfigLimit(payload.limit);
+      setSelectedSavedShiftConfigId((current) => (
+        payload.rows.some((row) => row.id === current) ? current : payload.rows[0]?.id || ""
+      ));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load saved shift configurations");
+    } finally {
+      setSavedShiftConfigLoading(false);
+    }
+  }
+
+  async function fetchSavedPairingConfigs(nextOffset = savedPairingConfigOffset, nextLimit = savedPairingConfigLimit) {
+    setSavedPairingConfigLoading(true);
+    try {
+      const params = new URLSearchParams({
+        limit: String(nextLimit),
+        offset: String(nextOffset)
+      });
+      if (pairingFilters.depotId) params.set("depot_id", pairingFilters.depotId);
+      const payload = await apiGet<SavedPairingAnalysisConfigResponse>(`/api/v1/pairing-intelligence/saved-configurations?${params.toString()}`);
+      setSavedPairingConfigs(payload.rows);
+      setSavedPairingConfigTotal(payload.total);
+      setSavedPairingConfigOffset(payload.offset);
+      setSavedPairingConfigLimit(payload.limit);
+      setSelectedSavedPairingConfigId((current) => (
+        payload.rows.some((row) => row.id === current) ? current : payload.rows[0]?.id || ""
+      ));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load saved pairing configurations");
+    } finally {
+      setSavedPairingConfigLoading(false);
+    }
+  }
+
   async function refresh() {
     setError(null);
     const dashboardParams = dashboardDepotId !== "ALL" ? `?depot_id=${encodeURIComponent(dashboardDepotId)}` : "";
@@ -1497,6 +1627,12 @@ function App() {
 
   useEffect(() => {
     if (currentPage === "departure-intelligence") {
+      fetchSavedShiftConfigs(savedShiftConfigOffset, savedShiftConfigLimit);
+    }
+  }, [currentPage, departureFilters.depotId, savedShiftConfigOffset, savedShiftConfigLimit]);
+
+  useEffect(() => {
+    if (currentPage === "departure-intelligence") {
       fetchDepartureDateAvailability(departureFilters.depotId);
     }
   }, [currentPage, departureFilters.depotId]);
@@ -1506,6 +1642,12 @@ function App() {
       fetchPairingAnalysis(pairingOffset, appliedPairingFilters);
     }
   }, [currentPage, pairingOffset, pairingLimit, pairingSortColumn, pairingSortDirection]);
+
+  useEffect(() => {
+    if (currentPage === "pairing-intelligence") {
+      fetchSavedPairingConfigs(savedPairingConfigOffset, savedPairingConfigLimit);
+    }
+  }, [currentPage, pairingFilters.depotId, savedPairingConfigOffset, savedPairingConfigLimit]);
 
   useEffect(() => {
     if (currentPage === "pairing-intelligence") {
@@ -1572,6 +1714,12 @@ function App() {
   const departurePageCount = Math.max(1, Math.ceil(departureTotal / departureLimit));
   const canPreviousDeparturePage = departureOffset > 0 && !departureLoading;
   const canNextDeparturePage = departureOffset + departureLimit < departureTotal && !departureLoading;
+  const savedShiftConfigShowingStart = savedShiftConfigTotal === 0 ? 0 : savedShiftConfigOffset + 1;
+  const savedShiftConfigShowingEnd = Math.min(savedShiftConfigOffset + savedShiftConfigLimit, savedShiftConfigTotal);
+  const savedShiftConfigPageNumber = Math.floor(savedShiftConfigOffset / savedShiftConfigLimit) + 1;
+  const savedShiftConfigPageCount = Math.max(1, Math.ceil(savedShiftConfigTotal / savedShiftConfigLimit));
+  const canPreviousSavedShiftConfigPage = savedShiftConfigOffset > 0 && !savedShiftConfigLoading;
+  const canNextSavedShiftConfigPage = savedShiftConfigOffset + savedShiftConfigLimit < savedShiftConfigTotal && !savedShiftConfigLoading;
   const selectedDepartureProfile = departureProfiles.find((profile) => profile.spbu_id === selectedDepartureSpbuId) ?? departureProfiles[0] ?? null;
   const selectedDepartureObservations = selectedDepartureProfile
     ? departureObservations.filter((row) => row.spbu_id === selectedDepartureProfile.spbu_id).slice(0, 20)
@@ -1592,6 +1740,12 @@ function App() {
   const pairingPageCount = Math.max(1, Math.ceil(pairingTotal / pairingLimit));
   const canPreviousPairingPage = pairingOffset > 0 && !pairingLoading;
   const canNextPairingPage = pairingOffset + pairingLimit < pairingTotal && !pairingLoading;
+  const savedPairingConfigShowingStart = savedPairingConfigTotal === 0 ? 0 : savedPairingConfigOffset + 1;
+  const savedPairingConfigShowingEnd = Math.min(savedPairingConfigOffset + savedPairingConfigLimit, savedPairingConfigTotal);
+  const savedPairingConfigPageNumber = Math.floor(savedPairingConfigOffset / savedPairingConfigLimit) + 1;
+  const savedPairingConfigPageCount = Math.max(1, Math.ceil(savedPairingConfigTotal / savedPairingConfigLimit));
+  const canPreviousSavedPairingConfigPage = savedPairingConfigOffset > 0 && !savedPairingConfigLoading;
+  const canNextSavedPairingConfigPage = savedPairingConfigOffset + savedPairingConfigLimit < savedPairingConfigTotal && !savedPairingConfigLoading;
   const selectedPairingDetail = pairingAnalysis?.detail ?? null;
   const pairingMatrixOption = useMemo(() => {
     const matrix = pairingAnalysis?.matrix;
@@ -2041,8 +2195,10 @@ function App() {
       setShiftAnalysis(null);
       setDepartureConfidenceFilter("ALL");
       setShiftSummaryFilter("ALL");
-      const saved = window.localStorage.getItem(`departure-shift-config:${value}`);
-      setShiftConfigs(saved ? JSON.parse(saved) : defaultShiftConfig);
+      setShiftConfigMessage("");
+      setShiftConfigs(defaultShiftConfig);
+      setSavedShiftConfigOffset(0);
+      setSelectedSavedShiftConfigId("");
     }
   }
 
@@ -2113,6 +2269,9 @@ function App() {
       setPairingDateAvailability(null);
       setSelectedPairingSpbuId(null);
       setSelectedPairingPair(null);
+      setSavedPairingConfigOffset(0);
+      setSelectedSavedPairingConfigId("");
+      setPairingConfigMessage("");
     }
   }
 
@@ -2120,6 +2279,7 @@ function App() {
     setPairingOffset(0);
     setSelectedPairingSpbuId(null);
     setSelectedPairingPair(null);
+    setPairingConfigMessage("");
     await fetchPairingAnalysis(0, pairingFilters, null, null);
   }
 
@@ -2145,6 +2305,134 @@ function App() {
     }
   }
 
+  function openSavePairingConfigModal() {
+    if (!pairingAnalysis || !appliedPairingFilters) {
+      setError("Run Phase 3 analysis before saving a pairing analysis configuration.");
+      setPairingConfigMessage("");
+      return;
+    }
+    setPairingSaveName("");
+    setPairingSaveModalOpen(true);
+    setError(null);
+  }
+
+  function openLoadPairingConfigModal() {
+    if (savedPairingConfigs.length === 0) {
+      setError("No saved pairing analysis configuration is available.");
+      setPairingConfigMessage("");
+      return;
+    }
+    setSelectedSavedPairingConfigId((current) => current || savedPairingConfigs[0]?.id || "");
+    setPairingLoadModalOpen(true);
+    setError(null);
+  }
+
+  async function savePairingConfig() {
+    if (!pairingAnalysis || !appliedPairingFilters) return;
+    const name = pairingSaveName.trim();
+    if (!name) {
+      setError("Configuration name is required.");
+      return;
+    }
+    setSavedPairingConfigLoading(true);
+    setError(null);
+    try {
+      const saved = await apiSend<SavedPairingAnalysisConfig>("/api/v1/pairing-intelligence/saved-configurations", "POST", {
+        name,
+        depot_id: appliedPairingFilters.depotId,
+        start_date: appliedPairingFilters.startDate,
+        end_date: appliedPairingFilters.endDate,
+        product_id: appliedPairingFilters.productId || null,
+        search: appliedPairingFilters.search,
+        sort_column: pairingSortColumn,
+        sort_direction: pairingSortDirection,
+        ui_state: {
+          range_preset: appliedPairingFilters.rangePreset,
+          pairing_offset: pairingOffset,
+          pairing_limit: pairingLimit,
+          pairing_sort_column: pairingSortColumn,
+          pairing_sort_direction: pairingSortDirection,
+          selected_pairing_spbu_id: selectedPairingSpbuId,
+          evidence_spbu_a_id: selectedPairingPair?.spbu_a_id ?? null,
+          evidence_spbu_b_id: selectedPairingPair?.spbu_b_id ?? null
+        },
+        pairing_analysis_snapshot: pairingAnalysis
+      });
+      setPairingConfigMessage(`Saved pairing analysis configuration: ${saved.name}.`);
+      setPairingSaveModalOpen(false);
+      setPairingSaveName("");
+      setSavedPairingConfigOffset(0);
+      await fetchSavedPairingConfigs(0, savedPairingConfigLimit);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to save pairing analysis configuration");
+    } finally {
+      setSavedPairingConfigLoading(false);
+    }
+  }
+
+  async function loadPairingConfig() {
+    if (!selectedSavedPairingConfigId) {
+      setError("Select a saved pairing analysis configuration to load.");
+      return;
+    }
+    setSavedPairingConfigLoading(true);
+    setError(null);
+    try {
+      const saved = await apiGet<SavedPairingAnalysisConfig>(`/api/v1/pairing-intelligence/saved-configurations/${encodeURIComponent(selectedSavedPairingConfigId)}`);
+      const pairingSnapshot = saved.pairing_analysis_snapshot;
+      if (!pairingSnapshot) {
+        throw new Error("Saved configuration does not contain a pairing analysis snapshot.");
+      }
+      const uiState = saved.ui_state ?? {};
+      const nextFilters: PairingFilters = {
+        depotId: saved.depot_id,
+        rangePreset: (uiState.range_preset as PairingFilters["rangePreset"]) ?? "CUSTOM",
+        startDate: saved.start_date,
+        endDate: saved.end_date,
+        productId: saved.product_id ?? "",
+        search: saved.search ?? ""
+      };
+      const nextPair = uiState.evidence_spbu_a_id && uiState.evidence_spbu_b_id
+        ? { spbu_a_id: String(uiState.evidence_spbu_a_id), spbu_b_id: String(uiState.evidence_spbu_b_id) }
+        : pairingSnapshot.evidence.pair
+          ? { spbu_a_id: pairingSnapshot.evidence.pair.spbu_a_id, spbu_b_id: pairingSnapshot.evidence.pair.spbu_b_id }
+          : null;
+      setPairingFilters(nextFilters);
+      setAppliedPairingFilters(nextFilters);
+      setPairingSortColumn((uiState.pairing_sort_column as PairingSortColumn) ?? (saved.sort_column as PairingSortColumn) ?? "evidence_strength");
+      setPairingSortDirection((uiState.pairing_sort_direction as CrudSortDirection) ?? (saved.sort_direction as CrudSortDirection) ?? "desc");
+      setPairingLimit(Number(uiState.pairing_limit ?? pairingSnapshot.limit ?? 25));
+      setPairingOffset(Number(uiState.pairing_offset ?? pairingSnapshot.offset ?? 0));
+      setSelectedPairingSpbuId(String(uiState.selected_pairing_spbu_id ?? pairingSnapshot.detail?.spbu_id ?? "") || null);
+      setSelectedPairingPair(nextPair);
+      setPairingAnalysis(pairingSnapshot);
+      setPairingConfigMessage(`Loaded pairing analysis configuration: ${saved.name}.`);
+      setPairingLoadModalOpen(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load pairing analysis configuration");
+    } finally {
+      setSavedPairingConfigLoading(false);
+    }
+  }
+
+  async function deleteSavedPairingConfig(config: SavedPairingAnalysisConfig) {
+    if (!window.confirm(`Delete saved pairing analysis configuration "${config.name}"?`)) return;
+    setSavedPairingConfigLoading(true);
+    setError(null);
+    try {
+      await apiSend<{ status: string }>(`/api/v1/pairing-intelligence/saved-configurations/${encodeURIComponent(config.id)}`, "DELETE");
+      setPairingConfigMessage(`Deleted pairing analysis configuration: ${config.name}.`);
+      setSelectedSavedPairingConfigId((current) => (current === config.id ? "" : current));
+      const nextOffset = savedPairingConfigs.length === 1 ? Math.max(0, savedPairingConfigOffset - savedPairingConfigLimit) : savedPairingConfigOffset;
+      setSavedPairingConfigOffset(nextOffset);
+      await fetchSavedPairingConfigs(nextOffset, savedPairingConfigLimit);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to delete pairing analysis configuration");
+    } finally {
+      setSavedPairingConfigLoading(false);
+    }
+  }
+
   function updateShiftConfig(index: number, key: keyof OperationalShiftConfig, value: string) {
     setShiftConfigs((current) => current.map((shift, shiftIndex) => (shiftIndex === index ? { ...shift, [key]: value } : shift)));
   }
@@ -2160,28 +2448,140 @@ function App() {
     setShiftConfigs((current) => current.filter((_, shiftIndex) => shiftIndex !== index));
   }
 
-  function saveShiftConfig() {
-    if (!departureFilters.depotId) {
-      setError("Select a depot before saving a shift configuration.");
+  function openSaveShiftConfigModal() {
+    if (!departureAnalysis || !shiftAnalysis || !appliedDepartureFilters) {
+      setError("Run Phase 2 analysis before saving a shift analysis configuration.");
+      setShiftConfigMessage("");
       return;
     }
     const validationErrors = validateOperationalShifts(shiftConfigs);
     if (validationErrors.length > 0) {
       setError(validationErrors[0]);
+      setShiftConfigMessage("");
       return;
     }
-    window.localStorage.setItem(`departure-shift-config:${departureFilters.depotId}`, JSON.stringify(shiftConfigs));
+    setShiftSaveName("");
+    setShiftSaveModalOpen(true);
     setError(null);
   }
 
-  function loadShiftConfig() {
-    if (!departureFilters.depotId) {
-      setError("Select a depot before loading a shift configuration.");
+  function openLoadShiftConfigModal() {
+    if (savedShiftConfigs.length === 0) {
+      setError("No saved shift analysis configuration is available.");
+      setShiftConfigMessage("");
       return;
     }
-    const saved = window.localStorage.getItem(`departure-shift-config:${departureFilters.depotId}`);
-    setShiftConfigs(saved ? JSON.parse(saved) : defaultShiftConfig);
+    setSelectedSavedShiftConfigId((current) => current || savedShiftConfigs[0]?.id || "");
+    setShiftLoadModalOpen(true);
     setError(null);
+  }
+
+  async function saveShiftConfig() {
+    if (!departureAnalysis || !shiftAnalysis || !appliedDepartureFilters) return;
+    const name = shiftSaveName.trim();
+    if (!name) {
+      setError("Configuration name is required.");
+      return;
+    }
+    setSavedShiftConfigLoading(true);
+    setError(null);
+    try {
+      const saved = await apiSend<SavedShiftAnalysisConfig>("/api/v1/departure-intelligence/saved-shift-configurations", "POST", {
+        name,
+        depot_id: appliedDepartureFilters.depotId,
+        start_date: appliedDepartureFilters.startDate,
+        end_date: appliedDepartureFilters.endDate,
+        bucket_minutes: Number(appliedDepartureFilters.bucketMinutes),
+        search: appliedDepartureFilters.search,
+        sort_column: departureSortColumn,
+        sort_direction: departureSortDirection,
+        assignment_method: shiftMethod,
+        shift_config: shiftConfigs,
+        ui_state: {
+          departure_offset: departureOffset,
+          departure_limit: departureLimit,
+          departure_sort_column: departureSortColumn,
+          departure_sort_direction: departureSortDirection,
+          departure_confidence_filter: departureConfidenceFilter,
+          shift_summary_filter: shiftSummaryFilter,
+          departure_profile_search: departureProfileSearch
+        },
+        departure_analysis_snapshot: departureAnalysis,
+        shift_analysis_snapshot: shiftAnalysis
+      });
+      setShiftConfigMessage(`Saved shift analysis configuration: ${saved.name}.`);
+      setShiftSaveModalOpen(false);
+      setShiftSaveName("");
+      setSavedShiftConfigOffset(0);
+      await fetchSavedShiftConfigs(0, savedShiftConfigLimit);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to save shift analysis configuration");
+    } finally {
+      setSavedShiftConfigLoading(false);
+    }
+  }
+
+  async function loadShiftConfig() {
+    if (!selectedSavedShiftConfigId) {
+      setError("Select a saved shift analysis configuration to load.");
+      return;
+    }
+    setSavedShiftConfigLoading(true);
+    setError(null);
+    try {
+      const saved = await apiGet<SavedShiftAnalysisConfig>(`/api/v1/departure-intelligence/saved-shift-configurations/${encodeURIComponent(selectedSavedShiftConfigId)}`);
+      const departureSnapshot = saved.departure_analysis_snapshot;
+      const shiftSnapshot = saved.shift_analysis_snapshot;
+      if (!departureSnapshot || !shiftSnapshot) {
+        throw new Error("Saved configuration does not contain complete analysis snapshots.");
+      }
+      const uiState = saved.ui_state ?? {};
+      const nextFilters = {
+        depotId: saved.depot_id,
+        startDate: saved.start_date,
+        endDate: saved.end_date,
+        bucketMinutes: String(saved.bucket_minutes),
+        search: saved.search ?? ""
+      };
+      setDepartureFilters(nextFilters);
+      setAppliedDepartureFilters(nextFilters);
+      setShiftConfigs(saved.shift_config ?? defaultShiftConfig);
+      setShiftMethod(saved.assignment_method);
+      setDepartureSortColumn((uiState.departure_sort_column as DepartureSortColumn) ?? (saved.sort_column as DepartureSortColumn) ?? "observation_count");
+      setDepartureSortDirection((uiState.departure_sort_direction as CrudSortDirection) ?? (saved.sort_direction as CrudSortDirection) ?? "desc");
+      setDepartureConfidenceFilter((uiState.departure_confidence_filter as DepartureConfidenceFilter) ?? "ALL");
+      setShiftSummaryFilter((uiState.shift_summary_filter as ShiftSummaryFilter) ?? "ALL");
+      setDepartureProfileSearch(String(uiState.departure_profile_search ?? ""));
+      setDepartureLimit(Number(uiState.departure_limit ?? departureSnapshot.limit ?? 25));
+      setDepartureOffset(Number(uiState.departure_offset ?? departureSnapshot.offset ?? 0));
+      setDepartureAnalysis(departureSnapshot);
+      setShiftAnalysis(shiftSnapshot);
+      setSelectedDepartureSpbuId(departureSnapshot.profiles[0]?.spbu_id ?? null);
+      setShiftConfigMessage(`Loaded shift analysis configuration: ${saved.name}.`);
+      setShiftLoadModalOpen(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load shift analysis configuration");
+    } finally {
+      setSavedShiftConfigLoading(false);
+    }
+  }
+
+  async function deleteSavedShiftConfig(config: SavedShiftAnalysisConfig) {
+    if (!window.confirm(`Delete saved shift analysis configuration "${config.name}"?`)) return;
+    setSavedShiftConfigLoading(true);
+    setError(null);
+    try {
+      await apiSend<{ status: string }>(`/api/v1/departure-intelligence/saved-shift-configurations/${encodeURIComponent(config.id)}`, "DELETE");
+      setShiftConfigMessage(`Deleted shift analysis configuration: ${config.name}.`);
+      setSelectedSavedShiftConfigId((current) => (current === config.id ? "" : current));
+      const nextOffset = savedShiftConfigs.length === 1 ? Math.max(0, savedShiftConfigOffset - savedShiftConfigLimit) : savedShiftConfigOffset;
+      setSavedShiftConfigOffset(nextOffset);
+      await fetchSavedShiftConfigs(nextOffset, savedShiftConfigLimit);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to delete shift analysis configuration");
+    } finally {
+      setSavedShiftConfigLoading(false);
+    }
   }
 
   function handleTagSort(column: string) {
@@ -2252,6 +2652,8 @@ function App() {
                       ? "/phase7-optimization"
                     : page === "manual-dispatch"
                       ? "/phase-8/manual-dispatch"
+                    : page === "route-model-alignment"
+                      ? "/phase9/route-model-alignment"
                     : page === "google-maps-integration"
                       ? "/settings/google-maps-integration"
                       : page === "documentation"
@@ -2372,6 +2774,140 @@ function App() {
             </div>
           </div>
         )}
+        {shiftSaveModalOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/35 px-4">
+            <div className="w-full max-w-lg border border-line bg-white p-5 shadow-card">
+              <div className="mb-4 flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Save Shift Analysis Configuration</div>
+                  <div className="mt-1 text-xs text-slate-500">The current shift configuration and analysis result will be stored in the backend.</div>
+                </div>
+                <button className="inline-flex h-8 w-8 items-center justify-center border border-line" onClick={() => setShiftSaveModalOpen(false)} title="Close save configuration">
+                  <X size={16} />
+                </button>
+              </div>
+              <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
+                Configuration Name
+                <input
+                  className="mt-2 w-full border border-line px-3 py-2 text-sm normal-case tracking-normal"
+                  value={shiftSaveName}
+                  onChange={(event) => setShiftSaveName(event.target.value)}
+                  onKeyDown={(event) => { if (event.key === "Enter") void saveShiftConfig(); }}
+                  autoFocus
+                  placeholder="Example: Medan 4 shift baseline"
+                />
+              </label>
+              <div className="mt-5 flex items-center justify-end gap-2">
+                <button className="border border-line px-3 py-2 text-sm" onClick={() => setShiftSaveModalOpen(false)}>Cancel</button>
+                <button className="inline-flex items-center gap-2 bg-mint px-3 py-2 text-sm font-medium text-white disabled:opacity-60" onClick={() => void saveShiftConfig()} disabled={savedShiftConfigLoading || !shiftSaveName.trim()}>
+                  <Save size={14} /> Save
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+        {shiftLoadModalOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/35 px-4">
+            <div className="w-full max-w-xl border border-line bg-white p-5 shadow-card">
+              <div className="mb-4 flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Load Shift Analysis Configuration</div>
+                  <div className="mt-1 text-xs text-slate-500">Loading restores the saved shift configuration and analysis snapshot.</div>
+                </div>
+                <button className="inline-flex h-8 w-8 items-center justify-center border border-line" onClick={() => setShiftLoadModalOpen(false)} title="Close load configuration">
+                  <X size={16} />
+                </button>
+              </div>
+              <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
+                Saved Configuration
+                <select
+                  className="mt-2 w-full border border-line bg-white px-3 py-2 text-sm normal-case tracking-normal"
+                  value={selectedSavedShiftConfigId}
+                  onChange={(event) => setSelectedSavedShiftConfigId(event.target.value)}
+                >
+                  {savedShiftConfigs.map((config) => (
+                    <option key={config.id} value={config.id}>
+                      {config.name} | {config.depot_name ?? config.depot_id} | {formatDate(config.start_date)} - {formatDate(config.end_date)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="mt-5 flex items-center justify-end gap-2">
+                <button className="border border-line px-3 py-2 text-sm" onClick={() => setShiftLoadModalOpen(false)}>Cancel</button>
+                <button className="inline-flex items-center gap-2 bg-mint px-3 py-2 text-sm font-medium text-white disabled:opacity-60" onClick={() => void loadShiftConfig()} disabled={savedShiftConfigLoading || !selectedSavedShiftConfigId}>
+                  <RefreshCw size={14} /> Load
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+        {pairingSaveModalOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/35 px-4">
+            <div className="w-full max-w-lg border border-line bg-white p-5 shadow-card">
+              <div className="mb-4 flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Save Pairing Analysis Configuration</div>
+                  <div className="mt-1 text-xs text-slate-500">The current Phase 3 filters and pairing analysis snapshot will be stored in the backend.</div>
+                </div>
+                <button className="inline-flex h-8 w-8 items-center justify-center border border-line" onClick={() => setPairingSaveModalOpen(false)} title="Close save configuration">
+                  <X size={16} />
+                </button>
+              </div>
+              <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
+                Configuration Name
+                <input
+                  className="mt-2 w-full border border-line px-3 py-2 text-sm normal-case tracking-normal"
+                  value={pairingSaveName}
+                  onChange={(event) => setPairingSaveName(event.target.value)}
+                  onKeyDown={(event) => { if (event.key === "Enter") void savePairingConfig(); }}
+                  autoFocus
+                  placeholder="Example: Medan pairing baseline"
+                />
+              </label>
+              <div className="mt-5 flex items-center justify-end gap-2">
+                <button className="border border-line px-3 py-2 text-sm" onClick={() => setPairingSaveModalOpen(false)}>Cancel</button>
+                <button className="inline-flex items-center gap-2 bg-mint px-3 py-2 text-sm font-medium text-white disabled:opacity-60" onClick={() => void savePairingConfig()} disabled={savedPairingConfigLoading || !pairingSaveName.trim()}>
+                  <Save size={14} /> Save
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+        {pairingLoadModalOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/35 px-4">
+            <div className="w-full max-w-xl border border-line bg-white p-5 shadow-card">
+              <div className="mb-4 flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Load Pairing Analysis Configuration</div>
+                  <div className="mt-1 text-xs text-slate-500">Loading restores the saved Phase 3 filters and pairing analysis snapshot.</div>
+                </div>
+                <button className="inline-flex h-8 w-8 items-center justify-center border border-line" onClick={() => setPairingLoadModalOpen(false)} title="Close load configuration">
+                  <X size={16} />
+                </button>
+              </div>
+              <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">
+                Saved Configuration
+                <select
+                  className="mt-2 w-full border border-line bg-white px-3 py-2 text-sm normal-case tracking-normal"
+                  value={selectedSavedPairingConfigId}
+                  onChange={(event) => setSelectedSavedPairingConfigId(event.target.value)}
+                >
+                  {savedPairingConfigs.map((config) => (
+                    <option key={config.id} value={config.id}>
+                      {config.name} | {config.depot_name ?? config.depot_id} | {formatDate(config.start_date)} - {formatDate(config.end_date)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="mt-5 flex items-center justify-end gap-2">
+                <button className="border border-line px-3 py-2 text-sm" onClick={() => setPairingLoadModalOpen(false)}>Cancel</button>
+                <button className="inline-flex items-center gap-2 bg-mint px-3 py-2 text-sm font-medium text-white disabled:opacity-60" onClick={() => void loadPairingConfig()} disabled={savedPairingConfigLoading || !selectedSavedPairingConfigId}>
+                  <RefreshCw size={14} /> Load
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
         {!hasData && (
           <section className="mb-5 border border-line bg-white p-5">
             <div className="flex items-start gap-3">
@@ -2404,6 +2940,10 @@ function App() {
           <ManualDispatchPage depots={depots} />
         )}
 
+        {currentPage === "route-model-alignment" && (
+          <RouteModelAlignmentPage depots={depots} />
+        )}
+
         {currentPage === "google-maps-integration" && (
           <GoogleMapsIntegrationPage />
         )}
@@ -2415,9 +2955,22 @@ function App() {
         {currentPage === "pairing-intelligence" && (
         <>
         <section className="mb-5 border border-line bg-white p-4">
-          <div className="mb-3 flex flex-col gap-1">
-            <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Phase 3 - SPBU Pairing Probability Intelligence</div>
-            <div className="text-xs text-slate-500">Same-shipment SPBU pairing. Consecutive GPS transition is kept as separate directional evidence.</div>
+          <div className="mb-3 flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+            <div>
+              <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Phase 3 - SPBU Pairing Probability Intelligence</div>
+              <div className="mt-1 text-xs text-slate-500">Same-shipment SPBU pairing. Consecutive GPS transition is kept as separate directional evidence.</div>
+            </div>
+            <div className="flex flex-col items-start gap-2 lg:items-end">
+              <div className="flex flex-wrap gap-2">
+                <button className="inline-flex items-center gap-2 border border-line px-3 py-2 text-sm disabled:opacity-50" onClick={openLoadPairingConfigModal} disabled={savedPairingConfigLoading || savedPairingConfigTotal === 0} title="Load a saved pairing analysis configuration">
+                  <RefreshCw size={14} /> Load
+                </button>
+                <button className="inline-flex items-center gap-2 border border-line px-3 py-2 text-sm disabled:opacity-50" onClick={openSavePairingConfigModal} disabled={pairingLoading || !pairingAnalysis} title="Save current pairing configuration and analysis result">
+                  <Save size={14} /> Save
+                </button>
+              </div>
+              {pairingConfigMessage && <div className="text-xs text-slate-500">{pairingConfigMessage}</div>}
+            </div>
           </div>
           <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-[1.4fr_0.7fr_0.8fr_0.8fr_1fr_1fr_auto]">
             <select className="border border-line bg-white px-3 py-2 text-sm" value={pairingFilters.depotId} onChange={(event) => updatePairingFilter("depotId", event.target.value)} title="Depot">
@@ -2459,6 +3012,59 @@ function App() {
               : pairingFilters.depotId
                 ? "Date availability will load for the selected depot."
                 : "Choose a depot before running analysis."}
+          </div>
+          <div className="mt-4 border border-line">
+            <div className="flex flex-col gap-2 border-b border-line bg-slate-50 px-3 py-2 lg:flex-row lg:items-center lg:justify-between">
+              <div>
+                <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Saved SPBU Pairing Analysis Configurations</div>
+                <div className="mt-1 text-xs text-slate-500">Showing {savedPairingConfigShowingStart}-{savedPairingConfigShowingEnd} of {savedPairingConfigTotal.toLocaleString()}</div>
+              </div>
+              <select className="border border-line bg-white px-2 py-1 text-xs" value={savedPairingConfigLimit} onChange={(event) => { setSavedPairingConfigOffset(0); setSavedPairingConfigLimit(Number(event.target.value)); }} title="Saved configurations per page">
+                <option value={5}>5 rows</option>
+                <option value={10}>10 rows</option>
+                <option value={25}>25 rows</option>
+              </select>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full border-collapse text-sm">
+                <thead>
+                  <tr className="border-b border-line text-left text-xs uppercase tracking-wide text-slate-500">
+                    <th className="whitespace-nowrap px-3 py-2">Name</th>
+                    <th className="whitespace-nowrap px-3 py-2">Depot</th>
+                    <th className="whitespace-nowrap px-3 py-2">Period</th>
+                    <th className="whitespace-nowrap px-3 py-2">Product</th>
+                    <th className="whitespace-nowrap px-3 py-2">Pairs</th>
+                    <th className="whitespace-nowrap px-3 py-2">Saved</th>
+                    <th className="whitespace-nowrap px-3 py-2">Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {savedPairingConfigs.map((config) => (
+                    <tr key={config.id} className="border-b border-line">
+                      <td className="whitespace-nowrap px-3 py-2 font-medium">{config.name}</td>
+                      <td className="whitespace-nowrap px-3 py-2">{config.depot_name ?? config.depot_id}</td>
+                      <td className="whitespace-nowrap px-3 py-2">{formatDate(config.start_date)} - {formatDate(config.end_date)}</td>
+                      <td className="whitespace-nowrap px-3 py-2">{config.product_name}</td>
+                      <td className="whitespace-nowrap px-3 py-2">{config.unique_spbu_pairs.toLocaleString()}</td>
+                      <td className="whitespace-nowrap px-3 py-2">{formatDateTime(config.updated_at)}</td>
+                      <td className="whitespace-nowrap px-3 py-2">
+                        <button className="inline-flex items-center justify-center border border-line px-2 py-1 text-xs text-rust disabled:opacity-50" onClick={() => deleteSavedPairingConfig(config)} disabled={savedPairingConfigLoading} title="Delete saved configuration">
+                          <Trash2 size={13} />
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                  {savedPairingConfigs.length === 0 && (
+                    <tr><td className="px-3 py-8 text-center text-sm text-slate-500" colSpan={7}>No saved pairing analysis configuration.</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+            <div className="flex items-center justify-between gap-3 px-3 py-2 text-sm">
+              <button className="border border-line px-3 py-2 disabled:opacity-50" onClick={() => setSavedPairingConfigOffset(Math.max(0, savedPairingConfigOffset - savedPairingConfigLimit))} disabled={!canPreviousSavedPairingConfigPage}>Previous</button>
+              <span className="text-slate-500">Page {savedPairingConfigPageNumber} of {savedPairingConfigPageCount}</span>
+              <button className="border border-line px-3 py-2 disabled:opacity-50" onClick={() => setSavedPairingConfigOffset(savedPairingConfigOffset + savedPairingConfigLimit)} disabled={!canNextSavedPairingConfigPage}>Next</button>
+            </div>
           </div>
         </section>
 
@@ -2700,9 +3306,22 @@ function App() {
         {currentPage === "departure-intelligence" && (
         <>
         <section className="mb-5 border border-line bg-white p-4">
-          <div className="mb-3 flex flex-col gap-1">
-            <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Phase 2 - Depot Departure Time Intelligence</div>
-            <div className="text-xs text-slate-500">Historical depot departure behavior only. This page does not calculate arrivals, ETA, route sequence, or dispatch recommendations.</div>
+          <div className="mb-3 flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+            <div>
+              <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Phase 2 - Depot Departure Time Intelligence</div>
+              <div className="mt-1 text-xs text-slate-500">Historical depot departure behavior only. This page does not calculate arrivals, ETA, route sequence, or dispatch recommendations.</div>
+            </div>
+            <div className="flex flex-col items-start gap-2 lg:items-end">
+              <div className="flex flex-wrap gap-2">
+                <button className="inline-flex items-center gap-2 border border-line px-3 py-2 text-sm disabled:opacity-50" onClick={openLoadShiftConfigModal} disabled={savedShiftConfigLoading || savedShiftConfigTotal === 0} title="Load a saved shift analysis configuration">
+                  <RefreshCw size={14} /> Load
+                </button>
+                <button className="inline-flex items-center gap-2 border border-line px-3 py-2 text-sm disabled:opacity-50" onClick={openSaveShiftConfigModal} disabled={departureLoading || shiftLoading || !departureAnalysis || !shiftAnalysis} title="Save current shift configuration and analysis result">
+                  <Save size={14} /> Save
+                </button>
+              </div>
+              {shiftConfigMessage && <div className="text-xs text-slate-500">{shiftConfigMessage}</div>}
+            </div>
           </div>
           <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-[1.4fr_0.8fr_0.8fr_0.7fr_1fr_auto]">
             <select className="border border-line bg-white px-3 py-2 text-sm" value={departureFilters.depotId} onChange={(event) => updateDepartureFilter("depotId", event.target.value)} title="Depot">
@@ -2748,21 +3367,66 @@ function App() {
               {departureLoading || shiftLoading ? "Running" : "Apply"}
             </button>
           </div>
+          <div className="mt-4 border border-line">
+            <div className="flex flex-col gap-2 border-b border-line bg-slate-50 px-3 py-2 lg:flex-row lg:items-center lg:justify-between">
+              <div>
+                <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Saved Shift Analysis Configurations</div>
+                <div className="mt-1 text-xs text-slate-500">Showing {savedShiftConfigShowingStart}-{savedShiftConfigShowingEnd} of {savedShiftConfigTotal.toLocaleString()}</div>
+              </div>
+              <select className="border border-line bg-white px-2 py-1 text-xs" value={savedShiftConfigLimit} onChange={(event) => { setSavedShiftConfigOffset(0); setSavedShiftConfigLimit(Number(event.target.value)); }} title="Saved configurations per page">
+                <option value={5}>5 rows</option>
+                <option value={10}>10 rows</option>
+                <option value={25}>25 rows</option>
+              </select>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full border-collapse text-sm">
+                <thead>
+                  <tr className="border-b border-line text-left text-xs uppercase tracking-wide text-slate-500">
+                    <th className="whitespace-nowrap px-3 py-2">Name</th>
+                    <th className="whitespace-nowrap px-3 py-2">Depot</th>
+                    <th className="whitespace-nowrap px-3 py-2">Period</th>
+                    <th className="whitespace-nowrap px-3 py-2">Method</th>
+                    <th className="whitespace-nowrap px-3 py-2">Profiles</th>
+                    <th className="whitespace-nowrap px-3 py-2">Saved</th>
+                    <th className="whitespace-nowrap px-3 py-2">Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {savedShiftConfigs.map((config) => (
+                    <tr key={config.id} className="border-b border-line">
+                      <td className="whitespace-nowrap px-3 py-2 font-medium">{config.name}</td>
+                      <td className="whitespace-nowrap px-3 py-2">{config.depot_name ?? config.depot_id}</td>
+                      <td className="whitespace-nowrap px-3 py-2">{formatDate(config.start_date)} - {formatDate(config.end_date)}</td>
+                      <td className="whitespace-nowrap px-3 py-2">{config.assignment_method_label}</td>
+                      <td className="whitespace-nowrap px-3 py-2">{config.profile_count.toLocaleString()}</td>
+                      <td className="whitespace-nowrap px-3 py-2">{formatDateTime(config.updated_at)}</td>
+                      <td className="whitespace-nowrap px-3 py-2">
+                        <button className="inline-flex items-center justify-center border border-line px-2 py-1 text-xs text-rust disabled:opacity-50" onClick={() => deleteSavedShiftConfig(config)} disabled={savedShiftConfigLoading} title="Delete saved configuration">
+                          <Trash2 size={13} />
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                  {savedShiftConfigs.length === 0 && (
+                    <tr><td className="px-3 py-8 text-center text-sm text-slate-500" colSpan={7}>No saved shift analysis configuration.</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+            <div className="flex items-center justify-between gap-3 px-3 py-2 text-sm">
+              <button className="border border-line px-3 py-2 disabled:opacity-50" onClick={() => setSavedShiftConfigOffset(Math.max(0, savedShiftConfigOffset - savedShiftConfigLimit))} disabled={!canPreviousSavedShiftConfigPage}>Previous</button>
+              <span className="text-slate-500">Page {savedShiftConfigPageNumber} of {savedShiftConfigPageCount}</span>
+              <button className="border border-line px-3 py-2 disabled:opacity-50" onClick={() => setSavedShiftConfigOffset(savedShiftConfigOffset + savedShiftConfigLimit)} disabled={!canNextSavedShiftConfigPage}>Next</button>
+            </div>
+          </div>
         </section>
 
         <section className="mb-5 border border-line bg-white p-4">
-          <div className="mb-4 flex flex-col gap-2 lg:flex-row lg:items-start lg:justify-between">
+          <div className="mb-4 flex flex-col gap-2">
             <div>
               <div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Operational Shift Configuration</div>
               <div className="mt-1 text-xs text-slate-500">Descriptive historical shift affinity based on the already applied depot/date range.</div>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <button className="inline-flex items-center gap-2 border border-line px-3 py-2 text-sm" onClick={loadShiftConfig} title="Load active shift configuration for this depot">
-                <RefreshCw size={14} /> Load
-              </button>
-              <button className="inline-flex items-center gap-2 border border-line px-3 py-2 text-sm" onClick={saveShiftConfig} title="Save active shift configuration for this depot">
-                <Save size={14} /> Save
-              </button>
             </div>
           </div>
           <div className="grid gap-4 xl:grid-cols-[1fr_0.8fr]">

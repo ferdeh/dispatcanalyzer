@@ -47,8 +47,8 @@ const guides: GuidePage[] = [
         id: "doc-tujuan",
         title: "Tujuan dan batas aplikasi",
         paragraphs: [
-          "Dispatch Intelligence Platform mengubah Master Data, Loading Order, GPS, dan histori dispatch menjadi informasi operasional yang dapat diaudit. Phase 0–5 terutama menjelaskan pola historis; Phase 6 menghasilkan prediction/assignment; Phase 7 menghasilkan route plan multi-trip; Phase 8 memberi workspace adjustment manual, simulation, audit, dan final dispatch.",
-          "Phase 7 memakai prediction Phase 6 sebagai warm start dan soft preference. Phase 8 menyalin source Phase 6/7 menjadi snapshot terpisah dan tidak menjalankan global reoptimization. Probability, affinity, consistency, atau confidence yang tinggi tetap bukan izin melewati master compatibility.",
+          "Dispatch Intelligence Platform mengubah Master Data, Loading Order, GPS, dan histori dispatch menjadi informasi operasional yang dapat diaudit. Phase 0–5 terutama menjelaskan pola historis; Phase 6 menghasilkan prediction/assignment; Phase 7 menghasilkan route plan multi-trip; Phase 8 memberi workspace adjustment manual, simulation, audit, dan final dispatch; Phase 9 mengevaluasi keselarasan route terhadap historical evidence secara deskriptif.",
+          "Phase 7 memakai prediction Phase 6 sebagai warm start dan soft preference. Phase 8 menyalin source Phase 6/7 menjadi snapshot terpisah dan tidak menjalankan global reoptimization. Phase 9 membentuk Source-Aligned Bundle otomatis dan tidak menilai route baik atau buruk. Probability, affinity, consistency, atau confidence yang tinggi tetap bukan izin melewati master compatibility.",
         ],
         note: "Selalu baca depot, periode, unit analitik, kualitas data, dan evidence count sebelum memakai hasil.",
       },
@@ -63,6 +63,7 @@ const guides: GuidePage[] = [
           { title: "Jalankan Phase 6", text: "Pilih model tersimpan, upload LO dan MT availability, validasi, lalu jalankan prediction." },
           { title: "Kendalikan operasi di Phase 7", text: "Buat Job per depot/tanggal, load Prediction Run tersimpan, masukkan actual MT/bay/queue, optimalkan V1, lalu reroute ke versi baru saat kondisi berubah." },
           { title: "Finalkan dispatch di Phase 8", text: "Pilih source route, sesuaikan MT–Trip–LO, Apply per trip, periksa simulation/dashboard, selesaikan hard error, lalu Finalize." },
+          { title: "Evaluasi alignment di Phase 9", text: "Pilih TBBM dan Route Version, jalankan Evaluate Alignment, lalu baca empat metric beserta evidence coverage dan Source-Aligned Bundle tanpa menjadikannya quality score." },
         ],
       },
       {
@@ -315,6 +316,7 @@ const guides: GuidePage[] = [
         title: "Fungsi dan cara menggunakan",
         paragraphs: [
           "Pilih Depot, SPBU, date range, Product, minimum observations, Confidence, temporal bucket, recent period, Top MT, dan edge metric lalu Apply. Search SPBU menentukan fokus detail; KPI tetap merangkum semua SPBU eligible.",
+          "Setelah analisis terbentuk, Save menyimpan filter, detail SPBU–MT aktif, viewport grafik, dan snapshot hasil ke backend. Load memulihkan snapshot tanpa menghitung ulang. Tabel Saved SPBU–MT Affinity Analysis Configurations mendukung pagination dan delete; nama yang sama pada depot yang sama memperbarui konfigurasi tersebut.",
         ],
       },
       {
@@ -323,6 +325,7 @@ const guides: GuidePage[] = [
         cards: [
           { name: "KPI Summary", meaning: "Eligible Shipment, SPBU, MT, pair, Avg/Median fleet, consistency, variability, stability, shift.", reading: "Seluruh KPI mengikuti filter yang sudah di-Apply." },
           { name: "Data Quality Summary", meaning: "Source, eligible, excluded, duplicate removed, bucket, algorithm.", reading: "Eligible % menjelaskan analytical coverage." },
+          { name: "Saved Affinity Configurations", meaning: "Snapshot filter, hasil, fokus SPBU–MT, dan viewport grafik Phase 4.", reading: "Gunakan Save setelah Apply; gunakan Load untuk membuka kembali hasil tersimpan tanpa rerun." },
           { name: "Historical Profile", meaning: "Dominant MT/share, Top-3, pattern, four scores.", reading: "Consistency, Variability, Stability, dan Confidence dibaca terpisah." },
           { name: "MT Historical Probability", meaning: "P(MT|SPBU).", reading: "Dominant historical MT bukan rekomendasi." },
           { name: "Affinity Over Time", meaning: "Probability per temporal bucket.", reading: "Crossing line dapat menandai pattern shift." },
@@ -615,8 +618,79 @@ const guides: GuidePage[] = [
     ],
   },
   {
-    id: "doc-maps",
+    id: "doc-phase9",
     number: "12",
+    title: "Phase 9 · Route–Model Alignment",
+    description: "Evaluasi deskriptif keselarasan Route Version terhadap cluster, shift, pairing SPBU, dan MT affinity historis.",
+    page: "route-model-alignment",
+    topics: [
+      {
+        id: "doc-phase9-workflow",
+        title: "Workflow evaluasi dan batas interpretasi",
+        steps: [
+          { title: "Pilih TBBM", text: "System hanya memuat seluruh immutable Route Version Phase 7 pada depot tersebut, termasuk versi non-current yang masih mempunyai lineage." },
+          { title: "Pilih Route Version", text: "Periksa tanggal operasional, job/version, source Prediction Run, source Phase 5 model, jumlah trip/LO, dan lineage readiness." },
+          { title: "Evaluate Alignment", text: "System otomatis membentuk Source-Aligned Bundle yang scope dan historical cutoff-nya sesuai source route. User tidak memilih saved analysis atau model secara manual." },
+          { title: "Baca dashboard", text: "Bandingkan empat metric secara terpisah bersama evaluated observation, evidence coverage, resolution method, historical period, dan bundle status." },
+          { title: "Audit trip dan LO", text: "Gunakan Trip Alignment Matrix untuk ringkasan per trip, lalu tabel Loading Order dan Evidence Detail untuk numerator, denominator, peer, distribusi shift, serta affinity." },
+        ],
+        note: "Alignment menjelaskan kemiripan dengan pola historis. Phase 9 tidak menilai route baik/buruk, tidak membuat pass/fail atau ranking, tidak memberi rekomendasi, dan tidak mengubah Phase 2–7.",
+      },
+      {
+        id: "doc-phase9-bundle",
+        title: "Source-Aligned Bundle dan lineage",
+        paragraphs: [
+          "Bundle mengikuti Route Version → Phase 7 Job → source Phase 6 Prediction Run → exact Phase 5 model/training run. Cluster, shift distribution, dan SPBU pairing diambil dari source model tersebut; MT affinity diselesaikan dari exact Phase 4 snapshot/fact, as-of fact, atau canonical rebuild pada scope historis yang sama.",
+          "Bukti dengan analysis end date pada atau setelah operating date route diblokir. Evaluation Run menyimpan snapshot bundle, checksum, source/resolution method, evidence count, hasil dashboard, row LO, dan unique trip-pair evidence sehingga hasil lama dapat dibuka tanpa silent recomputation.",
+        ],
+        cards: [
+          { name: "COMPLETE", meaning: "Semua kategori mempunyai evidence yang dapat dihitung.", reading: "Tetap baca coverage; status ini bukan label kualitas route." },
+          { name: "PARTIAL", meaning: "Evaluation selesai tetapi sebagian kategori/record kekurangan evidence.", reading: "Buka coverage dan status cell untuk mengetahui bukti yang hilang." },
+          { name: "BLOCKED", meaning: "Lineage depot/model atau historical cutoff tidak valid.", reading: "Evaluation tidak dijalankan sampai source lineage valid." },
+          { name: "Bundle Checksum", meaning: "Identitas deterministik snapshot sumber evaluasi.", reading: "Route, checksum, dan algorithm version yang sama memakai kembali completed run." },
+        ],
+      },
+      {
+        id: "doc-phase9-metric",
+        title: "Cara membaca empat metric",
+        cards: [
+          { name: "Cluster Cohesion", meaning: "Proporsi unique peer/pair SPBU evaluable dalam satu trip yang mempunyai cluster Phase 5 sama.", reading: "Trip singleton atau cluster noise/unassigned dapat menghasilkan N/A; membership probability tetap evidence terpisah." },
+          { name: "Shift Alignment", meaning: "Historical P(route shift | SPBU) dari planned gate-out dalam timezone depot.", reading: "Ini planned shift alignment, bukan actual delivery performance dan bukan sekadar dominant-shift match." },
+          { name: "Historical SPBU Pairing", meaning: "Mean symmetric P(B|A) dan P(A|B) untuk unique unordered SPBU pair dalam trip.", reading: "Dua arah tetap dapat dibuka sebagai evidence; satu pair tidak dihitung ulang pada setiap LO." },
+          { name: "Historical MT Affinity", meaning: "Historical P(assigned MT | SPBU) pada scope eligible.", reading: "Reverse P(SPBU|MT), shipment count, periode, dan resolution method hanya evidence tambahan." },
+          { name: "Evidence Coverage", meaning: "Observasi yang dapat dievaluasi dibanding total observasi relevan.", reading: "Coverage tidak dikalikan ke skor dan tidak menggantikan pembacaan denominator." },
+          { name: "0% dan N/A", meaning: "0% berarti denominator tersedia tetapi pattern tidak pernah terlihat; N/A berarti evidence/assignment tidak cukup.", reading: "Jangan mengubah N/A menjadi nol saat membandingkan route." },
+        ],
+        formulas: [
+          "Trip Cluster Cohesion = same-cluster SPBU pairs / seluruh evaluable SPBU pairs × 100%\nLO Cluster Cohesion = same-cluster peer SPBU / seluruh evaluable peer SPBU × 100%",
+          "LO Shift Alignment = historical P(route shift | SPBU) × 100%",
+          "Pairing Alignment(A,B) = [P(B|A) + P(A|B)] / 2 × 100%\nLO Pairing = mean pairing terhadap seluruh evaluable peer SPBU",
+          "LO Historical MT Affinity = historical P(assigned MT | SPBU) × 100%",
+        ],
+        examples: [
+          { title: "Cluster [1, 1, 2]", text: "Ada satu same-cluster pair dari tiga evaluable pair, sehingga trip cohesion = 1 ÷ 3 = 33,33%. Dua SPBU cluster 1 masing-masing mempunyai LO cohesion 1 ÷ 2 = 50%; SPBU cluster 2 mendapat 0 ÷ 2 = 0%." },
+          { title: "Pairing dua arah", text: "Jika P(B|A)=60% dan P(A|B)=40%, symmetric pairing alignment = (60% + 40%) ÷ 2 = 50%. Nilai ini deskriptif, bukan instruksi agar A dan B digabung atau dipisah." },
+          { title: "MT affinity", text: "SPBU X mempunyai 20 historical shipment dan MT-01 melayani 5 di antaranya. P(MT-01|SPBU X)=5 ÷ 20=25%. Nilai ini tidak membuktikan MT-01 lebih baik dari MT lain." },
+        ],
+      },
+      {
+        id: "doc-phase9-tables",
+        title: "Trip Alignment Matrix dan Loading Order Detail",
+        cards: [
+          { name: "No. LO", meaning: "Daftar nomor Loading Order pada trip.", reading: "Terpisah dari Jumlah LO; dapat dicari dan diurutkan server-side." },
+          { name: "No. SPBU", meaning: "Daftar nomor/kode SPBU unik pada trip.", reading: "Terpisah dari Jumlah SPBU; nama SPBU ikut masuk search index." },
+          { name: "Trip Search", meaning: "Mencari shipment, trip, MT ID/registration, shift, No. LO, No. SPBU, dan nama SPBU.", reading: "Tekan Search; query baru mengembalikan pagination ke halaman 1." },
+          { name: "Trip Sorting", meaning: "Header Shipment sampai Coverage memakai allowlist backend.", reading: "Klik header untuk asc/desc; N/A tetap diposisikan terakhir." },
+          { name: "Trip Pagination", meaning: "Pilihan 10, 25, 50, atau 100 trip per halaman.", reading: "Previous/Page/Next dan Showing X–Y of Z hanya mengubah matriks, bukan aggregate dashboard." },
+          { name: "LO Detail Table", meaning: "Satu row per LO, termasuk dropped/unassigned LO, dengan empat skor dan coverage.", reading: "Memiliki search, sort, pagination sendiri; klik Detail untuk membuka empat blok evidence." },
+        ],
+        note: "Beberapa LO pada SPBU/trip/MT yang sama dapat mempunyai skor identik karena unit metric dideduplicate pada route_version + trip + SPBU + vehicle, sedangkan tabel tetap mempertahankan setiap LO.",
+      },
+    ],
+  },
+  {
+    id: "doc-maps",
+    number: "13",
     title: "Google Maps Integration",
     description: "API key dan parameter route estimation Phase 6.",
     page: "google-maps-integration",
@@ -657,7 +731,7 @@ const guides: GuidePage[] = [
   },
   {
     id: "doc-glosarium",
-    number: "13",
+    number: "14",
     title: "Glosarium dan Guardrail",
     description: "Istilah penting agar hasil tidak salah ditafsirkan.",
     topics: [
@@ -675,6 +749,7 @@ const guides: GuidePage[] = [
           { name: "Noise", meaning: "Tidak kuat menjadi anggota cluster HDBSCAN.", reading: "Dapat berarti unique pattern, bukan error." },
           { name: "Fallback", meaning: "Estimasi alternatif saat sumber utama gagal.", reading: "Baca warning dan source." },
           { name: "Phase 6 / 7 Boundary", meaning: "Phase 6 membuat preliminary prediction; Phase 7 membuat final versioned operational plan.", reading: "Phase 7 tidak mengubah source prediction dan tidak menjalankan GMPRO." },
+          { name: "Phase 9 Alignment", meaning: "Kesamaan terhadap historical pattern pada exact source lineage.", reading: "Bukan route quality, operational feasibility, performance, atau recommendation." },
         ],
       },
     ],

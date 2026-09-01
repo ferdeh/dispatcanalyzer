@@ -18,7 +18,9 @@ Phase 7: dynamic fleet-wide multi-trip VRP, depot bay queue scheduling, rolling 
 
 Phase 8: manual dispatch adjustment, per-trip constraint validation and route recalculation, cascading fleet availability, operational simulation, dashboard, audit, versioning, and final dispatch.
 
-The repository includes read-only Phase 2–4 intelligence, persisted Phase 5 ML workflows, Phase 6 inference/assignment/availability estimation, Phase 7 OR-Tools optimization/control, and Phase 8 human-in-the-loop dispatch finalization. Phase 6 may estimate a preliminary small-stop sequence for cycle time; Phase 7 owns fleet-wide route optimization and depot bay scheduling; Phase 8 owns manual adjustment, per-trip recalculation, simulation, audit, and the finalized dispatch version.
+Phase 9: neutral Route–Model Alignment Evaluation against source-aligned cluster, shift, SPBU pairing, and MT affinity evidence.
+
+The repository includes read-only Phase 2–4 intelligence, persisted Phase 5 ML workflows, Phase 6 inference/assignment/availability estimation, Phase 7 OR-Tools optimization/control, Phase 8 human-in-the-loop dispatch finalization, and Phase 9 descriptive alignment evaluation. Phase 6 may estimate a preliminary small-stop sequence for cycle time; Phase 7 owns fleet-wide route optimization and depot bay scheduling; Phase 8 owns manual adjustment, per-trip recalculation, simulation, audit, and the finalized dispatch version; Phase 9 never changes those sources.
 
 ## Phase 2
 
@@ -134,6 +136,23 @@ The repository includes read-only Phase 2–4 intelligence, persisted Phase 5 ML
 - Finalization: hard errors block; unassigned LO is an explicit acknowledgment warning by default
 - Schema: migration `0022_phase8_manual_dispatch`
 - Technical documentation: `docs/PHASE_8_MANUAL_DISPATCH.md`
+
+## Phase 9
+
+- API prefix: `/api/v1/phase9/route-model-alignment`
+- UI: `/phase9/route-model-alignment`
+- Inputs: one TBBM and one persisted Phase 7 Route Version; model and saved-analysis lineage are never selected manually
+- Source bundle: exact Phase 5 model/training lineage for cluster, shift, and pairing; deterministic exact/as-of/rebuilt Phase 4 evidence for MT affinity
+- Historical cutoff: source model and all fallback evidence must end before the route operating date
+- Metrics: separate `Cluster Cohesion`, `Shift Alignment`, `Historical SPBU Pairing`, and `Historical MT Affinity`; no composite overall score
+- Semantics: `0–100%` describes historical alignment only; no good/bad/pass/fail classification
+- Observation: dashboard deduplicates unique trip–SPBU and canonical in-trip SPBU pairs, while the table persists every LO including dropped/unassigned LO
+- Evidence: nullable scores, status/reason, coverage, immutable Source-Aligned Bundle/checksum, per-trip matrix, and per-LO evidence drawer
+- Tables: Trip Alignment Matrix dan detail LO memiliki server-side pagination, column sorting, deterministic search, serta state kontrol yang independen; matriks menampilkan daftar No. LO dan No. SPBU per trip
+- Persistence: `route_alignment_evaluation_run`, `route_alignment_evaluation_row`, `route_alignment_pair_evidence`
+- Schema: migration `0027_phase9_route_alignment`
+- Algorithm: `phase9.route_model_alignment.v1`
+- Technical documentation: `docs/PHASE_9_ROUTE_MODEL_ALIGNMENT.md`
 
 ## Phase 7 → Phase 8 operational handoff
 

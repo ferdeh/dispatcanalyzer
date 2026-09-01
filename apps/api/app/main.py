@@ -17,16 +17,31 @@ from fastapi import Body, Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import String, Time, cast, delete, desc, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .compatibility import evaluate_mt_spbu_compatibility
-from .affinity_intelligence import build_affinity_date_availability, build_affinity_intelligence_payload
+from .affinity_intelligence import (
+    build_affinity_date_availability,
+    build_affinity_intelligence_payload,
+    delete_saved_affinity_analysis_config,
+    get_saved_affinity_analysis_config,
+    list_saved_affinity_analysis_configs,
+    save_affinity_analysis_config,
+)
 from .config import get_settings
 from .database import SessionLocal, get_db
-from .departure_intelligence import build_departure_date_availability, build_departure_intelligence_payload, build_shift_intelligence_payload
+from .departure_intelligence import (
+    build_departure_date_availability,
+    build_departure_intelligence_payload,
+    build_shift_intelligence_payload,
+    delete_saved_shift_analysis_config,
+    get_saved_shift_analysis_config,
+    list_saved_shift_analysis_configs,
+    save_shift_analysis_config,
+)
 from .importer import ImportProcessor
 from .models import (
     BridgeMTTag,
@@ -51,12 +66,20 @@ from .models import (
     TagAlias,
 )
 from .normalization import clean_str, infer_tag_type, make_id, normalize_key, normalize_product, parse_coordinate, parse_mt_name, source_int, source_number, source_time, split_project_tags
-from .pairing_intelligence import build_pairing_date_availability, build_pairing_intelligence_payload
+from .pairing_intelligence import (
+    build_pairing_date_availability,
+    build_pairing_intelligence_payload,
+    delete_saved_pairing_analysis_config,
+    get_saved_pairing_analysis_config,
+    list_saved_pairing_analysis_configs,
+    save_pairing_analysis_config,
+)
 from .phase5_behavioral import recover_interrupted_behavioral_training_runs
 from .phase5_routes import router as phase5_router
 from .phase6_routes import router as phase6_router
 from .phase7_routes import router as phase7_router
 from .phase8_routes import router as phase8_router
+from .phase9_routes import router as phase9_router
 from .phase7_service import recover_interrupted_phase7_optimizations
 from .google_routes_settings_routes import router as google_routes_settings_router
 from .tag_consistency import build_tag_consistency_payload, get_tag_consistency_detail
@@ -98,6 +121,7 @@ app.include_router(phase5_router)
 app.include_router(phase6_router)
 app.include_router(phase7_router)
 app.include_router(phase8_router)
+app.include_router(phase9_router)
 app.include_router(google_routes_settings_router)
 
 
@@ -142,6 +166,53 @@ class ShiftAnalysisRequest(BaseModel):
     search: str | None = None
     sort_column: str = "observation_count"
     sort_direction: str = "desc"
+
+
+class SaveShiftAnalysisConfigRequest(BaseModel):
+    name: str
+    depot_id: str | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+    bucket_minutes: int | None = None
+    search: str | None = None
+    sort_column: str | None = None
+    sort_direction: str | None = None
+    assignment_method: str | None = None
+    shift_config: list[dict] = Field(default_factory=list)
+    ui_state: dict = Field(default_factory=dict)
+    departure_analysis_snapshot: dict
+    shift_analysis_snapshot: dict
+
+
+class SavePairingAnalysisConfigRequest(BaseModel):
+    name: str
+    depot_id: str | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+    product_id: str | None = None
+    search: str | None = None
+    sort_column: str | None = None
+    sort_direction: str | None = None
+    ui_state: dict = Field(default_factory=dict)
+    pairing_analysis_snapshot: dict
+
+
+class SaveAffinityAnalysisConfigRequest(BaseModel):
+    name: str
+    depot_id: str | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+    product_id: str | None = None
+    minimum_observations: int | None = None
+    confidence: str | None = None
+    temporal_bucket: str | None = None
+    recent_days: int | None = None
+    top_n: int | None = None
+    edge_metric: str | None = None
+    selected_spbu_id: str | None = None
+    selected_mt_id: str | None = None
+    ui_state: dict = Field(default_factory=dict)
+    affinity_analysis_snapshot: dict
 
 
 IMPORT_TEMPLATE_COLUMNS = {
@@ -725,6 +796,31 @@ def depot_departure_available_dates(depot_id: str, db: Session = Depends(get_db)
     return build_departure_date_availability(db, depot_id)
 
 
+@app.get("/api/v1/departure-intelligence/saved-shift-configurations")
+def departure_saved_shift_configurations(
+    depot_id: str | None = None,
+    limit: int = 10,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+) -> dict:
+    return list_saved_shift_analysis_configs(db, depot_id=depot_id, limit=limit, offset=offset)
+
+
+@app.post("/api/v1/departure-intelligence/saved-shift-configurations")
+def departure_save_shift_configuration(request: SaveShiftAnalysisConfigRequest, db: Session = Depends(get_db)) -> dict:
+    return save_shift_analysis_config(db, request.model_dump())
+
+
+@app.get("/api/v1/departure-intelligence/saved-shift-configurations/{config_id}")
+def departure_saved_shift_configuration_detail(config_id: str, db: Session = Depends(get_db)) -> dict:
+    return get_saved_shift_analysis_config(db, config_id)
+
+
+@app.delete("/api/v1/departure-intelligence/saved-shift-configurations/{config_id}")
+def departure_delete_saved_shift_configuration(config_id: str, db: Session = Depends(get_db)) -> dict:
+    return delete_saved_shift_analysis_config(db, config_id)
+
+
 @app.post("/api/v1/departure-intelligence/shift-analysis")
 def depot_departure_shift_intelligence(request: ShiftAnalysisRequest, db: Session = Depends(get_db)) -> dict:
     return build_shift_intelligence_payload(
@@ -783,6 +879,31 @@ def spbu_pairing_available_dates(depot_id: str, db: Session = Depends(get_db)) -
     return build_pairing_date_availability(db, depot_id)
 
 
+@app.get("/api/v1/pairing-intelligence/saved-configurations")
+def spbu_pairing_saved_configurations(
+    depot_id: str | None = None,
+    limit: int = 10,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+) -> dict:
+    return list_saved_pairing_analysis_configs(db, depot_id=depot_id, limit=limit, offset=offset)
+
+
+@app.post("/api/v1/pairing-intelligence/saved-configurations")
+def spbu_pairing_save_configuration(request: SavePairingAnalysisConfigRequest, db: Session = Depends(get_db)) -> dict:
+    return save_pairing_analysis_config(db, request.model_dump())
+
+
+@app.get("/api/v1/pairing-intelligence/saved-configurations/{config_id}")
+def spbu_pairing_saved_configuration_detail(config_id: str, db: Session = Depends(get_db)) -> dict:
+    return get_saved_pairing_analysis_config(db, config_id)
+
+
+@app.delete("/api/v1/pairing-intelligence/saved-configurations/{config_id}")
+def spbu_pairing_delete_saved_configuration(config_id: str, db: Session = Depends(get_db)) -> dict:
+    return delete_saved_pairing_analysis_config(db, config_id)
+
+
 @app.get("/api/v1/affinity-intelligence/analysis")
 def spbu_mt_affinity_intelligence(
     depot_id: str,
@@ -821,6 +942,31 @@ def spbu_mt_affinity_intelligence(
 @app.get("/api/v1/affinity-intelligence/available-dates")
 def spbu_mt_affinity_available_dates(depot_id: str, db: Session = Depends(get_db)) -> dict:
     return build_affinity_date_availability(db, depot_id)
+
+
+@app.get("/api/v1/affinity-intelligence/saved-configurations")
+def spbu_mt_affinity_saved_configurations(
+    depot_id: str | None = None,
+    limit: int = 10,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+) -> dict:
+    return list_saved_affinity_analysis_configs(db, depot_id=depot_id, limit=limit, offset=offset)
+
+
+@app.post("/api/v1/affinity-intelligence/saved-configurations")
+def spbu_mt_affinity_save_configuration(request: SaveAffinityAnalysisConfigRequest, db: Session = Depends(get_db)) -> dict:
+    return save_affinity_analysis_config(db, request.model_dump())
+
+
+@app.get("/api/v1/affinity-intelligence/saved-configurations/{config_id}")
+def spbu_mt_affinity_saved_configuration_detail(config_id: str, db: Session = Depends(get_db)) -> dict:
+    return get_saved_affinity_analysis_config(db, config_id)
+
+
+@app.delete("/api/v1/affinity-intelligence/saved-configurations/{config_id}")
+def spbu_mt_affinity_delete_saved_configuration(config_id: str, db: Session = Depends(get_db)) -> dict:
+    return delete_saved_affinity_analysis_config(db, config_id)
 
 
 @app.get("/api/v1/master/compatibility/summary")

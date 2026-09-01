@@ -1,7 +1,7 @@
 import ReactECharts from "echarts-for-react";
-import { ArrowDown, ArrowUp, ArrowUpDown, Hand, Maximize2, Network, RefreshCw, ZoomIn } from "lucide-react";
+import { ArrowDown, ArrowUp, ArrowUpDown, Hand, Maximize2, Network, RefreshCw, Save, Trash2, X, ZoomIn } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { apiGet } from "../lib/api";
+import { apiGet, apiSend } from "../lib/api";
 
 type Depot = { depot_id: string; depot_name: string };
 type Product = { product_id: string; product_name: string };
@@ -130,6 +130,32 @@ type Analysis = {
   evidence: { relationship: { spbu_id: string; mt_id: string } | null; distinct_shipment_count: number; rows: EvidenceRow[] };
   methodology: Record<string, string | Record<string, unknown>>;
 };
+type SavedAffinityAnalysisConfig = {
+  id: string;
+  name: string;
+  depot_id: string;
+  depot_name: string | null;
+  start_date: string;
+  end_date: string;
+  product_id: string | null;
+  product_name: string;
+  minimum_observations: number;
+  confidence: string;
+  temporal_bucket: string;
+  recent_days: number;
+  top_n: number;
+  edge_metric: string;
+  selected_spbu_id: string | null;
+  selected_mt_id: string | null;
+  spbu_analyzed: number;
+  mt_observed: number;
+  created_by: string;
+  created_at: string | null;
+  updated_at: string | null;
+  ui_state?: Record<string, unknown>;
+  affinity_analysis_snapshot?: Analysis;
+};
+type SavedAffinityAnalysisConfigResponse = { total: number; limit: number; offset: number; rows: SavedAffinityAnalysisConfig[] };
 
 function addDays(value: string, days: number): string {
   const date = new Date(`${value}T00:00:00`);
@@ -148,6 +174,11 @@ function number(value: number, digits = 0): string {
 function dateLabel(value: string | null): string {
   if (!value) return "-";
   return new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "short", year: "numeric" }).format(new Date(`${value.slice(0, 10)}T00:00:00`));
+}
+
+function dateTimeLabel(value: string | null): string {
+  if (!value) return "-";
+  return new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" }).format(new Date(value));
 }
 
 function formatTags(tags: string[] | null | undefined): string {
@@ -274,9 +305,20 @@ export function AffinityIntelligencePage({ depots, products }: { depots: Depot[]
   const [matrixInteractionMode, setMatrixInteractionMode] = useState<ChartInteractionMode>("pan");
   const [scatterViewport, setScatterViewport] = useState<ChartViewport>({ start: 0, end: 100 });
   const [matrixViewport, setMatrixViewport] = useState<ChartViewport>({ start: 0, end: 100 });
+  const [savedConfigs, setSavedConfigs] = useState<SavedAffinityAnalysisConfig[]>([]);
+  const [savedConfigTotal, setSavedConfigTotal] = useState(0);
+  const [savedConfigOffset, setSavedConfigOffset] = useState(0);
+  const [savedConfigLimit, setSavedConfigLimit] = useState(5);
+  const [savedConfigLoading, setSavedConfigLoading] = useState(false);
+  const [saveModalOpen, setSaveModalOpen] = useState(false);
+  const [saveName, setSaveName] = useState("");
+  const [loadModalOpen, setLoadModalOpen] = useState(false);
+  const [selectedSavedConfigId, setSelectedSavedConfigId] = useState("");
+  const [configMessage, setConfigMessage] = useState("");
   const scatterChartRef = useRef<ReactECharts>(null);
   const matrixChartRef = useRef<ReactECharts>(null);
   const requestRef = useRef(0);
+  const preserveLoadedDatesRef = useRef(false);
 
   useEffect(() => {
     let active = true;
@@ -294,12 +336,20 @@ export function AffinityIntelligencePage({ depots, products }: { depots: Depot[]
       .then((payload) => {
         if (!active) return;
         setAvailability(payload);
-        setFilters((current) => ({ ...current, endDate: payload.max_date ?? "", startDate: payload.max_date ? (payload.min_date && addDays(payload.max_date, -29) < payload.min_date ? payload.min_date : addDays(payload.max_date, -29)) : "" }));
+        if (preserveLoadedDatesRef.current) {
+          preserveLoadedDatesRef.current = false;
+        } else {
+          setFilters((current) => ({ ...current, endDate: payload.max_date ?? "", startDate: payload.max_date ? (payload.min_date && addDays(payload.max_date, -29) < payload.min_date ? payload.min_date : addDays(payload.max_date, -29)) : "" }));
+        }
       })
       .catch((reason: unknown) => active && setError(reason instanceof Error ? reason.message : "Failed to load dates"))
       .finally(() => active && setDateLoading(false));
     return () => { active = false; };
   }, [filters.depotId]);
+
+  useEffect(() => {
+    void fetchSavedConfigs(savedConfigOffset, savedConfigLimit, filters.depotId);
+  }, [filters.depotId, savedConfigOffset, savedConfigLimit]);
 
   async function load(activeFilters: Filters, selectedSpbuId?: string | null, selectedMtId?: string | null) {
     if (!activeFilters.depotId || !activeFilters.startDate || !activeFilters.endDate) { setError("Select Depot and Date Range before running Phase 4."); return; }
@@ -328,6 +378,151 @@ export function AffinityIntelligencePage({ depots, products }: { depots: Depot[]
       if (requestRef.current === requestId) setError(reason instanceof Error ? reason.message : "Failed to run Phase 4 analysis");
     } finally {
       if (requestRef.current === requestId) setLoading(false);
+    }
+  }
+
+  async function fetchSavedConfigs(nextOffset = savedConfigOffset, nextLimit = savedConfigLimit, depotId = filters.depotId) {
+    setSavedConfigLoading(true);
+    try {
+      const params = new URLSearchParams({ limit: String(nextLimit), offset: String(nextOffset) });
+      if (depotId) params.set("depot_id", depotId);
+      const payload = await apiGet<SavedAffinityAnalysisConfigResponse>(`/api/v1/affinity-intelligence/saved-configurations?${params.toString()}`);
+      setSavedConfigs(payload.rows);
+      setSavedConfigTotal(payload.total);
+      setSavedConfigOffset(payload.offset);
+      setSavedConfigLimit(payload.limit);
+      setSelectedSavedConfigId((current) => payload.rows.some((row) => row.id === current) ? current : payload.rows[0]?.id ?? "");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Failed to load saved affinity configurations");
+    } finally {
+      setSavedConfigLoading(false);
+    }
+  }
+
+  function openSaveModal() {
+    if (!analysis || !appliedFilters) {
+      setError("Run Phase 4 analysis before saving an affinity analysis configuration.");
+      setConfigMessage("");
+      return;
+    }
+    setSaveName("");
+    setSaveModalOpen(true);
+    setError(null);
+  }
+
+  function openLoadModal() {
+    if (!savedConfigs.length) {
+      setError("No saved affinity analysis configuration is available.");
+      setConfigMessage("");
+      return;
+    }
+    setSelectedSavedConfigId((current) => current || savedConfigs[0]?.id || "");
+    setLoadModalOpen(true);
+    setError(null);
+  }
+
+  async function saveConfig() {
+    if (!analysis || !appliedFilters) return;
+    const name = saveName.trim();
+    if (!name) { setError("Configuration name is required."); return; }
+    setSavedConfigLoading(true);
+    setError(null);
+    try {
+      const saved = await apiSend<SavedAffinityAnalysisConfig>("/api/v1/affinity-intelligence/saved-configurations", "POST", {
+        name,
+        depot_id: appliedFilters.depotId,
+        start_date: appliedFilters.startDate,
+        end_date: appliedFilters.endDate,
+        product_id: appliedFilters.productId || null,
+        minimum_observations: Number(appliedFilters.minimumObservations),
+        confidence: appliedFilters.confidence,
+        temporal_bucket: appliedFilters.temporalBucket,
+        recent_days: Number(appliedFilters.recentDays),
+        top_n: Number(appliedFilters.topN),
+        edge_metric: appliedFilters.edgeMetric,
+        selected_spbu_id: analysis.selected_spbu_profile?.spbu_id ?? (appliedFilters.spbuId || null),
+        selected_mt_id: analysis.reverse_detail?.mt_id ?? null,
+        ui_state: {
+          spbu_search: spbuSearch,
+          scatter_interaction_mode: scatterInteractionMode,
+          matrix_interaction_mode: matrixInteractionMode,
+          scatter_viewport: scatterViewport,
+          matrix_viewport: matrixViewport,
+        },
+        affinity_analysis_snapshot: analysis,
+      });
+      setConfigMessage(`Saved affinity analysis configuration: ${saved.name}.`);
+      setSaveModalOpen(false);
+      setSaveName("");
+      setSavedConfigOffset(0);
+      await fetchSavedConfigs(0, savedConfigLimit, appliedFilters.depotId);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Failed to save affinity analysis configuration");
+    } finally {
+      setSavedConfigLoading(false);
+    }
+  }
+
+  async function loadConfig() {
+    if (!selectedSavedConfigId) { setError("Select a saved affinity analysis configuration to load."); return; }
+    setSavedConfigLoading(true);
+    setError(null);
+    try {
+      const saved = await apiGet<SavedAffinityAnalysisConfig>(`/api/v1/affinity-intelligence/saved-configurations/${encodeURIComponent(selectedSavedConfigId)}`);
+      const snapshot = saved.affinity_analysis_snapshot;
+      if (!snapshot) throw new Error("Saved configuration does not contain an affinity analysis snapshot.");
+      const uiState = saved.ui_state ?? {};
+      const selectedProfile = snapshot.selected_spbu_profile;
+      const nextFilters: Filters = {
+        depotId: saved.depot_id,
+        spbuId: saved.selected_spbu_id ?? selectedProfile?.spbu_id ?? "",
+        startDate: saved.start_date,
+        endDate: saved.end_date,
+        productId: saved.product_id ?? "",
+        minimumObservations: String(saved.minimum_observations),
+        confidence: saved.confidence,
+        temporalBucket: saved.temporal_bucket,
+        recentDays: String(saved.recent_days),
+        topN: String(saved.top_n),
+        edgeMetric: saved.edge_metric,
+      };
+      if (filters.depotId !== saved.depot_id) preserveLoadedDatesRef.current = true;
+      setSavedConfigOffset(0);
+      setFilters(nextFilters);
+      setAppliedFilters(nextFilters);
+      setSpbuSearch(String(uiState.spbu_search ?? (selectedProfile ? spbuLabel(selectedProfile) : "")));
+      setScatterInteractionMode(uiState.scatter_interaction_mode === "zoom" ? "zoom" : "pan");
+      setMatrixInteractionMode(uiState.matrix_interaction_mode === "zoom" ? "zoom" : "pan");
+      const savedScatterViewport = uiState.scatter_viewport as ChartViewport | undefined;
+      const savedMatrixViewport = uiState.matrix_viewport as ChartViewport | undefined;
+      setScatterViewport(savedScatterViewport?.start != null && savedScatterViewport?.end != null ? savedScatterViewport : { start: 0, end: 100 });
+      setMatrixViewport(savedMatrixViewport?.start != null && savedMatrixViewport?.end != null ? savedMatrixViewport : { start: 0, end: 100 });
+      setSelectedScatterPoint(null);
+      setAnalysis(snapshot);
+      setConfigMessage(`Loaded affinity analysis configuration: ${saved.name}.`);
+      setLoadModalOpen(false);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Failed to load affinity analysis configuration");
+    } finally {
+      setSavedConfigLoading(false);
+    }
+  }
+
+  async function deleteSavedConfig(config: SavedAffinityAnalysisConfig) {
+    if (!window.confirm(`Delete saved affinity analysis configuration "${config.name}"?`)) return;
+    setSavedConfigLoading(true);
+    setError(null);
+    try {
+      await apiSend<{ status: string }>(`/api/v1/affinity-intelligence/saved-configurations/${encodeURIComponent(config.id)}`, "DELETE");
+      setConfigMessage(`Deleted affinity analysis configuration: ${config.name}.`);
+      setSelectedSavedConfigId((current) => current === config.id ? "" : current);
+      const nextOffset = savedConfigs.length === 1 ? Math.max(0, savedConfigOffset - savedConfigLimit) : savedConfigOffset;
+      setSavedConfigOffset(nextOffset);
+      await fetchSavedConfigs(nextOffset, savedConfigLimit, filters.depotId);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Failed to delete affinity analysis configuration");
+    } finally {
+      setSavedConfigLoading(false);
     }
   }
 
@@ -484,13 +679,46 @@ export function AffinityIntelligencePage({ depots, products }: { depots: Depot[]
   const kpis: Array<[string, number, number?]> = analysis ? [
     ["Eligible Shipments", analysis.summary.total_eligible_shipments], ["SPBU Analyzed", analysis.summary.spbu_analyzed], ["MT Observed", analysis.summary.mt_observed], ["Unique SPBU–MT Pairs", analysis.summary.unique_spbu_mt_pairs], ["Avg MT / SPBU", analysis.summary.average_mt_per_spbu, 2], ["Median MT / SPBU", analysis.summary.median_mt_per_spbu, 1], ["High Consistency", analysis.summary.high_consistency_spbu], ["High Variability", analysis.summary.high_variability_spbu], ["Low Stability", analysis.summary.low_stability_spbu], ["Pattern Shifts", analysis.summary.historical_pattern_shifts]
   ] : [];
+  const savedShowingStart = savedConfigTotal === 0 ? 0 : savedConfigOffset + 1;
+  const savedShowingEnd = Math.min(savedConfigOffset + savedConfigLimit, savedConfigTotal);
+  const savedPageNumber = Math.floor(savedConfigOffset / savedConfigLimit) + 1;
+  const savedPageCount = Math.max(1, Math.ceil(savedConfigTotal / savedConfigLimit));
+  const canPreviousSavedPage = savedConfigOffset > 0 && !savedConfigLoading;
+  const canNextSavedPage = savedConfigOffset + savedConfigLimit < savedConfigTotal && !savedConfigLoading;
 
   return (
     <>
+      {saveModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/35 px-4">
+          <div className="w-full max-w-lg border border-line bg-white p-5 shadow-card">
+            <div className="mb-4 flex items-start justify-between gap-3">
+              <div><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Save Affinity Analysis Configuration</div><div className="mt-1 text-xs text-slate-500">The current Phase 4 filters, selected SPBU–MT detail, chart viewport, and analysis snapshot will be stored in the backend.</div></div>
+              <button className="inline-flex h-8 w-8 items-center justify-center border border-line" onClick={() => setSaveModalOpen(false)} title="Close save configuration"><X size={16} /></button>
+            </div>
+            <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">Configuration Name<input className="mt-2 w-full border border-line px-3 py-2 text-sm font-normal normal-case tracking-normal" value={saveName} onChange={(event) => setSaveName(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void saveConfig(); }} autoFocus placeholder="Example: Medan affinity baseline" /></label>
+            <div className="mt-5 flex items-center justify-end gap-2"><button className="border border-line px-3 py-2 text-sm" onClick={() => setSaveModalOpen(false)}>Cancel</button><button className="inline-flex items-center gap-2 bg-petroblue px-3 py-2 text-sm font-medium text-white disabled:opacity-60" onClick={() => void saveConfig()} disabled={savedConfigLoading || !saveName.trim()}><Save size={14} /> Save</button></div>
+          </div>
+        </div>
+      )}
+      {loadModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/35 px-4">
+          <div className="w-full max-w-xl border border-line bg-white p-5 shadow-card">
+            <div className="mb-4 flex items-start justify-between gap-3">
+              <div><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Load Affinity Analysis Configuration</div><div className="mt-1 text-xs text-slate-500">Loading restores the saved Phase 4 filters, selected SPBU–MT detail, chart viewport, and analysis snapshot.</div></div>
+              <button className="inline-flex h-8 w-8 items-center justify-center border border-line" onClick={() => setLoadModalOpen(false)} title="Close load configuration"><X size={16} /></button>
+            </div>
+            <label className="block text-xs font-semibold uppercase tracking-wide text-slate-500">Saved Configuration<select className="mt-2 w-full border border-line bg-white px-3 py-2 text-sm font-normal normal-case tracking-normal" value={selectedSavedConfigId} onChange={(event) => setSelectedSavedConfigId(event.target.value)}>{savedConfigs.map((config) => <option key={config.id} value={config.id}>{config.name} | {config.depot_name ?? config.depot_id} | {dateLabel(config.start_date)} – {dateLabel(config.end_date)}</option>)}</select></label>
+            <div className="mt-5 flex items-center justify-end gap-2"><button className="border border-line px-3 py-2 text-sm" onClick={() => setLoadModalOpen(false)}>Cancel</button><button className="inline-flex items-center gap-2 bg-petroblue px-3 py-2 text-sm font-medium text-white disabled:opacity-60" onClick={() => void loadConfig()} disabled={savedConfigLoading || !selectedSavedConfigId}><RefreshCw size={14} /> Load</button></div>
+          </div>
+        </div>
+      )}
       <section className="mb-5 border border-line bg-white p-4">
-        <div className="mb-4 flex flex-col gap-1"><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Phase 4 — SPBU–MT Historical Affinity & Stability Intelligence</div><div className="text-xs text-slate-500">Measures assignments that historically occurred. It does not optimize or recommend future MT assignments.</div></div>
+        <div className="mb-4 flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+          <div><div className="text-sm font-semibold uppercase tracking-wide text-slate-600">Phase 4 — SPBU–MT Historical Affinity & Stability Intelligence</div><div className="mt-1 text-xs text-slate-500">Measures assignments that historically occurred. It does not optimize or recommend future MT assignments.</div></div>
+          <div className="flex flex-col items-start gap-2 lg:items-end"><div className="flex flex-wrap gap-2"><button className="inline-flex items-center gap-2 border border-line px-3 py-2 text-sm disabled:opacity-50" onClick={openLoadModal} disabled={savedConfigLoading || savedConfigTotal === 0} title="Load a saved affinity analysis configuration"><RefreshCw size={14} /> Load</button><button className="inline-flex items-center gap-2 border border-line px-3 py-2 text-sm disabled:opacity-50" onClick={openSaveModal} disabled={loading || !analysis} title="Save current affinity configuration and analysis result"><Save size={14} /> Save</button></div>{configMessage && <div className="text-xs text-slate-500">{configMessage}</div>}</div>
+        </div>
         <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5 xl:grid-cols-6">
-          <label className="text-xs font-semibold uppercase tracking-wide text-slate-500">Depot<select className="mt-1 w-full border border-line px-3 py-2 text-sm font-normal normal-case" value={filters.depotId} onChange={(event) => { setAnalysis(null); setAppliedFilters(null); setSpbuSearch(""); setFilters((current) => ({ ...current, depotId: event.target.value, spbuId: "" })); }}><option value="">Select Depot</option>{depots.map((depot) => <option key={depot.depot_id} value={depot.depot_id}>{depot.depot_name}</option>)}</select></label>
+          <label className="text-xs font-semibold uppercase tracking-wide text-slate-500">Depot<select className="mt-1 w-full border border-line px-3 py-2 text-sm font-normal normal-case" value={filters.depotId} onChange={(event) => { setAnalysis(null); setAppliedFilters(null); setSpbuSearch(""); setSavedConfigOffset(0); setFilters((current) => ({ ...current, depotId: event.target.value, spbuId: "" })); }}><option value="">Select Depot</option>{depots.map((depot) => <option key={depot.depot_id} value={depot.depot_id}>{depot.depot_name}</option>)}</select></label>
           <label className="text-xs font-semibold uppercase tracking-wide text-slate-500">Search SPBU<input className="mt-1 w-full border border-line px-3 py-2 text-sm font-normal normal-case" type="search" list="phase4-spbu-options" value={spbuSearch} placeholder="Code or SPBU name" disabled={!filters.depotId} onChange={(event) => { const value = event.target.value; const matched = resolveSpbu(value); setSpbuSearch(value); setFilters((current) => ({ ...current, spbuId: matched?.spbu_id ?? "" })); }} /><datalist id="phase4-spbu-options">{searchableSpbus.map((row) => <option key={row.spbu_id} value={spbuLabel(row)} />)}</datalist></label>
           <label className="text-xs font-semibold uppercase tracking-wide text-slate-500">Start Date<input className="mt-1 w-full border border-line px-3 py-2 text-sm font-normal" type="date" value={filters.startDate} min={availability?.min_date ?? undefined} max={availability?.max_date ?? undefined} disabled={dateLoading} onChange={(event) => setFilters((current) => ({ ...current, startDate: event.target.value }))} /></label>
           <label className="text-xs font-semibold uppercase tracking-wide text-slate-500">End Date<input className="mt-1 w-full border border-line px-3 py-2 text-sm font-normal" type="date" value={filters.endDate} min={availability?.min_date ?? undefined} max={availability?.max_date ?? undefined} disabled={dateLoading} onChange={(event) => setFilters((current) => ({ ...current, endDate: event.target.value }))} /></label>
@@ -503,6 +731,11 @@ export function AffinityIntelligencePage({ depots, products }: { depots: Depot[]
           <label className="text-xs font-semibold uppercase tracking-wide text-slate-500">Network Edge<select className="mt-1 w-full border border-line px-3 py-2 text-sm font-normal" value={filters.edgeMetric} onChange={(event) => setFilters((current) => ({ ...current, edgeMetric: event.target.value }))}><option value="SHIPMENT_COUNT">Shipment Count</option><option value="AFFINITY_PROBABILITY">Affinity Probability</option></select></label>
         </div>
         <div className="mt-4 flex flex-wrap items-center justify-between gap-3"><div className="text-xs text-slate-500">{availability?.min_date ? `Available: ${dateLabel(availability.min_date)} – ${dateLabel(availability.max_date)}` : filters.depotId ? "No shipment dates available." : "Select a depot to load its historical date coverage."}</div><button className="inline-flex items-center gap-2 rounded-full bg-petroblue px-5 py-2 text-sm font-semibold text-white disabled:opacity-50" disabled={loading || dateLoading} onClick={apply}><RefreshCw size={15} className={loading ? "animate-spin" : ""} />{loading ? "Running" : "Apply"}</button></div>
+        <div className="mt-4 border border-line">
+          <div className="flex flex-col gap-2 border-b border-line bg-slate-50 px-3 py-2 lg:flex-row lg:items-center lg:justify-between"><div><div className="text-xs font-semibold uppercase tracking-wide text-slate-500">Saved SPBU–MT Affinity Analysis Configurations</div><div className="mt-1 text-xs text-slate-500">Showing {savedShowingStart}-{savedShowingEnd} of {savedConfigTotal.toLocaleString()}</div></div><select className="border border-line bg-white px-2 py-1 text-xs" value={savedConfigLimit} onChange={(event) => { setSavedConfigOffset(0); setSavedConfigLimit(Number(event.target.value)); }} title="Saved configurations per page"><option value={5}>5 rows</option><option value={10}>10 rows</option><option value={25}>25 rows</option></select></div>
+          <div className="overflow-x-auto"><table className="w-full border-collapse text-sm"><thead><tr className="border-b border-line text-left text-xs uppercase tracking-wide text-slate-500"><th className="whitespace-nowrap px-3 py-2">Name</th><th className="whitespace-nowrap px-3 py-2">Depot</th><th className="whitespace-nowrap px-3 py-2">Period</th><th className="whitespace-nowrap px-3 py-2">Product</th><th className="whitespace-nowrap px-3 py-2">SPBU</th><th className="whitespace-nowrap px-3 py-2">MT</th><th className="whitespace-nowrap px-3 py-2">Saved</th><th className="whitespace-nowrap px-3 py-2">Action</th></tr></thead><tbody>{savedConfigs.map((config) => <tr key={config.id} className="border-b border-line"><td className="whitespace-nowrap px-3 py-2 font-medium">{config.name}</td><td className="whitespace-nowrap px-3 py-2">{config.depot_name ?? config.depot_id}</td><td className="whitespace-nowrap px-3 py-2">{dateLabel(config.start_date)} – {dateLabel(config.end_date)}</td><td className="whitespace-nowrap px-3 py-2">{config.product_name}</td><td className="whitespace-nowrap px-3 py-2">{number(config.spbu_analyzed)}</td><td className="whitespace-nowrap px-3 py-2">{number(config.mt_observed)}</td><td className="whitespace-nowrap px-3 py-2">{dateTimeLabel(config.updated_at)}</td><td className="whitespace-nowrap px-3 py-2"><button className="inline-flex items-center justify-center border border-line px-2 py-1 text-xs text-rust disabled:opacity-50" onClick={() => void deleteSavedConfig(config)} disabled={savedConfigLoading} title="Delete saved configuration"><Trash2 size={13} /></button></td></tr>)}{savedConfigs.length === 0 && <tr><td className="px-3 py-8 text-center text-sm text-slate-500" colSpan={8}>No saved affinity analysis configuration.</td></tr>}</tbody></table></div>
+          <div className="flex items-center justify-between gap-3 px-3 py-2 text-sm"><button className="border border-line px-3 py-2 disabled:opacity-50" onClick={() => setSavedConfigOffset(Math.max(0, savedConfigOffset - savedConfigLimit))} disabled={!canPreviousSavedPage}>Previous</button><span className="text-slate-500">Page {savedPageNumber} of {savedPageCount}</span><button className="border border-line px-3 py-2 disabled:opacity-50" onClick={() => setSavedConfigOffset(savedConfigOffset + savedConfigLimit)} disabled={!canNextSavedPage}>Next</button></div>
+        </div>
       </section>
 
       {error && <div className="mb-5 rounded-2xl border border-rust bg-white px-4 py-3 text-sm text-rust">{error}</div>}

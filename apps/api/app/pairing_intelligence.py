@@ -6,10 +6,23 @@ from itertools import combinations
 from typing import Iterable
 
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session
 
-from .models import BridgeSPBUTag, FactLoadingOrderLine, FactShipment, FactShipmentSPBU, FactShipmentStop, MasterDepot, MasterMT, MasterProduct, MasterSPBU, MasterTag
+from .models import (
+    BridgeSPBUTag,
+    FactLoadingOrderLine,
+    FactShipment,
+    FactShipmentSPBU,
+    FactShipmentStop,
+    MasterDepot,
+    MasterMT,
+    MasterProduct,
+    MasterSPBU,
+    MasterTag,
+    PairingAnalysisConfig,
+)
+from .normalization import clean_str, make_id, normalize_key
 
 
 ALGORITHM_VERSION = "pairing_v1"
@@ -21,6 +34,173 @@ CONFIDENCE_THRESHOLDS = {
     "high_pair_count": 30,
 }
 CONFIDENCE_RANK = {"HIGH": 3, "MEDIUM": 2, "LOW": 1, "INSUFFICIENT_DATA": 0}
+
+
+def list_saved_pairing_analysis_configs(db: Session, depot_id: str | None = None, limit: int = 10, offset: int = 0) -> dict:
+    filters = []
+    if depot_id:
+        filters.append(PairingAnalysisConfig.depot_id == depot_id)
+    bounded_limit = max(1, min(limit, 100))
+    bounded_offset = max(0, offset)
+    total = db.scalar(select(func.count()).select_from(PairingAnalysisConfig).where(*filters)) or 0
+    rows = db.scalars(
+        select(PairingAnalysisConfig)
+        .where(*filters)
+        .order_by(desc(PairingAnalysisConfig.updated_at), desc(PairingAnalysisConfig.created_at))
+        .limit(bounded_limit)
+        .offset(bounded_offset)
+    ).all()
+    depot_ids = sorted({row.depot_id for row in rows})
+    product_ids = sorted({row.product_id for row in rows if row.product_id})
+    depot_names = {
+        depot.depot_id: depot.depot_name
+        for depot in db.scalars(select(MasterDepot).where(MasterDepot.depot_id.in_(depot_ids))).all()
+    } if depot_ids else {}
+    product_names = {
+        product.product_id: product.product_name
+        for product in db.scalars(select(MasterProduct).where(MasterProduct.product_id.in_(product_ids))).all()
+    } if product_ids else {}
+    return {
+        "total": total,
+        "limit": bounded_limit,
+        "offset": bounded_offset,
+        "rows": [
+            serialize_saved_pairing_analysis_config(
+                row,
+                depot_names.get(row.depot_id),
+                product_names.get(row.product_id) if row.product_id else "All Products",
+                include_snapshot=False,
+            )
+            for row in rows
+        ],
+    }
+
+
+def get_saved_pairing_analysis_config(db: Session, config_id: str) -> dict:
+    config = db.get(PairingAnalysisConfig, config_id)
+    if not config:
+        raise HTTPException(status_code=404, detail="Saved pairing analysis configuration not found.")
+    depot = db.get(MasterDepot, config.depot_id)
+    product = db.get(MasterProduct, config.product_id) if config.product_id else None
+    return serialize_saved_pairing_analysis_config(
+        config,
+        depot.depot_name if depot else None,
+        product.product_name if product else "All Products",
+        include_snapshot=True,
+    )
+
+
+def save_pairing_analysis_config(db: Session, payload: dict) -> dict:
+    name = clean_str(payload.get("name"))
+    if not name:
+        raise HTTPException(status_code=400, detail="Configuration name is required.")
+    normalized_name = normalize_key(name)
+    if not normalized_name:
+        raise HTTPException(status_code=400, detail="Configuration name is invalid.")
+
+    pairing_snapshot = payload.get("pairing_analysis_snapshot") or {}
+    if not pairing_snapshot:
+        raise HTTPException(status_code=400, detail="Pairing analysis snapshot is required.")
+
+    filters = pairing_snapshot.get("effective_filters") or {}
+    depot_id = clean_str(payload.get("depot_id")) or clean_str(filters.get("depot_id"))
+    if not depot_id or not db.get(MasterDepot, depot_id):
+        raise HTTPException(status_code=400, detail="A valid depot is required.")
+
+    product_id = clean_str(payload.get("product_id")) or clean_str(filters.get("product_id"))
+    product = db.get(MasterProduct, product_id) if product_id else None
+    if product_id and not product:
+        raise HTTPException(status_code=400, detail="A valid product is required.")
+
+    start_date = parse_pairing_date_from_payload(payload.get("start_date") or filters.get("start_date"), "start_date")
+    end_date = parse_pairing_date_from_payload(payload.get("end_date") or filters.get("end_date"), "end_date")
+    existing = db.scalar(
+        select(PairingAnalysisConfig).where(
+            PairingAnalysisConfig.depot_id == depot_id,
+            PairingAnalysisConfig.normalized_name == normalized_name,
+        )
+    )
+    config = existing or PairingAnalysisConfig(
+        id=make_id("pairing_cfg", depot_id, normalized_name, utc_now_label()),
+        name=name,
+        normalized_name=normalized_name,
+        depot_id=depot_id,
+    )
+    config.name = name
+    config.start_date = start_date
+    config.end_date = end_date
+    config.product_id = product_id
+    config.search = clean_str(payload.get("search")) or clean_str(filters.get("search"))
+    config.sort_column = clean_str(payload.get("sort_column")) or clean_str(filters.get("sort_column")) or "evidence_strength"
+    config.sort_direction = clean_str(payload.get("sort_direction")) or clean_str(filters.get("sort_direction")) or "desc"
+    config.ui_state = payload.get("ui_state") or {}
+    config.pairing_analysis_snapshot = pairing_snapshot
+    config.updated_at = datetime.now(timezone.utc)
+    db.add(config)
+    db.commit()
+    db.refresh(config)
+    depot = db.get(MasterDepot, depot_id)
+    return serialize_saved_pairing_analysis_config(
+        config,
+        depot.depot_name if depot else None,
+        product.product_name if product else "All Products",
+        include_snapshot=True,
+    )
+
+
+def delete_saved_pairing_analysis_config(db: Session, config_id: str) -> dict:
+    config = db.get(PairingAnalysisConfig, config_id)
+    if not config:
+        raise HTTPException(status_code=404, detail="Saved pairing analysis configuration not found.")
+    db.delete(config)
+    db.commit()
+    return {"status": "DELETED", "id": config_id}
+
+
+def parse_pairing_date_from_payload(value: object, field_name: str) -> date:
+    if isinstance(value, date):
+        return value
+    if not value:
+        raise HTTPException(status_code=400, detail=f"{field_name} is required.")
+    try:
+        return date.fromisoformat(str(value))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"{field_name} must be YYYY-MM-DD.") from exc
+
+
+def serialize_saved_pairing_analysis_config(
+    config: PairingAnalysisConfig,
+    depot_name: str | None,
+    product_name: str | None,
+    include_snapshot: bool,
+) -> dict:
+    summary = (config.pairing_analysis_snapshot or {}).get("summary") or {}
+    row = {
+        "id": config.id,
+        "name": config.name,
+        "depot_id": config.depot_id,
+        "depot_name": depot_name,
+        "start_date": config.start_date.isoformat(),
+        "end_date": config.end_date.isoformat(),
+        "product_id": config.product_id,
+        "product_name": product_name or "All Products",
+        "search": config.search or "",
+        "sort_column": config.sort_column,
+        "sort_direction": config.sort_direction,
+        "unique_spbu_pairs": summary.get("unique_spbu_pairs", 0),
+        "multi_spbu_shipments": summary.get("multi_spbu_shipments", 0),
+        "created_by": config.created_by,
+        "created_at": config.created_at.isoformat() if config.created_at else None,
+        "updated_at": config.updated_at.isoformat() if config.updated_at else None,
+    }
+    if include_snapshot:
+        row.update(
+            {
+                "ui_state": config.ui_state or {},
+                "pairing_analysis_snapshot": config.pairing_analysis_snapshot or {},
+            }
+        )
+    return row
 
 
 def calculate_confidence(pair_count: int, shipment_a_count: int, shipment_b_count: int) -> dict:

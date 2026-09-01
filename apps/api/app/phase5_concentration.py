@@ -9,18 +9,20 @@ from typing import Any
 
 import numpy as np
 from fastapi import HTTPException
-from sqlalchemy import desc, select
+from sqlalchemy import Integer, desc, func, select
 from sqlalchemy.orm import Session
 
 from .affinity_intelligence import _enrich_entity_tags, _load_observation_rows, _prepare_observations
 from .models import (
     FactShipment,
     MLConcentrationAnalysisRun,
+    MLConcentrationSavedAnalysis,
     MLSPBUConcentrationProfile,
     MasterDepot,
     MasterMT,
     MasterSPBU,
 )
+from .normalization import clean_str, normalize_key
 from .phase5_constants import (
     CONCENTRATION_ALGORITHM_VERSION,
     CONCENTRATION_CLASSIFICATION_THRESHOLDS,
@@ -470,3 +472,188 @@ def list_concentration_runs(db: Session, depot_id: str | None = None) -> list[di
         }
         for run in runs
     ]
+
+
+def _saved_concentration_summary(
+    saved: MLConcentrationSavedAnalysis,
+    run: MLConcentrationAnalysisRun,
+    depot_name: str | None,
+    counts: dict[str, dict[str, int]],
+) -> dict:
+    run_counts = counts.get(run.analysis_run_id, {})
+    return {
+        "id": saved.id,
+        "name": saved.name,
+        "depot_id": saved.depot_id,
+        "depot_name": depot_name or saved.depot_id,
+        "analysis_run_id": run.analysis_run_id,
+        "baseline_start_date": run.baseline_start_date.isoformat(),
+        "baseline_end_date": run.baseline_end_date.isoformat(),
+        "minimum_shipment_observation": run.minimum_shipment_observation,
+        "status": run.status,
+        "spbu_count": run_counts.get("spbu_count", 0),
+        "investigation_recommended_count": run_counts.get("investigation_recommended_count", 0),
+        "created_by": saved.created_by,
+        "created_at": saved.created_at.isoformat() if saved.created_at else None,
+        "updated_at": saved.updated_at.isoformat() if saved.updated_at else None,
+    }
+
+
+def _saved_concentration_counts(db: Session, run_ids: list[str]) -> dict[str, dict[str, int]]:
+    counts: dict[str, dict[str, int]] = {
+        run_id: {"spbu_count": 0, "investigation_recommended_count": 0}
+        for run_id in run_ids
+    }
+    if not run_ids:
+        return counts
+    rows = db.execute(
+        select(
+            MLSPBUConcentrationProfile.analysis_run_id,
+            func.count(MLSPBUConcentrationProfile.profile_id),
+            func.sum(
+                (MLSPBUConcentrationProfile.concentration_classification == "INVESTIGATION_RECOMMENDED").cast(Integer)
+            ),
+        )
+        .where(MLSPBUConcentrationProfile.analysis_run_id.in_(run_ids))
+        .group_by(MLSPBUConcentrationProfile.analysis_run_id)
+    ).all()
+    for run_id, spbu_count, investigation_count in rows:
+        counts[run_id] = {
+            "spbu_count": int(spbu_count or 0),
+            "investigation_recommended_count": int(investigation_count or 0),
+        }
+    return counts
+
+
+def list_saved_concentration_analyses(
+    db: Session,
+    depot_id: str | None = None,
+    limit: int = 10,
+    offset: int = 0,
+) -> dict:
+    filters = [MLConcentrationSavedAnalysis.depot_id == depot_id] if depot_id else []
+    bounded_limit = max(1, min(limit, 100))
+    bounded_offset = max(0, offset)
+    total = db.scalar(
+        select(func.count()).select_from(MLConcentrationSavedAnalysis).where(*filters)
+    ) or 0
+    saved_rows = db.scalars(
+        select(MLConcentrationSavedAnalysis)
+        .where(*filters)
+        .order_by(
+            desc(MLConcentrationSavedAnalysis.updated_at),
+            desc(MLConcentrationSavedAnalysis.created_at),
+        )
+        .limit(bounded_limit)
+        .offset(bounded_offset)
+    ).all()
+    run_ids = [row.analysis_run_id for row in saved_rows]
+    runs = {
+        row.analysis_run_id: row
+        for row in (
+            db.scalars(
+                select(MLConcentrationAnalysisRun).where(
+                    MLConcentrationAnalysisRun.analysis_run_id.in_(run_ids)
+                )
+            ).all()
+            if run_ids
+            else []
+        )
+    }
+    depot_ids = sorted({row.depot_id for row in saved_rows})
+    depots = {
+        row.depot_id: row.depot_name
+        for row in (
+            db.scalars(select(MasterDepot).where(MasterDepot.depot_id.in_(depot_ids))).all()
+            if depot_ids
+            else []
+        )
+    }
+    counts = _saved_concentration_counts(db, run_ids)
+    return {
+        "total": int(total),
+        "limit": bounded_limit,
+        "offset": bounded_offset,
+        "rows": [
+            _saved_concentration_summary(saved, runs[saved.analysis_run_id], depots.get(saved.depot_id), counts)
+            for saved in saved_rows
+            if saved.analysis_run_id in runs
+        ],
+    }
+
+
+def save_concentration_analysis(
+    db: Session,
+    *,
+    name: str,
+    analysis_run_id: str,
+    ui_state: dict | None,
+    created_by: str,
+) -> dict:
+    cleaned_name = clean_str(name)
+    normalized_name = normalize_key(cleaned_name)
+    if not cleaned_name or not normalized_name:
+        raise HTTPException(status_code=400, detail="Saved analysis name is required.")
+    run = db.get(MLConcentrationAnalysisRun, analysis_run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Concentration analysis run not found.")
+    if run.status != "COMPLETED":
+        raise HTTPException(status_code=409, detail="Only a completed concentration analysis can be saved.")
+    saved = db.scalar(
+        select(MLConcentrationSavedAnalysis).where(
+            MLConcentrationSavedAnalysis.depot_id == run.depot_id,
+            MLConcentrationSavedAnalysis.normalized_name == normalized_name,
+        )
+    )
+    if not saved:
+        saved = MLConcentrationSavedAnalysis(
+            id=uuid.uuid4().hex,
+            name=cleaned_name,
+            normalized_name=normalized_name,
+            depot_id=run.depot_id,
+            analysis_run_id=analysis_run_id,
+            created_by=created_by,
+        )
+    saved.name = cleaned_name
+    saved.analysis_run_id = analysis_run_id
+    saved.ui_state = ui_state or {}
+    saved.updated_at = datetime.now(timezone.utc)
+    db.add(saved)
+    db.commit()
+    db.refresh(saved)
+    depot = db.get(MasterDepot, run.depot_id)
+    result = _saved_concentration_summary(
+        saved,
+        run,
+        depot.depot_name if depot else None,
+        _saved_concentration_counts(db, [analysis_run_id]),
+    )
+    result.update({"ui_state": saved.ui_state or {}, "analysis_run": get_concentration_run(db, analysis_run_id)})
+    return result
+
+
+def get_saved_concentration_analysis(db: Session, saved_analysis_id: str) -> dict:
+    saved = db.get(MLConcentrationSavedAnalysis, saved_analysis_id)
+    if not saved:
+        raise HTTPException(status_code=404, detail="Saved concentration analysis not found.")
+    run = db.get(MLConcentrationAnalysisRun, saved.analysis_run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Source concentration analysis run not found.")
+    depot = db.get(MasterDepot, saved.depot_id)
+    result = _saved_concentration_summary(
+        saved,
+        run,
+        depot.depot_name if depot else None,
+        _saved_concentration_counts(db, [run.analysis_run_id]),
+    )
+    result.update({"ui_state": saved.ui_state or {}, "analysis_run": get_concentration_run(db, run.analysis_run_id)})
+    return result
+
+
+def delete_saved_concentration_analysis(db: Session, saved_analysis_id: str) -> dict:
+    saved = db.get(MLConcentrationSavedAnalysis, saved_analysis_id)
+    if not saved:
+        raise HTTPException(status_code=404, detail="Saved concentration analysis not found.")
+    db.delete(saved)
+    db.commit()
+    return {"status": "DELETED", "id": saved_analysis_id}

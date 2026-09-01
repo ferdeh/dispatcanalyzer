@@ -87,6 +87,17 @@ GET /api/v1/affinity-intelligence/analysis
 
 Main query parameters are `depot_id`, `start_date`, `end_date`, `product_id`, `minimum_observations`, `confidence`, `temporal_bucket`, `recent_days`, `top_n`, `selected_spbu_id`, `selected_mt_id`, and `edge_metric`.
 
+## Saved analysis configurations
+
+Phase 4 can persist and restore the applied filters, selected SPBU and MT detail, chart viewport state, and the complete analysis snapshot. Loading a saved configuration restores that immutable snapshot without rerunning the analysis. Saving the same normalized name for the same depot updates the existing record.
+
+```text
+GET    /api/v1/affinity-intelligence/saved-configurations
+POST   /api/v1/affinity-intelligence/saved-configurations
+GET    /api/v1/affinity-intelligence/saved-configurations/{config_id}
+DELETE /api/v1/affinity-intelligence/saved-configurations/{config_id}
+```
+
 ## Guardrails
 
 Phase 4 reads historical assignments. It does not create a recommended MT, optimal MT, preferred future assignment, causal explanation, or optimization result.
