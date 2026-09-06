@@ -192,7 +192,23 @@ def test_dashboard_counts_match_database() -> None:
             .filter(FactShipment.shipment_id == sample_loading_order.shipment_id)
             .scalar()
         )
+        sample_loading_order_driver_name = (
+            session.query(FactShipment.driver_name)
+            .filter(FactShipment.depot_id == depot.depot_id, FactShipment.driver_name.isnot(None))
+            .order_by(FactShipment.source_shipment_id)
+            .first()
+        )
+        sample_loading_order_end_datetime = (
+            session.query(FactShipment.shipment_end_datetime)
+            .filter(FactShipment.depot_id == depot.depot_id, FactShipment.shipment_end_datetime.isnot(None))
+            .order_by(FactShipment.source_shipment_id)
+            .first()
+        )
         sample_spbu = session.query(MasterSPBU).filter(MasterSPBU.primary_depot_id == depot.depot_id, MasterSPBU.city.isnot(None)).first()
+    sample_loading_order_driver_name = sample_loading_order_driver_name[0] if sample_loading_order_driver_name else None
+    sample_loading_order_end_datetime = sample_loading_order_end_datetime[0] if sample_loading_order_end_datetime else None
+    assert sample_loading_order_driver_name
+    assert sample_loading_order_end_datetime
     filtered = client.get(f"/api/v1/foundation/overview?depot_id={depot.depot_id}")
     assert filtered.status_code == 200
     filtered_payload = filtered.json()
@@ -418,6 +434,13 @@ def test_dashboard_counts_match_database() -> None:
     assert "validation_datetime" in lo_payload["rows"][0]
     assert "validation_date" in lo_payload["rows"][0]
     assert "validation_time" in lo_payload["rows"][0]
+    assert "driver_name" in lo_payload["rows"][0]
+    assert "driver_nip" in lo_payload["rows"][0]
+    assert "assistant_name" in lo_payload["rows"][0]
+    assert "assistant_nip" in lo_payload["rows"][0]
+    assert "shipment_end_datetime" in lo_payload["rows"][0]
+    assert "shipment_end_date" in lo_payload["rows"][0]
+    assert "shipment_end_time" in lo_payload["rows"][0]
     assert any(row["vehicle_registration"] for row in lo_payload["rows"])
     assert any(row["validation_date"] for row in lo_payload["rows"])
     assert any(row["validation_time"] for row in lo_payload["rows"])
@@ -434,6 +457,12 @@ def test_dashboard_counts_match_database() -> None:
     crud_loading_order_validation_search = client.get(f"/api/v1/master-crud/LOADING_ORDER?search={sample_loading_order_validation_datetime.date().isoformat()}&search_column=validation_date")
     assert crud_loading_order_validation_search.status_code == 200
     assert crud_loading_order_validation_search.json()["total"] > 0
+    crud_loading_order_driver_search = client.get(f"/api/v1/master-crud/LOADING_ORDER?search={quote(sample_loading_order_driver_name)}&search_column=driver_name")
+    assert crud_loading_order_driver_search.status_code == 200
+    assert crud_loading_order_driver_search.json()["total"] > 0
+    crud_loading_order_end_search = client.get(f"/api/v1/master-crud/LOADING_ORDER?search={sample_loading_order_end_datetime.date().isoformat()}&search_column=shipment_end_date")
+    assert crud_loading_order_end_search.status_code == 200
+    assert crud_loading_order_end_search.json()["total"] > 0
 
     create_product = client.post("/api/v1/master-crud/PRODUCT", json={"product_name": "TEST PRODUCT CRUD"})
     assert create_product.status_code == 200

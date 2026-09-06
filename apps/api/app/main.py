@@ -1280,6 +1280,13 @@ def serialize_crud_record(
         data["validation_datetime"] = shipment.validation_datetime if shipment else None
         data["validation_date"] = shipment.validation_datetime.date() if shipment and shipment.validation_datetime else None
         data["validation_time"] = shipment.validation_datetime.time().replace(microsecond=0) if shipment and shipment.validation_datetime else None
+        data["driver_name"] = shipment.driver_name if shipment else None
+        data["driver_nip"] = shipment.driver_nip if shipment else None
+        data["assistant_name"] = shipment.assistant_name if shipment else None
+        data["assistant_nip"] = shipment.assistant_nip if shipment else None
+        data["shipment_end_datetime"] = shipment.shipment_end_datetime if shipment else None
+        data["shipment_end_date"] = shipment.shipment_end_datetime.date() if shipment and shipment.shipment_end_datetime else None
+        data["shipment_end_time"] = shipment.shipment_end_datetime.time().replace(microsecond=0) if shipment and shipment.shipment_end_datetime else None
     if domain == "MOBIL_TANGKI":
         for tag_type in (tag_types or {}).values():
             data[tag_type_column_key(tag_type.code)] = None
@@ -1350,6 +1357,13 @@ def crud_search_columns(domain: str) -> dict[str, object]:
             "validation_datetime": FactShipment.validation_datetime,
             "validation_date": func.date(FactShipment.validation_datetime),
             "validation_time": cast(FactShipment.validation_datetime, Time),
+            "driver_name": FactShipment.driver_name,
+            "driver_nip": FactShipment.driver_nip,
+            "assistant_name": FactShipment.assistant_name,
+            "assistant_nip": FactShipment.assistant_nip,
+            "shipment_end_datetime": FactShipment.shipment_end_datetime,
+            "shipment_end_date": func.date(FactShipment.shipment_end_datetime),
+            "shipment_end_time": cast(FactShipment.shipment_end_datetime, Time),
             "source_spbu_code": FactLoadingOrderLine.source_spbu_code,
             "shipto": FactLoadingOrderLine.shipto,
             "source_product_name": FactLoadingOrderLine.source_product_name,
@@ -2191,6 +2205,10 @@ def build_shipment_export(db: Session, depot: MasterDepot) -> tuple[str, list[st
         "validation_datetime",
         "gate_out_datetime",
         "shipment_end_datetime",
+        "driver_name",
+        "driver_nip",
+        "assistant_name",
+        "assistant_nip",
         "status",
         "source_import_id",
     ]
@@ -2209,6 +2227,10 @@ def build_shipment_export(db: Session, depot: MasterDepot) -> tuple[str, list[st
             shipment.validation_datetime,
             shipment.gate_out_datetime,
             shipment.shipment_end_datetime,
+            shipment.driver_name,
+            shipment.driver_nip,
+            shipment.assistant_name,
+            shipment.assistant_nip,
             shipment.status,
             shipment.source_import_id,
         ]
@@ -2231,6 +2253,12 @@ def build_loading_order_export(db: Session, depot: MasterDepot) -> tuple[str, li
         "product_name",
         "source_product_name",
         "quantity",
+        "driver_name",
+        "driver_nip",
+        "assistant_name",
+        "assistant_nip",
+        "shipment_end_date",
+        "shipment_end_time",
         "status",
         "source_distance_km",
         "actual_km",
@@ -2265,6 +2293,12 @@ def build_loading_order_export(db: Session, depot: MasterDepot) -> tuple[str, li
                 product.product_name if product else "",
                 line.source_product_name,
                 line.quantity,
+                shipment.driver_name,
+                shipment.driver_nip,
+                shipment.assistant_name,
+                shipment.assistant_nip,
+                shipment.shipment_end_datetime.date() if shipment.shipment_end_datetime else None,
+                shipment.shipment_end_datetime.time().replace(microsecond=0) if shipment.shipment_end_datetime else None,
                 line.status,
                 line.source_distance_km,
                 line.actual_km,

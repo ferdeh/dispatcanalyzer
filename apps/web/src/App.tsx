@@ -647,7 +647,25 @@ function crudConfigs(depots: Depot[], tagTypes: TagType[]): Record<string, CrudD
       titleKey: "loading_order_number",
       depotFilter: true,
       statusFilter: false,
-      columns: ["loading_order_number", "source_depot_name", "shipment_id", "vehicle_registration", "validation_date", "validation_time", "source_spbu_code", "shipto", "source_product_name", "quantity", "status"],
+      columns: [
+        "loading_order_number",
+        "source_depot_name",
+        "shipment_id",
+        "vehicle_registration",
+        "driver_name",
+        "driver_nip",
+        "assistant_name",
+        "assistant_nip",
+        "validation_date",
+        "validation_time",
+        "shipment_end_date",
+        "shipment_end_time",
+        "source_spbu_code",
+        "shipto",
+        "source_product_name",
+        "quantity",
+        "status"
+      ],
       fields: [
         { key: "loading_order_number", label: "Loading Order Number", required: true, readonlyOnEdit: true },
         { key: "source_depot_name", label: "Depot Name (TBBM)", required: true, readonlyOnEdit: true },
@@ -719,6 +737,12 @@ function crudColumnLabel(column: string): string {
   const labels: Record<string, string> = {
     validation_date: "Tanggal Validasi",
     validation_time: "Jam Validasi",
+    driver_name: "Nama Driver",
+    driver_nip: "NIP Driver",
+    assistant_name: "Nama Kernet",
+    assistant_nip: "NIP Kernet",
+    shipment_end_date: "Tanggal Endshipment",
+    shipment_end_time: "Waktu Endshipment",
     vehicle_registration: "Vehicle Registration"
   };
   return labels[column] ?? column.replace(/_/g, " ");
@@ -728,6 +752,8 @@ function formatCrudValue(value: unknown, column?: string): string {
   if (value === null || value === undefined || value === "") return "-";
   if (column === "validation_date") return formatCrudDate(String(value));
   if (column === "validation_time") return formatCrudTime(String(value));
+  if (column === "shipment_end_date") return formatCrudDate(String(value));
+  if (column === "shipment_end_time") return formatCrudTime(String(value));
   if (column?.endsWith("_datetime")) return formatImportDateTime(String(value));
   if (typeof value === "boolean") return value ? "Yes" : "No";
   if (typeof value === "number") return value.toLocaleString();

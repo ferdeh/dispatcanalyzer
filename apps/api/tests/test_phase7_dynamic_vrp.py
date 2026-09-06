@@ -84,6 +84,13 @@ def parameters(**overrides) -> dict:
     })
 
 
+def test_mt_turnaround_buffer_is_a_validated_profile_parameter() -> None:
+    assert effective_parameters({})["mt_turnaround_buffer_minutes"] == 30
+    assert effective_parameters({"mt_turnaround_buffer_minutes": 0})["mt_turnaround_buffer_minutes"] == 0
+    with pytest.raises(ValueError, match="mt_turnaround_buffer_minutes"):
+        effective_parameters({"mt_turnaround_buffer_minutes": -1})
+
+
 def constraint_override(constraint_id: str, *, enabled: bool = True, mode: str = "SOFT", penalty: float = 123_456) -> dict:
     return {"constraint_rules": {constraint_id: {"enabled": enabled, "mode": mode, "penalty": penalty}}}
 
@@ -703,10 +710,12 @@ def test_c_multi_trip_assigns_same_mt_again_after_return() -> None:
         time_matrix=[[0, 1_200, 1_500], [1_200, 0, 600], [1_500, 600, 0]],
         day_start=DAY_START,
         depot_close=DAY_START + timedelta(hours=18),
-        parameters=parameters(),
+        parameters=parameters(mt_turnaround_buffer_minutes=25),
     )
     assert [trip["trip_number"] for trip in result["trips"]] == [1, 2]
-    assert result["trips"][1]["vehicle_ready_at_depot"] >= result["trips"][0]["estimated_return_depot"]
+    assert result["trips"][1]["vehicle_ready_at_depot"] == (
+        result["trips"][0]["estimated_return_depot"] + timedelta(minutes=25)
+    )
 
 
 def test_d_vehicle_availability_prevents_early_departure() -> None:
@@ -1168,13 +1177,13 @@ def test_fifo_balanced_propagates_actual_return_before_same_mt_next_trip() -> No
         loading_durations={"P1": 10},
         day_start=DAY_START,
         depot_close=DAY_START + timedelta(hours=18),
-        parameters=parameters(gate_process_time=5),
+        parameters=parameters(gate_process_time=5, mt_turnaround_buffer_minutes=20),
     )
 
     first, second = result["assignments"]
     assert first["gate_out"] == DAY_START + timedelta(minutes=15)
-    assert second["vehicle_ready_at_depot"] == DAY_START + timedelta(minutes=75)
-    assert second["loading_start"] == DAY_START + timedelta(minutes=75)
+    assert second["vehicle_ready_at_depot"] == DAY_START + timedelta(minutes=95)
+    assert second["loading_start"] == DAY_START + timedelta(minutes=95)
 
 
 def test_cp_sat_bay_scheduler_remains_available_as_explicit_strategy() -> None:

@@ -172,7 +172,13 @@ The registry covers MT–SPBU compatibility, vehicle/compartment capacity, produ
 
 For each FIFO event, the scheduler enumerates the active bays, applies HARD product and bay-change eligibility, calculates loading duration, then rejects candidates whose gate-out exceeds a HARD bay/depot window. The selected candidate uses this ordering: lowest SOFT penalty, earliest gate-out, lowest projected loading workload, fewest assigned trips, least-flexible eligible bay, then stable bay ID. Therefore identical all-product bays split a simultaneous queue evenly, while product-specific bays are preserved before consuming an equally available all-product bay.
 
-The chosen bay is reserved through loading finish. Gate process follows the reservation, and its timestamp becomes the trip's actual gate-out. The same MT's next trip is not inserted into FIFO until this gate-out plus the previous calculated route duration returns it to the depot. This prevents Trip 2 from jumping ahead while Trip 1 is still loading or travelling. Complexity is approximately `O(T log T + T × B)` for `T` trips and `B` active bays; it has no bay search worker, no bay timeout, and no combinatorial symmetry across identical bays.
+The chosen bay is reserved through loading finish. Gate process follows the reservation, and its timestamp becomes the trip's actual gate-out. The same MT's next trip is not inserted into FIFO until the previous trip returns and its profile-specific turnaround preparation has elapsed:
+
+```text
+next_vehicle_ready_at_depot = estimated_return_depot + mt_turnaround_buffer_minutes
+```
+
+`estimated_return_depot` remains the physical return timestamp for the completed trip; the buffer changes only the MT's next eligibility. The default is 30 minutes, zero disables the delay, and each Parameter Profile may store a different value for scenario comparison. This prevents Trip 2 from jumping ahead while Trip 1 is still loading, travelling, or being prepared for reuse. Complexity is approximately `O(T log T + T × B)` for `T` trips and `B` active bays; it has no bay search worker, no bay timeout, and no combinatorial symmetry across identical bays.
 
 With `serve_loading_order=SOFT`, a trip that cannot obtain a valid bay is omitted and the result remains `PARTIAL` when other trips are served. With `serve_loading_order=HARD`, one blocking trip makes the bay result `INFEASIBLE`. `BAY_PRODUCT_CONSTRAINT` is reserved for no structurally eligible bay; `BAY_WINDOW_EXHAUSTED` means compatible bays exist but all valid gate-outs exceed their operational window. A later same-MT trip blocked by failure of an earlier trip is reported as `BAY_CONGESTION`.
 

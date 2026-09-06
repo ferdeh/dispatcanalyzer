@@ -121,6 +121,32 @@ def test_loading_order_number_can_repeat_across_depots(db_session, tmp_path) -> 
     assert {line.source_depot_name for line in lines} == {"DEPOT A", "DEPOT B"}
 
 
+def test_loading_order_import_stores_personnel_on_shipment(db_session, tmp_path) -> None:
+    csv_path = tmp_path / "lo_shipment_personnel.csv"
+    csv_path.write_text(
+        "\n".join(
+            [
+                "shipment_id,loading_order_number,tbbm,kode_depot,nopol,nama_spbu,produk,quantity,status,supir,nip_supir,kernet,nip_kernet,date_end_shipment,jam_end_shipment",
+                "SHP-PERSONNEL,LO-PERSONNEL-1,DEPOT A,DA,B1234AA,SPBU-A,PERTALITE,8,Terkirim,Driver A,DRV001,Kernet A,KRN001,2026-08-13,05:16:41",
+                "SHP-PERSONNEL,LO-PERSONNEL-2,DEPOT A,DA,B1234AA,SPBU-B,BIOSOLAR B50,8,Terkirim,Driver A,DRV001,Kernet A,KRN001,2026-08-13,05:16:41",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    processor = ImportProcessor(db_session)
+    processor.import_loading_order(csv_path)
+
+    shipment = db_session.get(FactShipment, "SHP-PERSONNEL")
+    assert shipment is not None
+    assert shipment.driver_name == "Driver A"
+    assert shipment.driver_nip == "DRV001"
+    assert shipment.assistant_name == "Kernet A"
+    assert shipment.assistant_nip == "KRN001"
+    assert shipment.shipment_end_datetime.date().isoformat() == "2026-08-13"
+    assert shipment.shipment_end_datetime.time().replace(microsecond=0).isoformat() == "05:16:41"
+
+
 def test_product_names_with_commas_are_single_products(db_session) -> None:
     processor = ImportProcessor(db_session)
     processor.import_master_mt(EXAMPLE_DIR / "master data MT.xlsx")

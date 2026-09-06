@@ -601,6 +601,9 @@ class VRPOptimizationService:
         objective_value = 0.0
         depot_close_minutes = _minutes_between(day_start, depot_close)
         max_trips = int(parameters.get("maximum_trips_per_mt", 6))
+        turnaround_buffer = timedelta(
+            minutes=max(0, int(parameters.get("mt_turnaround_buffer_minutes", 30)))
+        )
 
         for trip_round in range(1, max_trips + 1):
             if not remaining:
@@ -773,8 +776,9 @@ class VRPOptimizationService:
                 trips.append(trip)
                 accepted_ids.update(str(lo["loading_order_id"]) for lo in route_los)
                 state = vehicle_state[vehicle["mt_id"]]
-                state["effective_eta_depot"] = preliminary_return
-                state["availability_eta_depot"] = preliminary_return
+                next_vehicle_ready_at_depot = preliminary_return + turnaround_buffer
+                state["effective_eta_depot"] = next_vehicle_ready_at_depot
+                state["availability_eta_depot"] = next_vehicle_ready_at_depot
                 state["completed_trip_count"] = trip_number
                 state["working_time_used_minutes"] = int(state.get("working_time_used_minutes") or 0) + operating_minutes
                 state["working_time_remaining_minutes"] = int(state.get("working_time_remaining_minutes") or 0) - operating_minutes
@@ -905,6 +909,9 @@ class BayQueueOptimizationService:
     ) -> dict:
         """Assign ready MT trips FIFO to the earliest compatible balanced bay."""
         schedule_started = perf_counter()
+        turnaround_buffer = timedelta(
+            minutes=max(0, int(parameters.get("mt_turnaround_buffer_minutes", 30)))
+        )
         if not trips:
             return {
                 "solver_status": "FEASIBLE",
@@ -1180,7 +1187,10 @@ class BayQueueOptimizationService:
             trip_position_by_vehicle[vehicle_id] = next_position
             if next_position < len(indexes):
                 next_index = indexes[next_position]
-                next_ready = max(_utc(trips[next_index]["vehicle_ready_at_depot"]), actual_return)
+                next_ready = max(
+                    _utc(trips[next_index]["vehicle_ready_at_depot"]),
+                    actual_return + turnaround_buffer,
+                )
                 push_trip(next_index, next_ready)
 
         dropped = sorted(set(dropped))
@@ -1634,6 +1644,9 @@ class OptimizationCoordinatorService:
             "engine": str(parameters.get("bay_scheduler_strategy") or "FIFO_BALANCED"),
         }
         scheduler_strategy = str(parameters.get("bay_scheduler_strategy") or "FIFO_BALANCED").upper()
+        turnaround_buffer = timedelta(
+            minutes=max(0, int(parameters.get("mt_turnaround_buffer_minutes", 30)))
+        )
         # FIFO_BALANCED propagates the actual return of each physical MT to its
         # next trip inside one event-driven pass. CP-SAT retains the legacy
         # iterative route/bay coordination behavior.
@@ -1653,7 +1666,9 @@ class OptimizationCoordinatorService:
                         _utc(trip["vehicle_ready_at_depot"]),
                         last_return[trip["vehicle_id"]],
                     )
-                last_return[trip["vehicle_id"]] = _utc(trip["estimated_return_depot"])
+                last_return[trip["vehicle_id"]] = (
+                    _utc(trip["estimated_return_depot"]) + turnaround_buffer
+                )
             result = self.bay.schedule(
                 trips=trips,
                 bays=bays,

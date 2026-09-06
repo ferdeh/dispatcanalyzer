@@ -20,7 +20,6 @@ from .models import (
     ImportAudit,
     MasterDepot,
     MasterMT,
-    MasterPersonnel,
     MasterProduct,
     MasterSPBU,
     MasterTag,
@@ -339,16 +338,6 @@ class ImportProcessor:
         self.db.merge(ProductAlias(product_alias_id=make_id("productalias", normalized, "LO"), product_id=product_id, alias_value=product_name, normalized_alias=normalized, source_system="LO"))
         return self.db.get(MasterProduct, product_id) or MasterProduct(product_id=product_id, product_name=product_name, normalized_product=normalized)
 
-    def resolve_personnel(self, parent_id: Any, name: Any, nip: Any, role: str, source_import_id: str) -> str | None:
-        parent = clean_str(parent_id)
-        person_name = clean_str(name)
-        if not parent and not person_name:
-            return None
-        personnel_id = make_id("person", role, parent or person_name)
-        self.db.merge(MasterPersonnel(personnel_id=personnel_id, source_parent_id=parent, name=person_name, nip=clean_str(nip), role=role, source_import_id=source_import_id))
-        self.db.flush()
-        return personnel_id
-
     def import_loading_order(self, path: Path, sheet_name: str = "Data Medan Mei", filename: str | None = None) -> str:
         actual_sheet_name = resolve_sheet_name(path, sheet_name, ("Data Medan Mei", "Loading Orders", "LOADING_ORDER"))
         audit = self.create_import("LOADING_ORDER", path, actual_sheet_name, filename=filename)
@@ -381,12 +370,30 @@ class ImportProcessor:
             validation_dt = combine_datetime(first.get("date_validasi"), first.get("Jam Validasi"))
             gate_out_dt = combine_datetime(first.get("date_gate_out"), first.get("Jam_gateout"))
             end_dt = combine_datetime(first.get("date_end_shipment"), first.get("jam_end_shipment"))
+            driver_name = clean_str(first.get("supir"))
+            driver_nip = clean_str(first.get("nip_supir"))
+            assistant_name = clean_str(first.get("kernet"))
+            assistant_nip = clean_str(first.get("nip_kernet"))
             if gate_out_dt and end_dt and end_dt < gate_out_dt:
                 messages.append("shipment_end before gate_out")
             if validation_dt and gate_out_dt and gate_out_dt < validation_dt:
                 messages.append("gate_out before validation")
-            driver_id = self.resolve_personnel(first.get("supir_parent_id"), first.get("supir"), first.get("nip_supir"), "DRIVER", audit.import_id)
-            assistant_id = self.resolve_personnel(first.get("kernet_parent_id"), first.get("kernet"), first.get("nip_kernet"), "ASSISTANT", audit.import_id)
+            for key, label in (
+                ("supir", "driver name"),
+                ("nip_supir", "driver NIP"),
+                ("kernet", "assistant name"),
+                ("nip_kernet", "assistant NIP"),
+            ):
+                values = {clean_str(item["row"].get(key)) for item in grouped if clean_str(item["row"].get(key))}
+                if len(values) > 1:
+                    messages.append(f"shipment contains multiple {label} values")
+            end_values = {
+                value
+                for value in (combine_datetime(item["row"].get("date_end_shipment"), item["row"].get("jam_end_shipment")) for item in grouped)
+                if value
+            }
+            if len(end_values) > 1:
+                messages.append("shipment contains multiple endshipment values")
             shipment_pk = source_shipment_id
             self.db.merge(
                 FactShipment(
@@ -404,8 +411,10 @@ class ImportProcessor:
                     validation_datetime=validation_dt,
                     gate_out_datetime=gate_out_dt,
                     shipment_end_datetime=end_dt,
-                    driver_id=driver_id,
-                    assistant_id=assistant_id,
+                    driver_name=driver_name,
+                    driver_nip=driver_nip,
+                    assistant_name=assistant_name,
+                    assistant_nip=assistant_nip,
                     status=clean_str(first.get("status")),
                     source_import_id=audit.import_id,
                 )
