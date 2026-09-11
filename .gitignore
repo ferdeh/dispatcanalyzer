@@ -10,4 +10,6 @@ dist/
 .vite/
 coverage/
 ml_artifacts/
+import_uploads/
+outputs/
 example data/~$*.xlsx

@@ -8,6 +8,7 @@ import {
   GitBranch,
   LayoutDashboard,
   MapPinned,
+  PlugZap,
   PanelLeftOpen,
   Route,
   ShieldCheck,
@@ -30,6 +31,7 @@ export type AppPage =
   | "phase7-optimization"
   | "manual-dispatch"
   | "route-model-alignment"
+  | "amt-scheduler-connector"
   | "google-maps-integration"
   | "documentation";
 
@@ -78,6 +80,12 @@ const navGroups: NavGroup[] = [
     label: "Evaluation",
     items: [
       { page: "route-model-alignment", label: "Route–Model Alignment", icon: GitBranch, phase: 9 },
+    ],
+  },
+  {
+    label: "Integration",
+    items: [
+      { page: "amt-scheduler-connector", label: "AMT Scheduler Connector", icon: PlugZap, phase: 10 },
     ],
   },
   {

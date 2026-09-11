@@ -1,6 +1,7 @@
+import hashlib
 from datetime import date, time
 
-from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, Time, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, Time, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.sql import func
 
@@ -26,6 +27,13 @@ class ImportAudit(Base):
     status: Mapped[str] = mapped_column(String(40), default="STAGED")
     published_at = mapped_column(DateTime(timezone=True), nullable=True)
     mapping_version: Mapped[str] = mapped_column(String(40), default="phase0.v1")
+    stored_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    file_size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    processed_rows: Mapped[int] = mapped_column(Integer, default=0)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at = mapped_column(DateTime(timezone=True), nullable=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class StagingMixin:
@@ -120,6 +128,7 @@ class TagAlias(Base):
 
 class MasterMT(Base):
     __tablename__ = "master_mt"
+    __table_args__ = (UniqueConstraint("depot_id", "vehicle_registration", name="uq_master_mt_depot_registration"),)
 
     mt_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     source_mt_id: Mapped[str | None] = mapped_column(String(120))
@@ -157,9 +166,10 @@ class BridgeMTTag(Base):
 
 class MasterSPBU(Base):
     __tablename__ = "master_spbu"
+    __table_args__ = (UniqueConstraint("primary_depot_id", "spbu_code", name="uq_master_spbu_depot_code"),)
 
     spbu_id: Mapped[str] = mapped_column(String(64), primary_key=True)
-    spbu_code: Mapped[str] = mapped_column(String(120), unique=True)
+    spbu_code: Mapped[str] = mapped_column(String(120))
     spbu_name: Mapped[str | None] = mapped_column(String(255))
     address: Mapped[str | None] = mapped_column(Text)
     city: Mapped[str | None] = mapped_column(String(120))
@@ -344,11 +354,22 @@ class FactShipment(Base):
     created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+def _default_loading_order_id(context) -> str:
+    values = context.get_current_parameters()
+    depot_identity = values.get("depot_id") or values.get("source_depot_name") or "UNKNOWN_DEPOT"
+    loading_order_number = values.get("loading_order_number") or "UNKNOWN_LO"
+    digest = hashlib.sha1(f"{depot_identity}|{loading_order_number}".encode("utf-8")).hexdigest()[:24]
+    return f"lo_{digest}"
+
+
 class FactLoadingOrderLine(Base):
     __tablename__ = "fact_loading_order_line"
+    __table_args__ = (UniqueConstraint("depot_id", "loading_order_number", name="uq_loading_order_depot_number"),)
 
-    loading_order_number: Mapped[str] = mapped_column(String(120), primary_key=True)
-    source_depot_name: Mapped[str] = mapped_column(String(255), primary_key=True)
+    loading_order_id: Mapped[str] = mapped_column(String(64), primary_key=True, default=_default_loading_order_id)
+    loading_order_number: Mapped[str] = mapped_column(String(120), index=True)
+    depot_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("master_depot.depot_id"), index=True)
+    source_depot_name: Mapped[str] = mapped_column(String(255))
     shipment_id: Mapped[str] = mapped_column(String(120), ForeignKey("fact_shipment.shipment_id"))
     spbu_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("master_spbu.spbu_id"))
     spbu_mapping_status: Mapped[str] = mapped_column(String(40), default="UNMATCHED")
@@ -1947,3 +1968,66 @@ class ManualDispatchAuditLog(Base):
     metadata_json: Mapped[dict] = mapped_column(JSON, default=dict)
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+
+# Phase 10 owns integration credentials, logical synchronization versions, and
+# an audit trail only. Operational/master records remain owned by their
+# canonical Phase 0/7/8 tables and are exposed through read adapters.
+class IntegrationClient(Base):
+    __tablename__ = "integration_client"
+    __table_args__ = (
+        UniqueConstraint("integration_name", "client_code", name="uq_integration_client_name_code"),
+        Index("ix_integration_client_active", "integration_name", "active"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    integration_name: Mapped[str] = mapped_column(String(80), index=True)
+    client_name: Mapped[str] = mapped_column(String(160))
+    client_code: Mapped[str] = mapped_column(String(80), index=True)
+    token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    token_hint: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    permissions: Mapped[list] = mapped_column(JSON, default=lambda: ["read"])
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    token_created_at = mapped_column(DateTime(timezone=True), nullable=True)
+    last_used_at = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by: Mapped[str] = mapped_column(String(120), default="local-user")
+
+
+class IntegrationDatasetVersion(Base):
+    __tablename__ = "integration_dataset_version"
+    __table_args__ = (
+        UniqueConstraint("integration_name", "dataset_name", name="uq_integration_dataset_name"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    integration_name: Mapped[str] = mapped_column(String(80), index=True)
+    dataset_name: Mapped[str] = mapped_column(String(80), index=True)
+    data_version: Mapped[str] = mapped_column(String(80))
+    last_updated_at = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class IntegrationAPILog(Base):
+    __tablename__ = "integration_api_log"
+    __table_args__ = (
+        Index("ix_integration_api_log_requested", "integration_name", "requested_at"),
+        Index("ix_integration_api_log_status", "integration_name", "response_status"),
+        Index("ix_integration_api_log_client_requested", "client_id", "requested_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    request_id: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    integration_name: Mapped[str] = mapped_column(String(80), index=True)
+    client_id: Mapped[str | None] = mapped_column(String(64), ForeignKey("integration_client.id"), nullable=True, index=True)
+    http_method: Mapped[str] = mapped_column(String(12))
+    endpoint: Mapped[str] = mapped_column(String(500), index=True)
+    query_params: Mapped[dict] = mapped_column(JSON, default=dict)
+    requested_at = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    response_status: Mapped[int] = mapped_column(Integer, index=True)
+    response_time_ms: Mapped[int] = mapped_column(Integer, default=0)
+    record_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ip_address: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)

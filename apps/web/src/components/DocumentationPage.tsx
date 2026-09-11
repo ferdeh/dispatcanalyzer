@@ -47,8 +47,8 @@ const guides: GuidePage[] = [
         id: "doc-tujuan",
         title: "Tujuan dan batas aplikasi",
         paragraphs: [
-          "Dispatch Intelligence Platform mengubah Master Data, Loading Order, GPS, dan histori dispatch menjadi informasi operasional yang dapat diaudit. Phase 0–5 terutama menjelaskan pola historis; Phase 6 menghasilkan prediction/assignment; Phase 7 menghasilkan route plan multi-trip; Phase 8 memberi workspace adjustment manual, simulation, audit, dan final dispatch; Phase 9 mengevaluasi keselarasan route terhadap historical evidence secara deskriptif.",
-          "Phase 7 memakai prediction Phase 6 sebagai warm start dan soft preference. Phase 8 menyalin source Phase 6/7 menjadi snapshot terpisah dan tidak menjalankan global reoptimization. Phase 9 membentuk Source-Aligned Bundle otomatis dan tidak menilai route baik atau buruk. Probability, affinity, consistency, atau confidence yang tinggi tetap bukan izin melewati master compatibility.",
+          "Dispatch Intelligence Platform mengubah Master Data, Loading Order, GPS, dan histori dispatch menjadi informasi operasional yang dapat diaudit. Phase 0–5 terutama menjelaskan pola historis; Phase 6 menghasilkan prediction/assignment; Phase 7 menghasilkan route plan multi-trip; Phase 8 memberi workspace adjustment manual, simulation, audit, dan final dispatch; Phase 9 mengevaluasi keselarasan route; Phase 10 menyediakan interface read-only bagi AMT Scheduler.",
+          "Phase 7 memakai prediction Phase 6 sebagai warm start dan soft preference. Phase 8 menyalin source Phase 6/7 menjadi snapshot terpisah. Phase 9 membentuk Source-Aligned Bundle otomatis. Phase 10 hanya mengekspos canonical data dan route-specific MT availability—tidak membuat roster, pairing crew, assignment AMT–MT, atau rekomendasi waktu kedatangan AMT.",
         ],
         note: "Selalu baca depot, periode, unit analitik, kualitas data, dan evidence count sebelum memakai hasil.",
       },
@@ -64,6 +64,7 @@ const guides: GuidePage[] = [
           { title: "Kendalikan operasi di Phase 7", text: "Buat Job per depot/tanggal, load Prediction Run tersimpan, masukkan actual MT/bay/queue, optimalkan V1, lalu reroute ke versi baru saat kondisi berubah." },
           { title: "Finalkan dispatch di Phase 8", text: "Pilih source route, sesuaikan MT–Trip–LO, Apply per trip, periksa simulation/dashboard, selesaikan hard error, lalu Finalize." },
           { title: "Evaluasi alignment di Phase 9", text: "Pilih TBBM dan Route Version, jalankan Evaluate Alignment, lalu baca empat metric beserta evidence coverage dan Source-Aligned Bundle tanpa menjadikannya quality score." },
+          { title: "Hubungkan AMT Scheduler di Phase 10", text: "Generate bearer token, pilih terminal/tanggal/route, uji endpoint canonical, lalu gunakan availability-after atau shift-availability sebagai input read-only bagi sistem eksternal." },
         ],
       },
       {
@@ -690,8 +691,56 @@ const guides: GuidePage[] = [
     ],
   },
   {
-    id: "doc-maps",
+    id: "doc-phase10",
     number: "13",
+    title: "Phase 10 · AMT Scheduler Connector",
+    description: "Console internal dan REST API read-only untuk integrasi AMT Scheduler.",
+    page: "amt-scheduler-connector",
+    topics: [
+      {
+        id: "doc-phase10-boundary",
+        title: "Boundary, keamanan, dan workflow",
+        steps: [
+          { title: "Buka API Access", text: "Generate atau rotate token. Full token hanya tampil pada response awal; backend menyimpan SHA-256 hash dan hint." },
+          { title: "Periksa metadata", text: "AMT Scheduler dapat membaca dataset version dan last update sebelum melakukan pull atau incremental sync." },
+          { title: "Pilih source route", text: "GET /routes mengembalikan semua versi Phase 7 dan Phase 8 untuk operation date, bukan hanya current/latest route." },
+          { title: "Ambil timeline", text: "GET /routes/{route_id} mengelompokkan MT, trip, LO, SPBU, departure, dan return dalam kontrak canonical." },
+          { title: "Hitung availability", text: "Panggil shift-availability atau availability-after pada route terpilih. Gunakan next_available_at dan next_departure_at sebagai data input AMT Scheduler." },
+          { title: "Audit request", text: "API Logs menampilkan request ID, client, endpoint, status, duration, record count, dan error tanpa token." },
+        ],
+        note: "Phase 10 berhenti pada vehicle timeline dan availability. Roster, AMT1/AMT2, fatigue, AMT–MT optimization, handover sufficiency, dan recommended AMT arrival tetap di luar Dispatcher Optimizer.",
+      },
+      {
+        id: "doc-phase10-semantics",
+        title: "Availability semantics",
+        cards: [
+          { name: "AVAILABLE", meaning: "Tidak ada trip aktif pada reference time dan initial availability sudah tercapai.", reading: "next_available_at sama dengan reference time; baca next departure untuk window informasional." },
+          { name: "ON_TRIP", meaning: "departure_at ≤ reference time < return_to_depot_at.", reading: "next_available_at adalah return active trip. Exact departure ON_TRIP; exact return AVAILABLE." },
+          { name: "UNAVAILABLE", meaning: "Initial authoritative availability berada setelah reference time.", reading: "next_available_at berasal dari initial route snapshot, bukan timestamp buatan." },
+          { name: "UNKNOWN", meaning: "Initial availability atau timeline departure/return tidak lengkap/invalid.", reading: "Jangan memperlakukan UNKNOWN sebagai AVAILABLE." },
+          { name: "Handover Window", meaning: "Menit antara next_available_at dan next_departure_at.", reading: "Informasional saja; Phase 10 tidak memutuskan apakah window cukup." },
+          { name: "Route Scope", meaning: "Availability selalu dihitung dari selected P7:/P8: route ID.", reading: "MT yang sama boleh mempunyai return/availability berbeda pada route berbeda." },
+        ],
+        formulas: [
+          "ON_TRIP jika departure_at <= reference_at < return_to_depot_at\nAVAILABLE pada exact return boundary\nON_TRIP pada exact departure boundary",
+          "handover_window_minutes = next_departure_at - next_available_at",
+        ],
+      },
+      {
+        id: "doc-phase10-console",
+        title: "Empat tab console",
+        cards: [
+          { name: "Overview", meaning: "Status connector, base URL, dataset versions, request KPI, dan Test Connector.", reading: "CREDENTIAL REQUIRED berarti client ada tetapi token belum dihasilkan." },
+          { name: "API Access", meaning: "Client metadata, masked token, one-time token display/copy, header example, dan rotate.", reading: "Rotation langsung menonaktifkan token lama." },
+          { name: "Endpoints", meaning: "Dokumentasi, parameter, Copy cURL, Try API, HTTP status, response time, request ID, record count, dan JSON.", reading: "Jalankan GET /routes dahulu untuk mengisi route picker." },
+          { name: "API Logs", meaning: "Traffic eksternal yang sudah disanitasi dengan filter status/endpoint dan row detail.", reading: "Console traffic tidak dihitung sebagai request AMT Scheduler." },
+        ],
+      },
+    ],
+  },
+  {
+    id: "doc-maps",
+    number: "14",
     title: "Google Maps Integration",
     description: "API key dan parameter route estimation Phase 6.",
     page: "google-maps-integration",
@@ -732,7 +781,7 @@ const guides: GuidePage[] = [
   },
   {
     id: "doc-glosarium",
-    number: "14",
+    number: "15",
     title: "Glosarium dan Guardrail",
     description: "Istilah penting agar hasil tidak salah ditafsirkan.",
     topics: [
@@ -751,6 +800,7 @@ const guides: GuidePage[] = [
           { name: "Fallback", meaning: "Estimasi alternatif saat sumber utama gagal.", reading: "Baca warning dan source." },
           { name: "Phase 6 / 7 Boundary", meaning: "Phase 6 membuat preliminary prediction; Phase 7 membuat final versioned operational plan.", reading: "Phase 7 tidak mengubah source prediction dan tidak menjalankan GMPRO." },
           { name: "Phase 9 Alignment", meaning: "Kesamaan terhadap historical pattern pada exact source lineage.", reading: "Bukan route quality, operational feasibility, performance, atau recommendation." },
+          { name: "Phase 10 Availability", meaning: "Keadaan MT pada timestamp dalam satu selected route.", reading: "Bukan global MT state, crew schedule, atau recommended AMT arrival." },
         ],
       },
     ],

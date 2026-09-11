@@ -20,7 +20,20 @@ Phase 8: manual dispatch adjustment, per-trip constraint validation and route re
 
 Phase 9: neutral Route–Model Alignment Evaluation against source-aligned cluster, shift, SPBU pairing, and MT affinity evidence.
 
-The repository includes read-only Phase 2–4 intelligence, persisted Phase 5 ML workflows, Phase 6 inference/assignment/availability estimation, Phase 7 OR-Tools optimization/control, Phase 8 human-in-the-loop dispatch finalization, and Phase 9 descriptive alignment evaluation. Phase 6 may estimate a preliminary small-stop sequence for cycle time; Phase 7 owns fleet-wide route optimization and depot bay scheduling; Phase 8 owns manual adjustment, per-trip recalculation, simulation, audit, and the finalized dispatch version; Phase 9 never changes those sources.
+Phase 10: secure, versioned, observable, read-only AMT Scheduler integration API for canonical terminal/MT/history/route/shift data and selected-route MT availability.
+
+The repository includes read-only Phase 2–4 intelligence, persisted Phase 5 ML workflows, Phase 6 inference/assignment/availability estimation, Phase 7 OR-Tools optimization/control, Phase 8 human-in-the-loop dispatch finalization, Phase 9 descriptive alignment evaluation, and Phase 10 AMT Scheduler connector. Phase 10 adapts existing source records without changing route behavior and stops before any AMT scheduling/roster/crew-assignment logic.
+
+## Phase 10
+
+- API prefix: `/api/v1/integration/amt-scheduler`
+- UI: `/phase10/amt-scheduler-connector`
+- Direction: AMT Scheduler pulls JSON with authenticated GET requests
+- Source adapters: Phase 7 immutable Route Version and Phase 8 versioned Manual Dispatch snapshot
+- Availability: always scoped by selected canonical `P7:`/`P8:` route ID
+- Security: bearer token hash at rest, RBAC console, request ID, sanitized request log, per-client rate guardrail
+- Boundary: no AMT/driver/helper master ownership, roster, pairing, AMT–MT optimization, handover decision, or arrival recommendation
+- Detail: `docs/PHASE_10_AMT_SCHEDULER_CONNECTOR.md`
 
 ## Phase 2
 

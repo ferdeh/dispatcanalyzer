@@ -452,11 +452,10 @@ Operational Shift Intelligence tetap berbasis perilaku historis. Output ini tida
 
 Catatan scope: fondasi Phase 0 tetap menjadi dasar data utama dan Phase 2 tetap read-only historical intelligence. Prediction/availability Phase 6 dan dynamic route/bay optimization Phase 7 sudah tersedia sebagai modul terpisah; GPS-confirmed arrival/visit dan actual stop reconstruction tetap menunggu evidence GPS yang tervalidasi.
 
-Load sample data:
-
-```bash
-curl -X POST http://localhost:8000/api/v1/imports/sample
-```
+Import workflow: create the depot manually in Master Data first. The system
+generates its immutable `depot_id`; copy that ID into every MT, SPBU, and
+Loading Order import row. Missing, deleted, or unknown depot IDs fail the whole
+import before canonical records are written.
 
 ## Local Tests
 
@@ -543,7 +542,8 @@ Progress yang sudah dibuat:
   - `master data MT.xlsx`: 162 rows
   - `master data spbu.xlsx`: 583 rows
   - `masterdata_LO.xlsx`: 4,462 rows, 1,876 grouped shipments
-- Upload import file lokal `.xlsx` atau `.csv`.
+- Upload import file lokal `.xlsx` atau `.csv`. Template MT, SPBU, dan LO mewajibkan `depot_id` yang sudah ada pada Master Depot.
+- Upload disimpan sebagai durable background job (`QUEUED` → `PROCESSING` → `PUBLISHED`/`FAILED`) agar file besar tidak menahan request API. Status import tetap dipantau setelah browser di-refresh dan tabel UI otomatis dimuat ulang ketika job selesai.
 - Export template.
 - Export data per depot.
 - Import audit dan import history.
@@ -555,7 +555,7 @@ Progress yang sudah dibuat:
 - Tag splitting, tag master, tag type, MT tag bridge, SPBU tag bridge.
 - Tag Vehicle Class pada MT/SPBU disimpan sebagai integer dan ditampilkan sebagai kolom `TAG VEHICLE CLASS`.
 - Loading Order grouping menjadi shipment header dan loading-order lines.
-- Kombinasi `loading_order_number` + nama depot `tbbm`/`source_depot_name` menjadi primary key canonical untuk `fact_loading_order_line`; `loading_order_number` boleh sama di depot berbeda, sedangkan source `shipment_id` boleh duplikat karena satu shipment bisa multi loading order, multi SPBU, dan multi kompartemen dalam MT yang sama.
+- ID canonical depot-scoped dibentuk dari `depot_id + vehicle_registration` untuk MT, `depot_id + spbu_code` untuk SPBU, dan `depot_id + loading_order_number` untuk LO. Nomor/kode yang sama boleh digunakan di depot berbeda tetapi tidak boleh duplikat di depot yang sama.
 - Shipment-SPBU membership.
 - Driver/kernet preservation.
 - Mapping status untuk MT/SPBU masih bersifat internal import diagnostic dan tidak ditampilkan sebagai analisa relasi pada CRUD Phase 0.
@@ -1050,7 +1050,6 @@ Setiap phase harus melewati gate berikut sebelum phase berikutnya dimulai:
 ## Current API Highlights
 
 - `GET /api/v1/health`
-- `POST /api/v1/imports/sample`
 - `POST /api/v1/imports?domain=...&sheet_name=...`
 - `GET /api/v1/imports`
 - `GET /api/v1/imports/{id}`
@@ -1204,6 +1203,16 @@ Endpoint Phase 9:
 
 Persistence Phase 9 memakai evaluation run, one-row-per-LO alignment snapshot, dan unique trip-pair evidence. Idempotency menggunakan `route_version_id + source_bundle_checksum + algorithm_version`; perubahan source bundle atau algorithm version membuat run baru tanpa mengubah Route Version.
 
+### Phase 10 — AMT Scheduler Connector
+
+Phase 10 menyediakan REST API read-only di `/api/v1/integration/amt-scheduler` dan console internal di `/phase10/amt-scheduler-connector`. AMT Scheduler melakukan pull terhadap canonical Terminal, MT, historical operation pada grain trip, seluruh Route Version Phase 7, seluruh versi Manual Dispatch Phase 8, authoritative shift definition, dan MT availability yang selalu dihitung dari route terpilih.
+
+External endpoint menggunakan bearer token acak yang disimpan sebagai SHA-256 hash, kecuali health check. Setiap request memiliki `X-Request-ID`, canonical error envelope, database request log yang tidak menyimpan token, logical dataset version, pagination, serta incremental `updated_since` pada terminal/vehicle/history. Adapter `Phase7RouteAdapter` dan `Phase8RouteAdapter` tidak mengubah source route.
+
+Availability memakai boundary `departure_at <= reference_at < return_to_depot_at`: exact departure `ON_TRIP`, exact return `AVAILABLE`, initial availability di masa depan `UNAVAILABLE`, dan incomplete/invalid timeline `UNKNOWN`. Output hanya mencakup vehicle timeline, next availability/departure, serta informational handover window; Phase 10 tidak membuat roster, crew pairing, AMT–MT assignment, handover decision, atau recommended AMT arrival.
+
+Lihat `docs/PHASE_10_AMT_SCHEDULER_CONNECTOR.md` untuk mapping, auth/RBAC, endpoint, cURL, shift lineage, logging, dan limitation.
+
 ## Important Design Principles
 
 - Jangan overwrite master data secara diam-diam dari historical evidence.
@@ -1213,6 +1222,7 @@ Persistence Phase 9 memakai evaluation run, one-row-per-LO alignment snapshot, d
 - Phase 7 route optimization hanya boleh membaca saved Phase 6 sebagai warm start; jangan menulis balik atau menjalankan Phase 6 otomatis saat reroute.
 - Phase 8 hanya boleh menyalin Phase 6/7 sebagai working snapshot; jangan menulis balik source dan jangan menjalankan global reoptimization otomatis.
 - Phase 9 hanya menjelaskan alignment terhadap historical evidence; jangan mengubahnya menjadi route quality score, pass/fail, ranking, atau recommendation.
+- Phase 10 hanya menyediakan canonical read API dan route-scoped MT availability; jangan menambahkan AMT scheduling, roster, crew assignment, atau recommended AMT arrival.
 - Google Routes menyediakan travel data dan geometry saja; OR-Tools adalah satu-satunya optimization engine Phase 7.
 - Jangan tampilkan uncertainty sebagai fakta pasti; gunakan status seperti `UNKNOWN`, `UNMAPPED`, `AMBIGUOUS`, `LOW CONFIDENCE`, `PARTIAL`, atau `INSUFFICIENT DATA`.
 
@@ -1231,6 +1241,7 @@ Dokumen pendukung:
 - `docs/PHASE_7_DYNAMIC_VRP.md`
 - `docs/PHASE_8_MANUAL_DISPATCH.md`
 - `docs/PHASE_9_ROUTE_MODEL_ALIGNMENT.md`
+- `docs/PHASE_10_AMT_SCHEDULER_CONNECTOR.md`
 - `docs/SHIPMENT_MODEL.md`
 - `docs/GPS_MODEL.md`
 - `docs/PHASES.md`

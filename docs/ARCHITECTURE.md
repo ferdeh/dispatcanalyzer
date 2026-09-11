@@ -8,9 +8,20 @@ The repository is a monorepo:
 - `services/analytics`: idempotent analytics job entry points.
 - `example data`: source workbooks used to validate Phase 0.
 
-Phase 0 uses PostgreSQL/PostGIS as the system of record. All imports create an `import_audit` record and staging rows before canonical tables are updated. Canonical tables keep `source_import_id` so published data can be traced back to the source file and sheet.
+Phase 0 uses PostgreSQL/PostGIS as the system of record. Uploaded files are streamed to a persistent volume and recorded as durable `QUEUED` jobs in `import_audit`. The separate `import-worker` claims and processes jobs, writes staging rows, and then updates canonical tables in one transaction. A worker restart requeues interrupted jobs, while a browser refresh only reconnects UI polling to the same import ID. Canonical tables keep `source_import_id` so published data can be traced back to the source file and sheet.
+
+Master import identity is depot-scoped: MT uses `depot_id + vehicle_registration`, SPBU uses `depot_id + spbu_code`, and Loading Order uses `depot_id + loading_order_number`. `depot_id` is mandatory in all three v2 import templates and must reference an active `master_depot` row.
 
 The backend API is versioned under `/api/v1`. Later phases should add derived fact tables and endpoints without changing Phase 0 canonical identifiers.
+
+Phase 10 adds a canonical integration boundary inside the modular monolith. External AMT Scheduler traffic is GET-only under `/api/v1/integration/amt-scheduler`; `Phase7RouteAdapter` and `Phase8RouteAdapter` translate existing versioned route models without exposing raw table schemas. Bearer credentials are random and hash-only at rest, request correlation/logging is scoped to the connector, list queries remain database-filtered/paginated, and availability is calculated only against the selected route timeline. The internal console uses the application's replaceable RBAC seam and is not an AMT scheduling application.
+
+```text
+canonical master/history + immutable Phase 7 routes + versioned Phase 8 dispatch
+    → Phase 10 adapters and canonical mapper
+    → authenticated read-only REST JSON + dataset versions + request logs
+    → AMT Scheduler (future external system)
+```
 
 Phase 5 remains inside the FastAPI modular monolith. Synchronous status transitions (`PENDING`, `PREPARING_DATA`, `TRAINING`, `CALCULATING_PROFILES`, `COMPLETED`, `FAILED`) preserve an upgrade path to a background worker without adding a second service prematurely. Engine B joblib packages and JSON manifests are stored under `ML_ARTIFACT_DIR`; Docker Compose mounts the `ml_artifacts` named volume. Database rows retain parameters, snapshots, assignments, profiles, relative artifact URI, SHA-256, audit user, and timestamps.
 

@@ -5,7 +5,7 @@ from datetime import UTC, datetime, time
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from .models import (
@@ -64,6 +64,14 @@ TAG_TYPES = {
 }
 
 
+def row_value(row: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = row.get(key)
+        if clean_str(value) is not None:
+            return value
+    return None
+
+
 class ImportProcessor:
     def __init__(self, db: Session):
         self.db = db
@@ -84,6 +92,52 @@ class ImportProcessor:
         if missing:
             raise ValueError(f"{domain} import columns do not match the selected domain. Missing columns: {', '.join(missing)}.")
 
+    def validate_required_column_groups(
+        self,
+        rows: list[dict[str, Any]],
+        domain: str,
+        required_groups: tuple[tuple[str, ...], ...],
+    ) -> None:
+        columns = set(rows[0].keys()) if rows else set()
+        missing = [aliases[0] for aliases in required_groups if not any(alias in columns for alias in aliases)]
+        if missing:
+            guidance = (
+                " Buat Depot terlebih dahulu pada Master Data > Depot, lalu gunakan Depot ID yang dihasilkan sistem."
+                if "depot_id" in missing
+                else ""
+            )
+            raise ValueError(
+                f"{domain} import columns do not match the selected domain. Missing columns: {', '.join(missing)}.{guidance}"
+            )
+
+    def validate_existing_depot_ids(self, rows: list[dict[str, Any]], domain: str) -> None:
+        missing_rows = [index for index, row in enumerate(rows, start=2) if not clean_str(row.get("depot_id"))]
+        supplied_ids = {clean_str(row.get("depot_id")) for row in rows if clean_str(row.get("depot_id"))}
+        existing_ids = set(
+            self.db.scalars(
+                select(MasterDepot.depot_id).where(
+                    MasterDepot.depot_id.in_(supplied_ids),
+                    MasterDepot.active_status != "DELETED",
+                )
+            ).all()
+        ) if supplied_ids else set()
+        unknown_ids = sorted(supplied_ids - existing_ids)
+        if not missing_rows and not unknown_ids:
+            return
+        problems: list[str] = []
+        if missing_rows:
+            preview = ", ".join(map(str, missing_rows[:10]))
+            suffix = f" dan {len(missing_rows) - 10} baris lainnya" if len(missing_rows) > 10 else ""
+            problems.append(f"depot_id kosong pada baris {preview}{suffix}")
+        if unknown_ids:
+            preview = ", ".join(unknown_ids[:10])
+            suffix = f" dan {len(unknown_ids) - 10} ID lainnya" if len(unknown_ids) > 10 else ""
+            problems.append(f"depot_id belum terdaftar atau sudah dihapus: {preview}{suffix}")
+        raise ValueError(
+            f"{domain} import gagal: {'; '.join(problems)}. "
+            "Buat Depot terlebih dahulu pada Master Data > Depot, lalu gunakan Depot ID yang dihasilkan sistem."
+        )
+
     def import_examples(self, example_dir: Path) -> dict[str, str]:
         results = {
             "mt": self.import_master_mt(example_dir / "master data MT.xlsx"),
@@ -94,7 +148,25 @@ class ImportProcessor:
         self.db.commit()
         return results
 
-    def create_import(self, domain: str, path: Path, sheet_name: str, uploaded_by: str = "system", filename: str | None = None) -> ImportAudit:
+    def create_import(
+        self,
+        domain: str,
+        path: Path,
+        sheet_name: str,
+        uploaded_by: str = "system",
+        filename: str | None = None,
+        existing_import_id: str | None = None,
+    ) -> ImportAudit:
+        if existing_import_id:
+            audit = self.db.get(ImportAudit, existing_import_id)
+            if not audit:
+                raise ValueError("Queued import audit was not found.")
+            audit.status = "PROCESSING"
+            audit.mapping_version = "phase0.v2"
+            audit.started_at = audit.started_at or datetime.now(UTC)
+            audit.error_message = None
+            self.db.flush()
+            return audit
         import_id = make_id("imp", domain, path.name, file_sha256(path), sheet_name, datetime.now(UTC).isoformat())
         audit = ImportAudit(
             import_id=import_id,
@@ -104,11 +176,30 @@ class ImportProcessor:
             sheet_name=sheet_name,
             uploaded_by=uploaded_by,
             status="STAGED",
-            mapping_version="phase0.v1",
+            mapping_version="phase0.v2",
         )
         self.db.add(audit)
         self.db.flush()
         return audit
+
+    def resolve_depot_reference(
+        self,
+        explicit_depot_id: Any,
+        name: Any,
+        code: Any,
+        source_import_id: str,
+        source_system: str,
+        require_depot_id: bool,
+    ) -> MasterDepot | None:
+        depot_id = clean_str(explicit_depot_id)
+        if depot_id:
+            depot = self.db.get(MasterDepot, depot_id)
+            if depot and depot.active_status != "DELETED":
+                return depot
+            return None
+        if require_depot_id:
+            return None
+        return self.resolve_depot(name, code, source_import_id, source_system)
 
     def issue(self, entity_type: str, entity_id: str | None, import_id: str | None, rule_code: str, severity: str, description: str) -> None:
         self.db.merge(
@@ -190,140 +281,212 @@ class ImportProcessor:
                 )
         return depot
 
-    def import_master_mt(self, path: Path, sheet_name: str = "Mobil Tangki", filename: str | None = None) -> str:
+    def import_master_mt(
+        self,
+        path: Path,
+        sheet_name: str = "Mobil Tangki",
+        filename: str | None = None,
+        existing_import_id: str | None = None,
+        require_depot_id: bool = False,
+    ) -> str:
         actual_sheet_name = resolve_sheet_name(path, sheet_name, ("Mobil Tangki", "MOBIL_TANGKI"))
-        audit = self.create_import("MOBIL_TANGKI", path, actual_sheet_name, filename=filename)
+        audit = self.create_import("MOBIL_TANGKI", path, actual_sheet_name, filename=filename, existing_import_id=existing_import_id)
         rows = dataframe_records(path, actual_sheet_name)
-        self.validate_required_columns(rows, "MOBIL_TANGKI", ("name",))
+        required_groups = (("depot_id",), ("vehicle_registration", "name", "vehicle_name_raw")) if require_depot_id else (("vehicle_registration", "name", "vehicle_name_raw"),)
+        self.validate_required_column_groups(rows, "MOBIL_TANGKI", required_groups)
+        if require_depot_id:
+            self.validate_existing_depot_ids(rows, "MOBIL_TANGKI")
         valid = warnings = rejected = 0
-        seen_registrations: set[str] = set()
+        seen_registrations: set[tuple[str, str]] = set()
         for row_number, row in enumerate(rows, start=2):
-            registration, capacity, parse_messages = parse_mt_name(row.get("name"))
+            raw_name = clean_str(row_value(row, "vehicle_name_raw", "name"))
+            parsed_registration, parsed_capacity, parse_messages = parse_mt_name(raw_name)
+            registration = normalize_key(row_value(row, "vehicle_registration")) or parsed_registration
+            capacity = clean_str(row_value(row, "capacity_label")) or parsed_capacity
+            if registration and not raw_name:
+                raw_name = registration
+                parse_messages = []
             messages = list(parse_messages)
             if not registration:
                 messages.append("missing normalized registration")
-            if registration in seen_registrations:
-                messages.append("duplicate normalized registration in source import")
-            seen_registrations.add(registration or f"row-{row_number}")
-            depot = self.resolve_depot(row.get("Depot"), row.get("hubId"), audit.import_id, "MASTER_MT")
+            depot = self.resolve_depot_reference(row.get("depot_id"), row.get("Depot"), None, audit.import_id, "MASTER_MT", require_depot_id)
+            if not depot:
+                messages.append("missing or unknown depot_id")
+            identity = (depot.depot_id, registration) if depot and registration else None
+            duplicate_identity = bool(identity and identity in seen_registrations)
+            if duplicate_identity:
+                messages.append("duplicate vehicle registration for depot_id in source import")
+            if identity:
+                seen_registrations.add(identity)
             normalized = {
-                "source_mt_id": clean_str(row.get("id")),
-                "vehicle_name_raw": clean_str(row.get("name")),
+                "source_mt_id": clean_str(row_value(row, "source_mt_id", "id")),
+                "vehicle_name_raw": raw_name,
                 "vehicle_registration": registration,
                 "capacity_label": capacity,
-                "vehicle_type_tag": source_int(row.get("vehicleType tag")),
-                "project_tags": split_project_tags(row.get("project_tag")),
-                "number_of_compartments": source_int(row.get("numberOfCompartments")),
+                "vehicle_type_tag": source_int(row_value(row, "vehicle_type_tag", "vehicleType tag")),
+                "project_tags": split_project_tags(row_value(row, "project_tag", "project_tag_raw")),
+                "number_of_compartments": source_int(row_value(row, "number_of_compartments", "numberOfCompartments")),
                 "depot_id": depot.depot_id if depot else None,
             }
-            status = "WARNING" if messages else "VALID"
+            status = "REJECTED" if not registration or (require_depot_id and not depot) or duplicate_identity else "WARNING" if messages else "VALID"
+            rejected += int(status == "REJECTED")
             warnings += int(status == "WARNING")
             valid += int(status == "VALID")
             self.db.add(StgMT(staging_id=make_id("stgmt", audit.import_id, row_number), import_id=audit.import_id, source_row_number=row_number, raw_payload=row, normalized_payload=normalized, validation_status=status, validation_messages=messages))
             if messages:
                 self.issue("MT", registration, audit.import_id, "MT_NAME_PARSE", "WARNING", "; ".join(messages))
-            mt_id = make_id("mt", registration or clean_str(row.get("name")) or row_number)
+            if status == "REJECTED":
+                continue
+            mt_id = (
+                make_id("mt", depot.depot_id, registration)
+                if depot
+                else make_id("mt", registration or raw_name or row_number)
+            )
             self.upsert_active(
                 MasterMT,
                 mt_id,
                 {
                     "mt_id": mt_id,
-                    "source_mt_id": clean_str(row.get("id")),
-                    "vehicle_name_raw": clean_str(row.get("name")) or "",
+                    "source_mt_id": clean_str(row_value(row, "source_mt_id", "id")),
+                    "vehicle_name_raw": raw_name or "",
                     "vehicle_registration": registration,
                     "capacity_label": capacity,
-                    "vehicle_type_tag": source_int(row.get("vehicleType tag")),
-                    "project_tag_raw": clean_str(row.get("project_tag")),
-                    "number_of_compartments": source_int(row.get("numberOfCompartments")),
+                    "vehicle_type_tag": source_int(row_value(row, "vehicle_type_tag", "vehicleType tag")),
+                    "project_tag_raw": clean_str(row_value(row, "project_tag", "project_tag_raw")),
+                    "number_of_compartments": source_int(row_value(row, "number_of_compartments", "numberOfCompartments")),
                     "depot_id": depot.depot_id if depot else None,
-                    "source_hub_id": clean_str(row.get("hubId")),
+                    "source_hub_id": clean_str(row_value(row, "source_hub_id", "hubId")),
                     "assignee": clean_str(row.get("assignee")),
-                    "active_status": "ACTIVE",
+                    "active_status": clean_str(row.get("active_status")) or "ACTIVE",
                     "source_import_id": audit.import_id,
                 },
             )
             self.db.flush()
-            for tag_value in split_project_tags(row.get("project_tag")):
+            project_type_id = make_id("tagtype", "PROJECT")
+            self.db.execute(
+                delete(BridgeMTTag).where(
+                    BridgeMTTag.mt_id == mt_id,
+                    BridgeMTTag.tag_id.in_(select(MasterTag.tag_id).where(MasterTag.tag_type_id == project_type_id)),
+                )
+            )
+            for tag_value in split_project_tags(row_value(row, "project_tag", "project_tag_raw")):
                 tag = self.resolve_tag(tag_value, "MASTER_MT")
                 self.db.merge(BridgeMTTag(mt_id=mt_id, tag_id=tag.tag_id, source_import_id=audit.import_id))
         audit.total_rows = len(rows)
         audit.valid_rows = valid
         audit.warning_rows = warnings
         audit.rejected_rows = rejected
+        audit.processed_rows = len(rows)
         audit.status = "PUBLISHED"
         audit.published_at = datetime.now(UTC)
+        audit.completed_at = audit.published_at
         self.db.commit()
         return audit.import_id
 
-    def import_master_spbu(self, path: Path, sheet_name: str = "Lembaga Penyalur", filename: str | None = None) -> str:
+    def import_master_spbu(
+        self,
+        path: Path,
+        sheet_name: str = "Lembaga Penyalur",
+        filename: str | None = None,
+        existing_import_id: str | None = None,
+        require_depot_id: bool = False,
+    ) -> str:
         actual_sheet_name = resolve_sheet_name(path, sheet_name, ("SPBU", "Lembaga Penyalur"))
-        audit = self.create_import("SPBU", path, actual_sheet_name, filename=filename)
+        audit = self.create_import("SPBU", path, actual_sheet_name, filename=filename, existing_import_id=existing_import_id)
         rows = dataframe_records(path, actual_sheet_name)
-        self.validate_required_columns(rows, "SPBU", ("Nama SPBU",))
+        required_groups = (("depot_id",), ("spbu_code", "Nama SPBU")) if require_depot_id else (("spbu_code", "Nama SPBU"),)
+        self.validate_required_column_groups(rows, "SPBU", required_groups)
+        if require_depot_id:
+            self.validate_existing_depot_ids(rows, "SPBU")
         valid = warnings = rejected = 0
+        seen_codes: set[tuple[str, str]] = set()
         for row_number, row in enumerate(rows, start=2):
-            code = clean_str(row.get("Nama SPBU"))
-            lat, lon, coordinate_messages = parse_coordinate(row.get("Coordinate"))
+            code = clean_str(row_value(row, "spbu_code", "Nama SPBU"))
+            source_coordinate = clean_str(row_value(row, "source_coordinate", "Coordinate"))
+            lat = source_number(row.get("latitude"))
+            lon = source_number(row.get("longitude"))
+            parsed_lat, parsed_lon, coordinate_messages = parse_coordinate(source_coordinate)
+            if lat is None:
+                lat = parsed_lat
+            if lon is None:
+                lon = parsed_lon
+            if lat is not None and lon is not None:
+                coordinate_messages = []
             messages = list(coordinate_messages)
             if not code:
                 messages.append("missing SPBU code")
-            depot = self.resolve_depot(row.get("Depot"), None, audit.import_id, "MASTER_SPBU")
+            depot = self.resolve_depot_reference(row.get("depot_id"), row.get("Depot"), None, audit.import_id, "MASTER_SPBU", require_depot_id)
             if not depot:
-                messages.append("unknown depot")
+                messages.append("missing or unknown depot_id")
+            identity = (depot.depot_id, code) if depot and code else None
+            duplicate_identity = bool(identity and identity in seen_codes)
+            if duplicate_identity:
+                messages.append("duplicate SPBU code for depot_id in source import")
+            if identity:
+                seen_codes.add(identity)
             normalized = {
                 "spbu_code": code,
                 "latitude": lat,
                 "longitude": lon,
-                "vehicle_type_tag": source_int(row.get("Vehicle Type tag")),
-                "project_tags": split_project_tags(row.get("Project tag")),
+                "vehicle_type_tag": source_int(row_value(row, "vehicle_type_tag", "Vehicle Type tag")),
+                "project_tags": split_project_tags(row_value(row, "project_tag", "project_tag_raw", "Project tag")),
                 "depot_id": depot.depot_id if depot else None,
-                "official_window_start": source_time(row.get("Official Window Start"), time(0, 0)).isoformat(timespec="minutes"),
-                "official_window_end": source_time(row.get("Official Window End"), time(23, 59)).isoformat(timespec="minutes"),
+                "official_window_start": source_time(row_value(row, "official_window_start", "Official Window Start"), time(0, 0)).isoformat(timespec="minutes"),
+                "official_window_end": source_time(row_value(row, "official_window_end", "Official Window End"), time(23, 59)).isoformat(timespec="minutes"),
             }
-            status = "WARNING" if messages else "VALID"
+            status = "REJECTED" if not code or (require_depot_id and not depot) or duplicate_identity else "WARNING" if messages else "VALID"
+            rejected += int(status == "REJECTED")
             warnings += int(status == "WARNING")
             valid += int(status == "VALID")
             self.db.add(StgSPBU(staging_id=make_id("stgspbu", audit.import_id, row_number), import_id=audit.import_id, source_row_number=row_number, raw_payload=row, normalized_payload=normalized, validation_status=status, validation_messages=messages))
             if messages:
                 self.issue("SPBU", code, audit.import_id, "SPBU_SOURCE_VALIDATION", "WARNING", "; ".join(messages))
-            if not code:
-                rejected += 1
+            if status == "REJECTED":
                 continue
-            spbu_id = make_id("spbu", code)
+            spbu_id = make_id("spbu", depot.depot_id, code) if depot else make_id("spbu", code)
             self.upsert_active(
                 MasterSPBU,
                 spbu_id,
                 {
                     "spbu_id": spbu_id,
                     "spbu_code": code,
-                    "spbu_name": code,
-                    "address": clean_str(row.get("Address")),
-                    "city": clean_str(row.get("Kota")),
+                    "spbu_name": clean_str(row.get("spbu_name")) or code,
+                    "address": clean_str(row_value(row, "address", "Address")),
+                    "city": clean_str(row_value(row, "city", "Kota")),
                     "latitude": lat,
                     "longitude": lon,
-                    "source_coordinate": clean_str(row.get("Coordinate")),
-                    "master_distance_km": source_number(row.get("jarak_km")),
-                    "master_travel_time_min": source_number(row.get("waktu_menit")),
-                    "vehicle_type_tag": source_int(row.get("Vehicle Type tag")),
-                    "project_tag_raw": clean_str(row.get("Project tag")),
+                    "source_coordinate": source_coordinate,
+                    "master_distance_km": source_number(row_value(row, "master_distance_km", "jarak_km")),
+                    "master_travel_time_min": source_number(row_value(row, "master_travel_time_min", "waktu_menit")),
+                    "vehicle_type_tag": source_int(row_value(row, "vehicle_type_tag", "Vehicle Type tag")),
+                    "project_tag_raw": clean_str(row_value(row, "project_tag", "project_tag_raw", "Project tag")),
                     "primary_depot_id": depot.depot_id if depot else None,
-                    "active_status": "ACTIVE",
-                    "official_window_start": source_time(row.get("Official Window Start"), time(0, 0)),
-                    "official_window_end": source_time(row.get("Official Window End"), time(23, 59)),
+                    "active_status": clean_str(row.get("active_status")) or "ACTIVE",
+                    "official_window_start": source_time(row_value(row, "official_window_start", "Official Window Start"), time(0, 0)),
+                    "official_window_end": source_time(row_value(row, "official_window_end", "Official Window End"), time(23, 59)),
                     "source_import_id": audit.import_id,
                 },
             )
             self.db.flush()
+            project_type_id = make_id("tagtype", "PROJECT")
+            self.db.execute(
+                delete(BridgeSPBUTag).where(
+                    BridgeSPBUTag.spbu_id == spbu_id,
+                    BridgeSPBUTag.tag_id.in_(select(MasterTag.tag_id).where(MasterTag.tag_type_id == project_type_id)),
+                )
+            )
             self.db.merge(SpbuIdentifierAlias(spbu_identifier_alias_id=make_id("spbualias", spbu_id, "SPBU_CODE", code), spbu_id=spbu_id, identifier_type="SPBU_CODE", identifier_value=code, normalized_identifier=normalize_key(code) or code, source_system="MASTER_SPBU"))
-            for tag_value in split_project_tags(row.get("Project tag")):
+            for tag_value in split_project_tags(row_value(row, "project_tag", "project_tag_raw", "Project tag")):
                 tag = self.resolve_tag(tag_value, "MASTER_SPBU")
                 self.db.merge(BridgeSPBUTag(spbu_id=spbu_id, tag_id=tag.tag_id, source_import_id=audit.import_id))
         audit.total_rows = len(rows)
         audit.valid_rows = valid
         audit.warning_rows = warnings
         audit.rejected_rows = rejected
+        audit.processed_rows = len(rows)
         audit.status = "PUBLISHED"
         audit.published_at = datetime.now(UTC)
+        audit.completed_at = audit.published_at
         self.db.commit()
         return audit.import_id
 
@@ -338,58 +501,129 @@ class ImportProcessor:
         self.db.merge(ProductAlias(product_alias_id=make_id("productalias", normalized, "LO"), product_id=product_id, alias_value=product_name, normalized_alias=normalized, source_system="LO"))
         return self.db.get(MasterProduct, product_id) or MasterProduct(product_id=product_id, product_name=product_name, normalized_product=normalized)
 
-    def import_loading_order(self, path: Path, sheet_name: str = "Data Medan Mei", filename: str | None = None) -> str:
+    def import_loading_order(
+        self,
+        path: Path,
+        sheet_name: str = "Data Medan Mei",
+        filename: str | None = None,
+        existing_import_id: str | None = None,
+        require_depot_id: bool = False,
+    ) -> str:
         actual_sheet_name = resolve_sheet_name(path, sheet_name, ("Data Medan Mei", "Loading Orders", "LOADING_ORDER"))
-        audit = self.create_import("LOADING_ORDER", path, actual_sheet_name, filename=filename)
+        audit = self.create_import("LOADING_ORDER", path, actual_sheet_name, filename=filename, existing_import_id=existing_import_id)
         rows = dataframe_records(path, actual_sheet_name)
-        self.validate_required_columns(rows, "LOADING_ORDER", ("shipment_id", "loading_order_number", "tbbm"))
+        required_groups = (
+            (("depot_id",), ("shipment_id",), ("loading_order_number",), ("source_depot_name", "tbbm"))
+            if require_depot_id
+            else (("shipment_id",), ("loading_order_number",), ("source_depot_name", "tbbm"))
+        )
+        self.validate_required_column_groups(rows, "LOADING_ORDER", required_groups)
+        if require_depot_id:
+            self.validate_existing_depot_ids(rows, "LOADING_ORDER")
         lo_depot_counts = Counter(
-            (clean_str(row.get("loading_order_number")), clean_str(row.get("tbbm")))
+            (clean_str(row.get("loading_order_number")), clean_str(row.get("depot_id")) or clean_str(row_value(row, "source_depot_name", "tbbm")))
             for row in rows
-            if clean_str(row.get("loading_order_number")) and clean_str(row.get("tbbm"))
+            if clean_str(row.get("loading_order_number")) and (clean_str(row.get("depot_id")) or clean_str(row_value(row, "source_depot_name", "tbbm")))
         )
         by_shipment: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for row_number, row in enumerate(rows, start=2):
             source_shipment_id = clean_str(row.get("shipment_id")) or f"row-{row_number}"
             by_shipment[source_shipment_id].append({"row_number": row_number, "row": row})
-        mt_by_registration = {mt.vehicle_registration: mt for mt in self.db.scalars(select(MasterMT)).all() if mt.vehicle_registration}
-        spbu_by_code = {spbu.spbu_code: spbu for spbu in self.db.scalars(select(MasterSPBU)).all()}
+        mt_by_registration = {
+            (mt.depot_id, mt.vehicle_registration): mt
+            for mt in self.db.scalars(select(MasterMT)).all()
+            if mt.depot_id and mt.vehicle_registration
+        }
+        spbu_by_code = {
+            (spbu.primary_depot_id, spbu.spbu_code): spbu
+            for spbu in self.db.scalars(select(MasterSPBU)).all()
+            if spbu.primary_depot_id
+        }
         valid = warnings = rejected = 0
         for source_shipment_id, grouped in by_shipment.items():
             first = grouped[0]["row"]
-            registrations = {normalize_key(item["row"].get("nopol")) for item in grouped if normalize_key(item["row"].get("nopol"))}
+            registrations = {
+                normalize_key(row_value(item["row"], "vehicle_registration", "nopol"))
+                for item in grouped
+                if normalize_key(row_value(item["row"], "vehicle_registration", "nopol"))
+            }
             vehicle_registration = next(iter(registrations)) if registrations else None
             messages: list[str] = []
             if len(registrations) > 1:
                 messages.append("shipment contains multiple nopol values")
-            mt = mt_by_registration.get(vehicle_registration) if vehicle_registration else None
+            depot = self.resolve_depot_reference(
+                first.get("depot_id"),
+                row_value(first, "source_depot_name", "tbbm"),
+                row_value(first, "depot_code", "kode_depot"),
+                audit.import_id,
+                "LO",
+                require_depot_id,
+            )
+            mt = mt_by_registration.get((depot.depot_id, vehicle_registration)) if depot and vehicle_registration else None
             vehicle_status = "MATCHED" if mt else "UNMATCHED"
             if not mt:
                 messages.append("unknown MT")
-            depot = self.resolve_depot(first.get("tbbm"), first.get("kode_depot"), audit.import_id, "LO")
-            validation_dt = combine_datetime(first.get("date_validasi"), first.get("Jam Validasi"))
-            gate_out_dt = combine_datetime(first.get("date_gate_out"), first.get("Jam_gateout"))
-            end_dt = combine_datetime(first.get("date_end_shipment"), first.get("jam_end_shipment"))
-            driver_name = clean_str(first.get("supir"))
-            driver_nip = clean_str(first.get("nip_supir"))
-            assistant_name = clean_str(first.get("kernet"))
-            assistant_nip = clean_str(first.get("nip_kernet"))
+            if not depot:
+                messages.append("unknown depot_id")
+                for item in grouped:
+                    row = item["row"]
+                    row_number = item["row_number"]
+                    lo_number = clean_str(row.get("loading_order_number"))
+                    self.db.add(
+                        StgLoadingOrder(
+                            staging_id=make_id("stglo", audit.import_id, row_number),
+                            import_id=audit.import_id,
+                            source_row_number=row_number,
+                            raw_payload=row,
+                            normalized_payload={
+                                "loading_order_id": None,
+                                "depot_id": clean_str(row.get("depot_id")),
+                                "shipment_id": source_shipment_id,
+                                "source_depot_name": clean_str(row_value(row, "source_depot_name", "tbbm")),
+                            },
+                            validation_status="REJECTED",
+                            validation_messages=["depot_id must reference an active Master Depot"],
+                        )
+                    )
+                    self.issue(
+                        "LO_LINE",
+                        lo_number or f"row-{row_number}",
+                        audit.import_id,
+                        "UNKNOWN_DEPOT_ID",
+                        "SEVERE",
+                        "depot_id must reference an active Master Depot.",
+                    )
+                    rejected += 1
+                continue
+            validation_dt = combine_datetime(row_value(first, "validation_date", "date_validasi"), row_value(first, "validation_time", "Jam Validasi"))
+            gate_out_dt = combine_datetime(row_value(first, "gate_out_date", "date_gate_out"), row_value(first, "gate_out_time", "Jam_gateout"))
+            end_dt = combine_datetime(row_value(first, "shipment_end_date", "date_end_shipment"), row_value(first, "shipment_end_time", "jam_end_shipment"))
+            driver_name = clean_str(row_value(first, "driver_name", "supir"))
+            driver_nip = clean_str(row_value(first, "driver_nip", "nip_supir"))
+            assistant_name = clean_str(row_value(first, "assistant_name", "kernet"))
+            assistant_nip = clean_str(row_value(first, "assistant_nip", "nip_kernet"))
             if gate_out_dt and end_dt and end_dt < gate_out_dt:
                 messages.append("shipment_end before gate_out")
             if validation_dt and gate_out_dt and gate_out_dt < validation_dt:
                 messages.append("gate_out before validation")
-            for key, label in (
-                ("supir", "driver name"),
-                ("nip_supir", "driver NIP"),
-                ("kernet", "assistant name"),
-                ("nip_kernet", "assistant NIP"),
+            for keys, label in (
+                (("driver_name", "supir"), "driver name"),
+                (("driver_nip", "nip_supir"), "driver NIP"),
+                (("assistant_name", "kernet"), "assistant name"),
+                (("assistant_nip", "nip_kernet"), "assistant NIP"),
             ):
-                values = {clean_str(item["row"].get(key)) for item in grouped if clean_str(item["row"].get(key))}
+                values = {clean_str(row_value(item["row"], *keys)) for item in grouped if clean_str(row_value(item["row"], *keys))}
                 if len(values) > 1:
                     messages.append(f"shipment contains multiple {label} values")
             end_values = {
                 value
-                for value in (combine_datetime(item["row"].get("date_end_shipment"), item["row"].get("jam_end_shipment")) for item in grouped)
+                for value in (
+                    combine_datetime(
+                        row_value(item["row"], "shipment_end_date", "date_end_shipment"),
+                        row_value(item["row"], "shipment_end_time", "jam_end_shipment"),
+                    )
+                    for item in grouped
+                )
                 if value
             }
             if len(end_values) > 1:
@@ -399,15 +633,15 @@ class ImportProcessor:
                 FactShipment(
                     shipment_id=shipment_pk,
                     source_shipment_id=source_shipment_id,
-                    operating_date=combine_datetime(first.get("date"), None).date() if combine_datetime(first.get("date"), None) else None,
+                    operating_date=combine_datetime(row_value(first, "operating_date", "date"), None).date() if combine_datetime(row_value(first, "operating_date", "date"), None) else None,
                     area_id=clean_str(first.get("area_id")),
                     area=clean_str(first.get("area")),
                     depot_id=depot.depot_id if depot else None,
                     mt_id=mt.mt_id if mt else None,
                     vehicle_registration=vehicle_registration,
                     vehicle_mapping_status=vehicle_status,
-                    vehicle_type_tag_observed=clean_str(first.get("Vehicle Type tag")),
-                    project_tag_raw=clean_str(first.get("Project tag")),
+                    vehicle_type_tag_observed=clean_str(row_value(first, "vehicle_type_tag", "Vehicle Type tag")),
+                    project_tag_raw=clean_str(row_value(first, "project_tag", "Project tag")),
                     validation_datetime=validation_dt,
                     gate_out_datetime=gate_out_dt,
                     shipment_end_datetime=end_dt,
@@ -426,10 +660,11 @@ class ImportProcessor:
                 row = item["row"]
                 row_number = item["row_number"]
                 lo_number = clean_str(row.get("loading_order_number"))
-                source_depot_name = clean_str(row.get("tbbm"))
-                spbu_code = clean_str(row.get("nama_spbu"))
-                spbu = spbu_by_code.get(spbu_code) if spbu_code else None
-                product = self.resolve_product(row.get("produk"), audit.import_id)
+                source_depot_name = clean_str(row_value(row, "source_depot_name", "tbbm"))
+                spbu_code = clean_str(row_value(row, "source_spbu_code", "spbu_code", "nama_spbu"))
+                spbu = spbu_by_code.get((depot.depot_id, spbu_code)) if depot and spbu_code else None
+                source_product_name = row_value(row, "source_product_name", "product_name", "produk")
+                product = self.resolve_product(source_product_name, audit.import_id)
                 row_messages = []
                 row_rejected = False
                 if not lo_number:
@@ -440,7 +675,7 @@ class ImportProcessor:
                     row_rejected = True
                     row_messages.append("missing tbbm")
                     self.issue("LO_LINE", lo_number or f"row-{row_number}", audit.import_id, "MISSING_TBBM", "SEVERE", "Depot name tbbm is required because loading-order uniqueness is scoped by depot.")
-                elif lo_depot_counts[(lo_number, source_depot_name)] > 1:
+                elif lo_depot_counts[(lo_number, clean_str(row.get("depot_id")) or source_depot_name)] > 1:
                     row_rejected = True
                     row_messages.append("duplicate loading_order_number for tbbm")
                     self.issue("LO_LINE", lo_number, audit.import_id, "DUPLICATE_LOADING_ORDER_NUMBER_DEPOT", "SEVERE", "Loading order number must be unique within the same tbbm/depot.")
@@ -450,13 +685,15 @@ class ImportProcessor:
                 if source_number(row.get("quantity")) is None or (source_number(row.get("quantity")) or 0) <= 0:
                     row_messages.append("invalid quantity")
                 normalized = {
+                    "loading_order_id": make_id("lo", depot.depot_id, lo_number) if depot and lo_number else None,
+                    "depot_id": depot.depot_id if depot else None,
                     "shipment_id": source_shipment_id,
                     "source_depot_name": source_depot_name,
                     "vehicle_registration": vehicle_registration,
                     "vehicle_mapping_status": vehicle_status,
                     "spbu_code": spbu_code,
                     "spbu_mapping_status": "MATCHED" if spbu else "UNMATCHED",
-                    "product": normalize_product(row.get("produk")),
+                    "product": normalize_product(source_product_name),
                     "quantity": source_number(row.get("quantity")),
                 }
                 status = "REJECTED" if row_rejected else "WARNING" if row_messages or messages else "VALID"
@@ -468,7 +705,9 @@ class ImportProcessor:
                     continue
                 self.db.merge(
                     FactLoadingOrderLine(
+                        loading_order_id=make_id("lo", depot.depot_id, lo_number),
                         loading_order_number=lo_number,
+                        depot_id=depot.depot_id,
                         source_depot_name=source_depot_name,
                         shipment_id=shipment_pk,
                         spbu_id=spbu.spbu_id if spbu else None,
@@ -476,11 +715,11 @@ class ImportProcessor:
                         source_spbu_code=spbu_code,
                         shipto=clean_str(row.get("shipto")),
                         product_id=product.product_id if product else None,
-                        source_product_name=clean_str(row.get("produk")),
+                        source_product_name=clean_str(source_product_name),
                         quantity=source_number(row.get("quantity")),
                         status=clean_str(row.get("status")),
-                        source_distance_km=source_number(row.get("jarak_spbu")),
-                        actual_km=source_number(row.get("km_aktual")),
+                        source_distance_km=source_number(row_value(row, "source_distance_km", "jarak_spbu")),
+                        actual_km=source_number(row_value(row, "actual_km", "km_aktual")),
                         source_import_id=audit.import_id,
                     )
                 )
@@ -493,20 +732,30 @@ class ImportProcessor:
         audit.valid_rows = valid
         audit.warning_rows = warnings
         audit.rejected_rows = rejected
+        audit.processed_rows = len(rows)
         audit.status = "PUBLISHED"
         audit.published_at = datetime.now(UTC)
+        audit.completed_at = audit.published_at
         self.db.commit()
         return audit.import_id
 
-    def stage_gps_file(self, path: Path, sheet_name: str, filename: str | None = None) -> str:
+    def stage_gps_file(
+        self,
+        path: Path,
+        sheet_name: str,
+        filename: str | None = None,
+        existing_import_id: str | None = None,
+    ) -> str:
         actual_sheet_name = resolve_sheet_name(path, sheet_name, ("GPS", "GPS Data"))
-        audit = self.create_import("GPS", path, actual_sheet_name, filename=filename)
+        audit = self.create_import("GPS", path, actual_sheet_name, filename=filename, existing_import_id=existing_import_id)
         rows = dataframe_records(path, actual_sheet_name)
         self.validate_required_columns(rows, "GPS", ("vehicle_registration", "event_datetime"))
         for row_number, row in enumerate(rows, start=2):
             self.db.add(StgGPSData(staging_id=make_id("stggps", audit.import_id, row_number), import_id=audit.import_id, source_row_number=row_number, raw_payload=row, normalized_payload={}, validation_status="PENDING_MAPPING", validation_messages=["GPS physical schema requires source mapping review"]))
         audit.total_rows = len(rows)
+        audit.processed_rows = len(rows)
         audit.status = "STAGED"
+        audit.completed_at = datetime.now(UTC)
         self.db.commit()
         return audit.import_id
 

@@ -4,7 +4,8 @@ export type SeriesPoint = { name: string; value: number };
 
 async function responseError(response: Response): Promise<Error> {
   try {
-    const payload = await response.json() as { detail?: string | { message?: string; code?: string } };
+    const payload = await response.json() as { detail?: string | { message?: string; code?: string }; error?: { message?: string; code?: string } };
+    if (payload.error?.message) return new Error(payload.error.message);
     if (typeof payload.detail === "string") return new Error(payload.detail);
     if (payload.detail?.message) return new Error(payload.detail.message);
   } catch {
@@ -21,15 +22,7 @@ export async function apiGet<T>(path: string): Promise<T> {
   return response.json();
 }
 
-export async function importSampleData(): Promise<{ status: string; imports: Record<string, string> }> {
-  const response = await fetch(`${API_BASE_URL}/api/v1/imports/sample`, { method: "POST" });
-  if (!response.ok) {
-    throw new Error(`${response.status} ${response.statusText}`);
-  }
-  return response.json();
-}
-
-export async function uploadImportFile(domain: string, sheetName: string, file: File): Promise<{ import_id: string; domain: string }> {
+export async function uploadImportFile(domain: string, sheetName: string, file: File): Promise<{ import_id: string; domain: string; status: string }> {
   const params = new URLSearchParams({ domain, sheet_name: sheetName });
   const body = new FormData();
   body.append("file", file);

@@ -8,6 +8,8 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./dispatch_intelligence.db"
     cors_origins: str = "http://localhost:3000,http://localhost:5173"
     example_data_dir: Path = Path("example data")
+    import_upload_dir: Path = Path("./import_uploads")
+    import_worker_poll_seconds: float = 1.0
     vehicle_compatibility_mode: str = "MT_CAPACITY_LE_SPBU_LIMIT"
     default_geofence_radius_m: float = 125.0
     minimum_gps_dwell_minutes: float = 5.0
@@ -24,6 +26,8 @@ class Settings(BaseSettings):
     phase6_worker_lease_seconds: float = 30.0
     phase6_prediction_timeout_seconds: float = 3600.0
     phase6_prediction_max_attempts: int = 3
+    phase10_rate_limit_per_minute: int = 600
+    phase10_default_timezone: str = "Asia/Jakarta"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

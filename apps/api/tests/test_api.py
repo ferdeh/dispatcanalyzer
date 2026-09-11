@@ -9,8 +9,8 @@ from sqlalchemy.pool import StaticPool
 from app.database import get_db
 from app.departure_intelligence import circular_stats, shift_for_minute, validate_shift_config
 from app.importer import ImportProcessor
-from app.main import app
-from app.models import Base, FactLoadingOrderLine, FactShipment, FactShipmentSPBU, MasterDepot, MasterMT, MasterProduct, MasterSPBU, MasterTag
+from app.main import IMPORT_TEMPLATE_COLUMNS, app
+from app.models import Base, FactLoadingOrderLine, FactShipment, FactShipmentSPBU, ImportAudit, MasterDepot, MasterMT, MasterProduct, MasterSPBU, MasterTag
 
 ROOT = Path(__file__).resolve().parents[3]
 EXAMPLE_DIR = ROOT / "example data"
@@ -19,6 +19,40 @@ EXAMPLE_DIR = ROOT / "example data"
 def test_health_endpoint() -> None:
     client = TestClient(app)
     assert client.get("/api/v1/health").json()["status"] == "ok"
+
+
+def test_manual_depot_creation_generates_id_and_depot_sync_is_disabled() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+
+    def override_db():
+        with Session() as session:
+            yield session
+
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        created = client.post(
+            "/api/v1/master-crud/DEPOT",
+            json={"depot_code": "TMD", "depot_name": "TEST MANUAL DEPOT"},
+        )
+        assert created.status_code == 200
+        depot_id = created.json()["record"]["depot_id"]
+        assert depot_id.startswith("depot_")
+
+        listed = client.get(
+            "/api/v1/master-crud/DEPOT",
+            params={"search": depot_id, "search_column": "depot_id"},
+        )
+        assert listed.status_code == 200
+        assert listed.json()["rows"][0]["depot_id"] == depot_id
+
+        sync = client.post("/api/v1/master-crud/DEPOT/sync")
+        assert sync.status_code == 400
+        assert "managed manually" in sync.json()["detail"]
+    finally:
+        app.dependency_overrides.clear()
 
 
 def test_spbu_crud_backfills_lat_long_from_source_coordinate() -> None:
@@ -139,7 +173,18 @@ def test_dashboard_counts_match_database() -> None:
 
     template = client.get("/api/v1/exports/template?domain=MOBIL_TANGKI&file_format=csv")
     assert template.status_code == 200
-    assert "vehicleType tag" in template.text
+    assert template.text.lstrip("\ufeff").startswith("depot_id,")
+    assert "vehicle_type_tag" in template.text
+    assert "vehicle_registration" in template.text
+    assert "vehicle_name_raw" in template.text
+    assert "source_mt_id" not in template.text
+    assert "source_hub_id" not in template.text
+    assert "assignee" not in template.text
+    for template_domain in ("SPBU", "LOADING_ORDER"):
+        domain_template = client.get(f"/api/v1/exports/template?domain={template_domain}&file_format=csv")
+        assert domain_template.status_code == 200
+        actual_header = domain_template.text.lstrip("\ufeff").splitlines()[0]
+        assert actual_header == ",".join(IMPORT_TEMPLATE_COLUMNS[template_domain])
 
     with Session() as session:
         depot = session.query(MasterDepot).order_by(MasterDepot.depot_name).first()
@@ -152,18 +197,26 @@ def test_dashboard_counts_match_database() -> None:
             "/api/v1/imports?domain=SPBU&sheet_name=Lembaga%20Penyalur",
             files={"file": ("template_spbu.xlsx", handle, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
         )
-    assert upload_template_spbu.status_code == 200
+    assert upload_template_spbu.status_code == 202
     uploaded_import_id = upload_template_spbu.json()["import_id"]
     imports_payload = client.get("/api/v1/imports").json()
     uploaded_audit = next(item for item in imports_payload if item["import_id"] == uploaded_import_id)
-    assert uploaded_audit["sheet_name"] == "SPBU"
+    assert uploaded_audit["sheet_name"] == "Lembaga Penyalur"
+    assert uploaded_audit["status"] == "QUEUED"
     with (EXAMPLE_DIR / "template_spbu.xlsx").open("rb") as handle:
         wrong_domain_upload = client.post(
             "/api/v1/imports?domain=MOBIL_TANGKI&sheet_name=SPBU",
             files={"file": ("template_spbu.xlsx", handle, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
         )
-    assert wrong_domain_upload.status_code == 400
-    assert "MOBIL_TANGKI import columns do not match" in wrong_domain_upload.text
+    assert wrong_domain_upload.status_code == 202
+    wrong_import_id = wrong_domain_upload.json()["import_id"]
+    with Session() as session:
+        for queued_import_id in (uploaded_import_id, wrong_import_id):
+            queued = session.get(ImportAudit, queued_import_id)
+            assert queued is not None
+            assert queued.status == "QUEUED"
+            if queued.stored_path:
+                Path(queued.stored_path).unlink(missing_ok=True)
 
     with Session() as session:
         expected_mt = session.query(MasterMT).filter(MasterMT.depot_id == depot.depot_id).count()
@@ -371,6 +424,12 @@ def test_dashboard_counts_match_database() -> None:
     assert spbu_sort_desc.status_code == 200
     spbu_codes = [row["spbu_code"] for row in spbu_sort_desc.json()["rows"]]
     assert spbu_codes == sorted(spbu_codes, reverse=True)
+    for sort_column in ("primary_depot_id", "source_coordinate"):
+        spbu_visible_column_sort = client.get(
+            f"/api/v1/master-crud/SPBU?limit=10&offset=0&sort_column={sort_column}&sort_direction=asc"
+        )
+        assert spbu_visible_column_sort.status_code == 200
+        assert spbu_visible_column_sort.json()["total"] > 0
     spbu_tag_sort = client.get(f"/api/v1/master-crud/SPBU?limit=10&offset=0&depot_id={depot.depot_id}&sort_column=tag_project&sort_direction=asc")
     assert spbu_tag_sort.status_code == 200
     spbu_project_tags = [row["tag_project"] for row in spbu_tag_sort.json()["rows"] if row.get("tag_project")]
@@ -411,6 +470,9 @@ def test_dashboard_counts_match_database() -> None:
     assert all(row["tag_vehicle_class"] == row["vehicle_type_tag"] for row in mt_rows)
     assert all(isinstance(row["tag_vehicle_class"], int) for row in mt_rows if row.get("tag_vehicle_class") is not None)
     assert any("," in row["tag_project"] for row in mt_rows if row.get("tag_project"))
+    mt_depot_sort = client.get("/api/v1/master-crud/MOBIL_TANGKI?limit=10&offset=0&sort_column=depot_id&sort_direction=asc")
+    assert mt_depot_sort.status_code == 200
+    assert mt_depot_sort.json()["total"] > 0
     mt_vehicle_class_search = client.get("/api/v1/master-crud/MOBIL_TANGKI?limit=10&offset=0&search=24&search_column=tag_vehicle_class")
     assert mt_vehicle_class_search.status_code == 200
     assert mt_vehicle_class_search.json()["total"] > 0
@@ -454,6 +516,9 @@ def test_dashboard_counts_match_database() -> None:
     assert crud_loading_order_vehicle_sort.status_code == 200
     lo_vehicle_registrations = [row["vehicle_registration"] for row in crud_loading_order_vehicle_sort.json()["rows"]]
     assert lo_vehicle_registrations == sorted(lo_vehicle_registrations, reverse=True)
+    crud_loading_order_depot_sort = client.get("/api/v1/master-crud/LOADING_ORDER?limit=10&offset=0&sort_column=depot_id&sort_direction=asc")
+    assert crud_loading_order_depot_sort.status_code == 200
+    assert crud_loading_order_depot_sort.json()["total"] > 0
     crud_loading_order_validation_search = client.get(f"/api/v1/master-crud/LOADING_ORDER?search={sample_loading_order_validation_datetime.date().isoformat()}&search_column=validation_date")
     assert crud_loading_order_validation_search.status_code == 200
     assert crud_loading_order_validation_search.json()["total"] > 0
@@ -482,7 +547,7 @@ def test_dashboard_counts_match_database() -> None:
 
     create_mt = client.post(
         "/api/v1/master-crud/MOBIL_TANGKI",
-        json={"vehicle_name_raw": "BTESTCRUD-16KL", "vehicle_registration": "BTESTCRUD", "capacity_label": "16KL", "vehicle_type_tag": "16"},
+        json={"depot_id": depot.depot_id, "vehicle_name_raw": "BTESTCRUD-16KL", "vehicle_registration": "BTESTCRUD", "capacity_label": "16KL", "vehicle_type_tag": "16"},
     )
     assert create_mt.status_code == 200
     mt_id = create_mt.json()["record"]["mt_id"]
@@ -494,7 +559,7 @@ def test_dashboard_counts_match_database() -> None:
     assert deleted_mt_list.json()["total"] == 0
     recreate_mt = client.post(
         "/api/v1/master-crud/MOBIL_TANGKI",
-        json={"vehicle_name_raw": "BTESTCRUD-24KL", "vehicle_registration": "BTESTCRUD", "capacity_label": "24KL", "vehicle_type_tag": "24"},
+        json={"depot_id": depot.depot_id, "vehicle_name_raw": "BTESTCRUD-24KL", "vehicle_registration": "BTESTCRUD", "capacity_label": "24KL", "vehicle_type_tag": "24"},
     )
     assert recreate_mt.status_code == 200
     assert recreate_mt.json()["record"]["mt_id"] == mt_id
@@ -524,6 +589,14 @@ def test_dashboard_counts_match_database() -> None:
             )
         )
         session.add(
+            FactLoadingOrderLine(
+                loading_order_number="SYNC-ACTIVE-SOURCE-ALIAS-LO",
+                source_depot_name="SYNC ACTIVE SOURCE ALIAS",
+                shipment_id="sync_deleted_source_shipment",
+                status="ACTIVE",
+            )
+        )
+        session.add(
             MasterMT(
                 mt_id="sync_deleted_source_mt",
                 vehicle_name_raw="SYNC DELETED SOURCE MT",
@@ -543,11 +616,11 @@ def test_dashboard_counts_match_database() -> None:
 
     assert client.delete(f"/api/v1/master-crud/DEPOT/{sync_depot_id}").status_code == 200
     depot_sync = client.post("/api/v1/master-crud/DEPOT/sync")
-    assert depot_sync.status_code == 200
-    assert depot_sync.json()["reactivated"] >= 1
+    assert depot_sync.status_code == 400
+    assert "managed manually" in depot_sync.json()["detail"]
     listed_depots_after_sync = client.get("/api/v1/master/depots")
     assert listed_depots_after_sync.status_code == 200
-    assert any(row["depot_id"] == sync_depot_id for row in listed_depots_after_sync.json())
+    assert all(row["depot_id"] != sync_depot_id for row in listed_depots_after_sync.json())
 
     assert client.delete(f"/api/v1/master-crud/PRODUCT/{sync_product_id}").status_code == 200
     product_sync = client.post("/api/v1/master-crud/PRODUCT/sync")
@@ -571,13 +644,15 @@ def test_dashboard_counts_match_database() -> None:
         synced_product = session.get(MasterProduct, sync_product_id)
         synced_tag = session.get(MasterTag, sync_tag_id)
         deleted_source_depot = session.query(MasterDepot).filter(MasterDepot.depot_name == "SYNC DELETED SOURCE DEPOT").first()
+        active_source_alias_depot = session.query(MasterDepot).filter(MasterDepot.depot_name == "SYNC ACTIVE SOURCE ALIAS").first()
         deleted_source_product = session.query(MasterProduct).filter(MasterProduct.product_name == "SYNC DELETED SOURCE PRODUCT").first()
         deleted_source_tag = session.query(MasterTag).filter(MasterTag.tag_value == "SYNC DELETED SOURCE TAG").first()
     assert deleted_product.active_status == "ACTIVE"
-    assert synced_depot.active_status == "ACTIVE"
+    assert synced_depot.active_status == "DELETED"
     assert synced_product.active_status == "ACTIVE"
     assert synced_tag.active_status == "ACTIVE"
     assert deleted_source_depot is None
+    assert active_source_alias_depot is None
     assert deleted_source_product is None
     assert deleted_source_tag is None
     app.dependency_overrides.clear()

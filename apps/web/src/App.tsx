@@ -2,7 +2,7 @@ import { AlertTriangle, ArrowDown, ArrowUp, ArrowUpDown, CalendarDays, CheckCirc
 import ReactECharts from "echarts-for-react";
 import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
 import "./index.css";
-import { apiGet, apiSend, downloadFromApi, importSampleData, uploadImportFile, type SeriesPoint } from "./lib/api";
+import { apiGet, apiSend, downloadFromApi, uploadImportFile, type SeriesPoint } from "./lib/api";
 import { ChartPanel } from "./components/ChartPanel";
 import { AffinityIntelligencePage } from "./components/AffinityIntelligencePage";
 import { MachineLearningIntelligencePage } from "./components/MachineLearningIntelligencePage";
@@ -13,6 +13,7 @@ import { DocumentationPage } from "./components/DocumentationPage";
 import { Phase7OptimizationPage } from "./components/Phase7OptimizationPage";
 import { ManualDispatchPage } from "./components/ManualDispatchPage";
 import { RouteModelAlignmentPage } from "./components/RouteModelAlignmentPage";
+import { AmtSchedulerConnectorPage } from "./components/AmtSchedulerConnectorPage";
 
 type Overview = Record<string, number>;
 type Charts = Record<string, SeriesPoint[]>;
@@ -27,7 +28,13 @@ type ImportAudit = {
   warning_rows: number;
   rejected_rows: number;
   status: string;
+  processed_rows?: number;
+  file_size_bytes?: number | null;
+  error_message?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
 };
+type ImportDetail = { import: ImportAudit; preview: Array<Record<string, unknown>> };
 type QualityIssue = {
   issue_id: string;
   entity_type: string;
@@ -138,6 +145,11 @@ const pageMetadata: Record<Page, { eyebrow: string; title: string; description: 
     eyebrow: "Phase 9 · Evaluation",
     title: "Route–Model Alignment Evaluation",
     description: "Neutral, source-aligned measurement of route similarity to historical cluster, shift, SPBU pairing, and MT affinity patterns.",
+  },
+  "amt-scheduler-connector": {
+    eyebrow: "Phase 10 · Integration",
+    title: "AMT Scheduler Connector",
+    description: "Secure, read-only, versioned access to terminal, MT, historical operation, route, shift, and route-specific availability data.",
   },
   "google-maps-integration": {
     eyebrow: "Settings",
@@ -573,14 +585,14 @@ const kpiLabels: Record<string, string> = {
   data_quality_issues: "Quality Issues"
 };
 
-const crudDomainOrder = ["MOBIL_TANGKI", "SPBU", "LOADING_ORDER", "DEPOT", "PRODUCT", "TAG", "TAG_TYPE"];
+const crudDomainOrder = ["DEPOT", "MOBIL_TANGKI", "SPBU", "LOADING_ORDER", "PRODUCT", "TAG", "TAG_TYPE"];
 
 function tagTypeColumnKey(code: string): string {
   return `tag_${code.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "")}`;
 }
 
 function crudConfigs(depots: Depot[], tagTypes: TagType[]): Record<string, CrudDomainConfig> {
-  const depotOptions = [{ label: "No depot", value: "" }, ...depots.map((depot) => ({ label: depot.depot_name, value: depot.depot_id }))];
+  const requiredDepotOptions = depots.map((depot) => ({ label: depot.depot_name, value: depot.depot_id }));
   const mtTagColumns = tagTypes.map((tagType) => tagTypeColumnKey(tagType.code));
   const spbuTagColumns = tagTypes.map((tagType) => tagTypeColumnKey(tagType.code));
   const editableTagFields = tagTypes
@@ -604,15 +616,15 @@ function crudConfigs(depots: Depot[], tagTypes: TagType[]): Record<string, CrudD
       idKey: "mt_id",
       titleKey: "vehicle_registration",
       depotFilter: true,
-      columns: ["vehicle_registration", "vehicle_name_raw", "capacity_label", "number_of_compartments", ...mtTagColumns, "active_status"],
+      columns: ["depot_id", "vehicle_registration", "vehicle_name_raw", "capacity_label", "number_of_compartments", ...mtTagColumns, "active_status"],
       fields: [
         { key: "vehicle_name_raw", label: "Raw Name", required: true },
-        { key: "vehicle_registration", label: "Registration" },
+        { key: "vehicle_registration", label: "Registration", readonlyOnEdit: true },
         { key: "capacity_label", label: "Capacity" },
         { key: "vehicle_type_tag", label: "Tag Vehicle Class", kind: "number" },
         ...editableTagFields,
         { key: "number_of_compartments", label: "Compartments", kind: "number" },
-        { key: "depot_id", label: "Depot", kind: "select", options: depotOptions },
+        { key: "depot_id", label: "Depot", kind: "select", options: requiredDepotOptions, required: true, readonlyOnEdit: true },
         { key: "assignee", label: "Assignee" },
         { key: "active_status", label: "Status", kind: "select", options: statusOptions }
       ]
@@ -622,9 +634,9 @@ function crudConfigs(depots: Depot[], tagTypes: TagType[]): Record<string, CrudD
       idKey: "spbu_id",
       titleKey: "spbu_code",
       depotFilter: true,
-      columns: ["spbu_code", "city", "source_coordinate", "latitude", "longitude", "official_window_start", "official_window_end", ...spbuTagColumns, "active_status"],
+      columns: ["primary_depot_id", "spbu_code", "city", "source_coordinate", "latitude", "longitude", "official_window_start", "official_window_end", ...spbuTagColumns, "active_status"],
       fields: [
-        { key: "spbu_code", label: "SPBU Code", required: true },
+        { key: "spbu_code", label: "SPBU Code", required: true, readonlyOnEdit: true },
         { key: "spbu_name", label: "Name" },
         { key: "address", label: "Address", kind: "textarea" },
         { key: "city", label: "City" },
@@ -635,7 +647,7 @@ function crudConfigs(depots: Depot[], tagTypes: TagType[]): Record<string, CrudD
         { key: "master_travel_time_min", label: "Travel Time Min", kind: "number" },
         { key: "vehicle_type_tag", label: "Tag Vehicle Class", kind: "number" },
         ...editableTagFields,
-        { key: "primary_depot_id", label: "Depot", kind: "select", options: depotOptions },
+        { key: "primary_depot_id", label: "Depot", kind: "select", options: requiredDepotOptions, required: true, readonlyOnEdit: true },
         { key: "official_window_start", label: "Official Window Start", kind: "time", required: true, defaultValue: "00:00" },
         { key: "official_window_end", label: "Official Window End", kind: "time", required: true, defaultValue: "23:59" },
         { key: "active_status", label: "Status", kind: "select", options: statusOptions }
@@ -648,6 +660,7 @@ function crudConfigs(depots: Depot[], tagTypes: TagType[]): Record<string, CrudD
       depotFilter: true,
       statusFilter: false,
       columns: [
+        "depot_id",
         "loading_order_number",
         "source_depot_name",
         "shipment_id",
@@ -667,6 +680,7 @@ function crudConfigs(depots: Depot[], tagTypes: TagType[]): Record<string, CrudD
         "status"
       ],
       fields: [
+        { key: "depot_id", label: "Depot", kind: "select", options: requiredDepotOptions, required: true, readonlyOnEdit: true },
         { key: "loading_order_number", label: "Loading Order Number", required: true, readonlyOnEdit: true },
         { key: "source_depot_name", label: "Depot Name (TBBM)", required: true, readonlyOnEdit: true },
         { key: "shipment_id", label: "Shipment ID", required: true },
@@ -684,7 +698,7 @@ function crudConfigs(depots: Depot[], tagTypes: TagType[]): Record<string, CrudD
       label: "Depot",
       idKey: "depot_id",
       titleKey: "depot_name",
-      columns: ["depot_code", "depot_name", "latitude", "longitude", "region", "timezone", "depot_operational_start", "depot_operational_end", "active_status"],
+      columns: ["depot_id", "depot_code", "depot_name", "latitude", "longitude", "region", "timezone", "depot_operational_start", "depot_operational_end", "active_status"],
       fields: [
         { key: "depot_code", label: "Depot Code" },
         { key: "depot_name", label: "Depot Name", required: true },
@@ -876,6 +890,7 @@ function pageFromPath(pathname: string): Page {
   if (pathname === "/phase7-optimization") return "phase7-optimization";
   if (pathname === "/phase-8/manual-dispatch" || pathname.startsWith("/phase-8/manual-dispatch/")) return "manual-dispatch";
   if (pathname === "/phase9/route-model-alignment") return "route-model-alignment";
+  if (pathname === "/phase10/amt-scheduler-connector") return "amt-scheduler-connector";
   if (pathname === "/settings/google-maps-integration") return "google-maps-integration";
   if (pathname === "/documentation") return "documentation";
   return "dashboard";
@@ -1180,6 +1195,10 @@ function App() {
   const [compatibility, setCompatibility] = useState<CompatibilitySummary | null>(null);
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [activeImportId, setActiveImportId] = useState<string | null>(() => window.localStorage.getItem("dispatch-active-import-id"));
+  const [activeImportStatus, setActiveImportStatus] = useState<string | null>(() => (
+    window.localStorage.getItem("dispatch-active-import-id") ? "QUEUED" : null
+  ));
   const [exporting, setExporting] = useState(false);
   const [domain, setDomain] = useState("MOBIL_TANGKI");
   const [sheetName, setSheetName] = useState("Mobil Tangki");
@@ -1640,6 +1659,45 @@ function App() {
   }, [currentPage, crudDomain, crudOffset, crudLimit, crudDepotId, crudAppliedSearch, crudAppliedSearchColumn, crudSortColumn, crudSortDirection]);
 
   useEffect(() => {
+    if (!activeImportId) return;
+    let cancelled = false;
+    let timer: number | undefined;
+
+    async function pollImport() {
+      try {
+        const payload = await apiGet<ImportDetail>(`/api/v1/imports/${activeImportId}`);
+        if (cancelled) return;
+        const nextStatus = payload.import.status;
+        setActiveImportStatus(nextStatus);
+        setImports((current) => [
+          payload.import,
+          ...current.filter((item) => item.import_id !== payload.import.import_id)
+        ].slice(0, 8));
+        if (["PUBLISHED", "STAGED", "FAILED"].includes(nextStatus)) {
+          window.localStorage.removeItem("dispatch-active-import-id");
+          setActiveImportId(null);
+          setUploading(false);
+          await refresh();
+          if (currentPage === "master-data") await fetchCrud();
+          if (nextStatus === "FAILED") {
+            setError(payload.import.error_message || "File import failed");
+          }
+          return;
+        }
+      } catch (err) {
+        if (!cancelled) setError(err instanceof Error ? err.message : "Failed to read import status");
+      }
+      if (!cancelled) timer = window.setTimeout(pollImport, 1500);
+    }
+
+    void pollImport();
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [activeImportId, currentPage]);
+
+  useEffect(() => {
     if (currentPage === "tag-consistency") {
       fetchTagAnalysis();
     }
@@ -1715,7 +1773,7 @@ function App() {
   const crudPageCount = isCrudAllRecords ? 1 : Math.max(1, Math.ceil(crudTotal / crudPageSizeNumber));
   const canPreviousCrudPage = !isCrudAllRecords && crudOffset > 0 && !crudLoading;
   const canNextCrudPage = !isCrudAllRecords && crudOffset + crudPageSizeNumber < crudTotal && !crudLoading;
-  const canSyncCrudDomain = ["DEPOT", "PRODUCT", "TAG"].includes(crudDomain);
+  const canSyncCrudDomain = ["PRODUCT", "TAG"].includes(crudDomain);
   const tagSummary = tagAnalysis?.summary ?? emptyTagConsistencySummary;
   const tagRows = tagAnalysis?.rows ?? [];
   const tagTotal = tagAnalysis?.total ?? 0;
@@ -1969,19 +2027,6 @@ function App() {
   const visibleSpbuMismatchRows = allSpbuMismatchRows.slice(spbuMismatchPage * mismatchRowsPerPage, (spbuMismatchPage + 1) * mismatchRowsPerPage);
   const visibleMtMismatchRows = allMtMismatchRows.slice(mtMismatchPage * mismatchRowsPerPage, (mtMismatchPage + 1) * mismatchRowsPerPage);
 
-  async function handleImportSample() {
-    setLoading(true);
-    setError(null);
-    try {
-      await importSampleData();
-      await refresh();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Import failed");
-    } finally {
-      setLoading(false);
-    }
-  }
-
   function handleDomainChange(nextDomain: string) {
     setDomain(nextDomain);
     const defaultSheets: Record<string, string> = {
@@ -2000,11 +2045,13 @@ function App() {
     setUploading(true);
     setError(null);
     try {
-      await uploadImportFile(domain, sheetName || "Sheet1", file);
+      const queued = await uploadImportFile(domain, sheetName || "Sheet1", file);
+      window.localStorage.setItem("dispatch-active-import-id", queued.import_id);
+      setActiveImportId(queued.import_id);
+      setActiveImportStatus(queued.status);
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "File import failed");
-    } finally {
       setUploading(false);
     }
   }
@@ -2680,6 +2727,8 @@ function App() {
                       ? "/phase-8/manual-dispatch"
                     : page === "route-model-alignment"
                       ? "/phase9/route-model-alignment"
+                    : page === "amt-scheduler-connector"
+                      ? "/phase10/amt-scheduler-connector"
                     : page === "google-maps-integration"
                       ? "/settings/google-maps-integration"
                       : page === "documentation"
@@ -2968,6 +3017,10 @@ function App() {
 
         {currentPage === "route-model-alignment" && (
           <RouteModelAlignmentPage depots={depots} />
+        )}
+
+        {currentPage === "amt-scheduler-connector" && (
+          <AmtSchedulerConnectorPage depots={depots} />
         )}
 
         {currentPage === "google-maps-integration" && (
@@ -4209,7 +4262,7 @@ function App() {
             <FileUp size={16} />
             Import Data
           </div>
-          <div className="grid gap-3 lg:grid-cols-[0.9fr_1.2fr_auto_auto_auto_auto]">
+          <div className="grid gap-3 lg:grid-cols-[0.9fr_1.2fr_auto_auto_auto]">
             <select className="border border-line bg-white px-3 py-2 text-sm" value={domain} onChange={(event) => handleDomainChange(event.target.value)} title="Import domain">
               <option value="MOBIL_TANGKI">Mobil Tangki</option>
               <option value="SPBU">SPBU</option>
@@ -4218,9 +4271,9 @@ function App() {
             </select>
             <input className="border border-line px-3 py-2 text-sm" value={sheetName} onChange={(event) => setSheetName(event.target.value)} placeholder="Sheet name" title="Sheet name" />
             <input ref={fileInputRef} className="hidden" type="file" accept=".xlsx,.csv,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={handleFileSelected} />
-            <button className="inline-flex items-center justify-center gap-2 bg-amber px-3 py-2 text-sm font-medium text-white disabled:opacity-60" onClick={() => fileInputRef.current?.click()} disabled={uploading} title="Choose XLSX or CSV file to import">
+            <button className="inline-flex items-center justify-center gap-2 bg-amber px-3 py-2 text-sm font-medium text-white disabled:opacity-60" onClick={() => fileInputRef.current?.click()} disabled={uploading || Boolean(activeImportId)} title="Choose XLSX or CSV file to import">
               <FileUp size={16} />
-              {uploading ? "Uploading" : "Import File"}
+              {uploading ? "Uploading" : activeImportId ? "Import Processing" : "Import File"}
             </button>
             <button className="inline-flex items-center justify-center gap-2 border border-line px-3 py-2 text-sm" onClick={handleExportTemplate} disabled={exporting} title="Download import template">
               <Download size={16} />
@@ -4230,11 +4283,13 @@ function App() {
               <RefreshCw size={16} />
               Refresh
             </button>
-            <button className="inline-flex items-center justify-center gap-2 bg-mint px-3 py-2 text-sm font-medium text-white disabled:opacity-60" onClick={handleImportSample} disabled={loading} title="Load provided Phase 0 sample workbooks">
-              <FileUp size={16} />
-              {loading ? "Importing" : "Import Samples"}
-            </button>
           </div>
+          {activeImportId && (
+            <div className="mt-3 border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-800">
+              Import tetap berjalan di background dan aman jika halaman di-refresh. Status: {activeImportStatus || "QUEUED"}.
+              Tabel akan diperbarui otomatis setelah selesai.
+            </div>
+          )}
         </section>
         )}
 
@@ -4310,7 +4365,12 @@ function App() {
                     <td className="py-2 pr-3">{item.total_rows.toLocaleString()}</td>
                     <td className="py-2 pr-3">{item.valid_rows.toLocaleString()}</td>
                     <td className="py-2 pr-3">{item.warning_rows.toLocaleString()}</td>
-                    <td className="py-2 pr-3">{item.status}</td>
+                    <td className="py-2 pr-3" title={item.error_message || undefined}>
+                      {item.status}
+                      {item.status === "PROCESSING" && item.total_rows > 0 && (
+                        <span className="ml-1 text-xs text-slate-500">({item.processed_rows || 0}/{item.total_rows})</span>
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>

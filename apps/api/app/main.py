@@ -5,8 +5,6 @@ import base64
 import json
 import logging
 import re
-import shutil
-import tempfile
 from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime, time
@@ -14,9 +12,14 @@ from io import BytesIO, StringIO
 from pathlib import Path
 
 from fastapi import Body, Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
+from openpyxl.workbook.defined_name import DefinedName
+from openpyxl.worksheet.datavalidation import DataValidation
 from pydantic import BaseModel, Field
 from sqlalchemy import String, Time, cast, delete, desc, func, select
 from sqlalchemy.exc import IntegrityError
@@ -42,12 +45,10 @@ from .departure_intelligence import (
     list_saved_shift_analysis_configs,
     save_shift_analysis_config,
 )
-from .importer import ImportProcessor
 from .models import (
     BridgeMTTag,
     BridgeSPBUTag,
     DataQualityIssue,
-    DepotIdentifierAlias,
     FactLoadingOrderLine,
     FactShipment,
     FactShipmentSPBU,
@@ -65,7 +66,7 @@ from .models import (
     StgSPBU,
     TagAlias,
 )
-from .normalization import clean_str, infer_tag_type, make_id, normalize_key, normalize_product, parse_coordinate, parse_mt_name, source_int, source_number, source_time, split_project_tags
+from .normalization import clean_str, file_sha256, infer_tag_type, make_id, normalize_key, normalize_product, parse_coordinate, parse_mt_name, source_int, source_number, source_time, split_project_tags
 from .pairing_intelligence import (
     build_pairing_date_availability,
     build_pairing_intelligence_payload,
@@ -80,6 +81,14 @@ from .phase6_routes import router as phase6_router
 from .phase7_routes import router as phase7_router
 from .phase8_routes import router as phase8_router
 from .phase9_routes import router as phase9_router
+from .phase10_auth import IntegrationAPIError
+from .phase10_http import (
+    integration_error_handler,
+    integration_validation_error_handler,
+    phase10_request_middleware,
+)
+from .phase10_routes import console_router as phase10_console_router
+from .phase10_routes import router as phase10_router
 from .phase7_service import recover_interrupted_phase7_optimizations
 from .google_routes_settings_routes import router as google_routes_settings_router
 from .tag_consistency import build_tag_consistency_payload, get_tag_consistency_detail
@@ -117,11 +126,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.middleware("http")(phase10_request_middleware)
+app.add_exception_handler(IntegrationAPIError, integration_error_handler)
+app.add_exception_handler(RequestValidationError, integration_validation_error_handler)
 app.include_router(phase5_router)
 app.include_router(phase6_router)
 app.include_router(phase7_router)
 app.include_router(phase8_router)
 app.include_router(phase9_router)
+app.include_router(phase10_router)
+app.include_router(phase10_console_router)
 app.include_router(google_routes_settings_router)
 
 
@@ -216,40 +230,70 @@ class SaveAffinityAnalysisConfigRequest(BaseModel):
 
 
 IMPORT_TEMPLATE_COLUMNS = {
-    "MOBIL_TANGKI": ["id", "name", "assignee", "hubId", "vehicleType tag", "project_tag", "numberOfCompartments", "Depot"],
-    "SPBU": ["Nama SPBU", "Address", "Kota", "Coordinate", "jarak_km", "waktu_menit", "Vehicle Type tag", "Project tag", "Depot", "Official Window Start", "Official Window End"],
+    "MOBIL_TANGKI": [
+        "depot_id",
+        "vehicle_registration",
+        "vehicle_name_raw",
+        "capacity_label",
+        "vehicle_type_tag",
+        "project_tag",
+        "number_of_compartments",
+        "active_status",
+    ],
+    "SPBU": [
+        "depot_id",
+        "spbu_code",
+        "spbu_name",
+        "address",
+        "city",
+        "source_coordinate",
+        "latitude",
+        "longitude",
+        "master_distance_km",
+        "master_travel_time_min",
+        "vehicle_type_tag",
+        "project_tag",
+        "official_window_start",
+        "official_window_end",
+        "active_status",
+    ],
     "LOADING_ORDER": [
+        "depot_id",
+        "shipment_id",
+        "loading_order_number",
+        "source_depot_name",
+        "operating_date",
+        "vehicle_registration",
+        "vehicle_type_tag",
+        "project_tag",
+        "validation_date",
+        "validation_time",
+        "gate_out_date",
+        "gate_out_time",
+        "shipment_end_date",
+        "shipment_end_time",
+        "source_spbu_code",
+        "shipto",
+        "source_product_name",
+        "quantity",
+        "driver_name",
+        "driver_nip",
+        "assistant_name",
+        "assistant_nip",
+        "status",
+        "source_distance_km",
+        "actual_km",
         "area_id",
         "area",
-        "kode_depot",
-        "tbbm",
-        "shipment_id",
-        "date",
-        "date_validasi",
-        "Jam Validasi",
-        "date_gate_out",
-        "Jam_gateout",
-        "date_end_shipment",
-        "jam_end_shipment",
-        "nopol",
-        "Vehicle Type tag",
-        "Project tag",
-        "nama_spbu",
-        "shipto",
-        "loading_order_number",
-        "produk",
-        "quantity",
-        "supir_parent_id",
-        "supir",
-        "nip_supir",
-        "status",
-        "jarak_spbu",
-        "km_aktual",
-        "kernet_parent_id",
-        "kernet",
-        "nip_kernet",
     ],
     "GPS": ["vehicle_registration", "event_datetime", "latitude", "longitude", "speed", "heading", "source_device_id"],
+}
+
+IMPORT_TEMPLATE_REQUIRED = {
+    "MOBIL_TANGKI": {"depot_id", "vehicle_registration"},
+    "SPBU": {"depot_id", "spbu_code"},
+    "LOADING_ORDER": {"depot_id", "shipment_id", "loading_order_number", "source_depot_name"},
+    "GPS": {"vehicle_registration", "event_datetime"},
 }
 
 EXPORT_DOMAIN_LABELS = {
@@ -266,61 +310,79 @@ def health() -> dict[str, str]:
     return {"status": "ok", "phase": "0", "service": "dispatch-intelligence-api"}
 
 
-@app.post("/api/v1/imports/sample")
-def import_sample_data(db: Session = Depends(get_db)) -> dict:
-    if not settings.example_data_dir.exists():
-        raise HTTPException(status_code=404, detail=f"Example data dir not found: {settings.example_data_dir}")
-    results = ImportProcessor(db).import_examples(settings.example_data_dir)
-    return {"status": "PUBLISHED", "imports": results}
-
-
-@app.post("/api/v1/imports")
+@app.post("/api/v1/imports", status_code=202)
 def upload_import(domain: str, sheet_name: str, file: UploadFile = File(...), db: Session = Depends(get_db)) -> dict:
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in {".xlsx", ".csv"}:
         raise HTTPException(status_code=400, detail="Only XLSX and CSV are supported in Phase 0.")
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as handle:
-        shutil.copyfileobj(file.file, handle)
-        temp_path = Path(handle.name)
-    processor = ImportProcessor(db)
     normalized_domain = domain.upper()
-    original_filename = file.filename or temp_path.name
+    normalized_domain = {
+        "MT": "MOBIL_TANGKI",
+        "MOBIL_TANGKI": "MOBIL_TANGKI",
+        "SPBU": "SPBU",
+        "LO": "LOADING_ORDER",
+        "LOADING_ORDER": "LOADING_ORDER",
+        "GPS": "GPS",
+    }.get(normalized_domain, "")
+    if not normalized_domain:
+        raise HTTPException(status_code=400, detail="Unknown import domain.")
+    original_filename = Path(file.filename or f"upload{suffix}").name
+    import_id = make_id("imp", normalized_domain, original_filename, datetime.now().isoformat())
+    settings.import_upload_dir.mkdir(parents=True, exist_ok=True)
+    stored_path = settings.import_upload_dir / f"{import_id}{suffix}"
     try:
-        if normalized_domain in {"MT", "MOBIL_TANGKI"}:
-            import_id = processor.import_master_mt(temp_path, sheet_name, filename=original_filename)
-        elif normalized_domain == "SPBU":
-            import_id = processor.import_master_spbu(temp_path, sheet_name, filename=original_filename)
-        elif normalized_domain in {"LO", "LOADING_ORDER"}:
-            import_id = processor.import_loading_order(temp_path, sheet_name, filename=original_filename)
-        elif normalized_domain == "GPS":
-            import_id = processor.stage_gps_file(temp_path, sheet_name, filename=original_filename)
-        else:
-            raise HTTPException(status_code=400, detail="Unknown import domain.")
-    except ValueError as exc:
+        file_size = 0
+        with stored_path.open("wb") as handle:
+            while chunk := file.file.read(1024 * 1024):
+                handle.write(chunk)
+                file_size += len(chunk)
+        audit = ImportAudit(
+            import_id=import_id,
+            domain=normalized_domain,
+            filename=original_filename,
+            file_checksum=file_sha256(stored_path),
+            sheet_name=sheet_name,
+            uploaded_by="local-user",
+            status="QUEUED",
+            mapping_version="phase0.v2",
+            stored_path=str(stored_path),
+            file_size_bytes=file_size,
+        )
+        db.add(audit)
+        db.commit()
+    except Exception as exc:
         db.rollback()
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"import_id": import_id, "domain": normalized_domain}
+        stored_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail="Could not queue the uploaded import file.") from exc
+    return {"import_id": import_id, "domain": normalized_domain, "status": "QUEUED"}
+
+
+def import_audit_payload(audit: ImportAudit) -> dict:
+    return {
+        "import_id": audit.import_id,
+        "domain": audit.domain,
+        "filename": audit.filename,
+        "sheet_name": audit.sheet_name,
+        "uploaded_at": audit.uploaded_at,
+        "total_rows": audit.total_rows,
+        "valid_rows": audit.valid_rows,
+        "warning_rows": audit.warning_rows,
+        "rejected_rows": audit.rejected_rows,
+        "status": audit.status,
+        "mapping_version": audit.mapping_version,
+        "processed_rows": audit.processed_rows,
+        "file_size_bytes": audit.file_size_bytes,
+        "error_message": audit.error_message,
+        "started_at": audit.started_at,
+        "completed_at": audit.completed_at,
+        "attempt_count": audit.attempt_count,
+    }
 
 
 @app.get("/api/v1/imports")
 def list_imports(db: Session = Depends(get_db)) -> list[dict]:
     audits = db.scalars(select(ImportAudit).order_by(desc(ImportAudit.uploaded_at)).limit(8)).all()
-    return [
-        {
-            "import_id": audit.import_id,
-            "domain": audit.domain,
-            "filename": audit.filename,
-            "sheet_name": audit.sheet_name,
-            "uploaded_at": audit.uploaded_at,
-            "total_rows": audit.total_rows,
-            "valid_rows": audit.valid_rows,
-            "warning_rows": audit.warning_rows,
-            "rejected_rows": audit.rejected_rows,
-            "status": audit.status,
-            "mapping_version": audit.mapping_version,
-        }
-        for audit in audits
-    ]
+    return [import_audit_payload(audit) for audit in audits]
 
 
 @app.get("/api/v1/imports/{import_id}")
@@ -345,7 +407,7 @@ def get_import(import_id: str, db: Session = Depends(get_db)) -> dict:
             }
             for row in db.scalars(select(staging_model).where(staging_model.import_id == import_id).limit(50)).all()
         ]
-    return {"import": public(audit), "preview": preview}
+    return {"import": import_audit_payload(audit), "preview": preview}
 
 
 @app.get("/api/v1/foundation/overview")
@@ -531,7 +593,7 @@ def list_depots(db: Session = Depends(get_db)) -> list[dict]:
 
 
 @app.get("/api/v1/exports/template")
-def export_template(domain: str, file_format: str = "xlsx") -> StreamingResponse:
+def export_template(domain: str, file_format: str = "xlsx", db: Session = Depends(get_db)) -> StreamingResponse:
     normalized_domain = normalize_export_domain(domain)
     if normalized_domain not in IMPORT_TEMPLATE_COLUMNS:
         raise HTTPException(status_code=400, detail="Template is available for MOBIL_TANGKI, SPBU, LOADING_ORDER, or GPS.")
@@ -540,7 +602,17 @@ def export_template(domain: str, file_format: str = "xlsx") -> StreamingResponse
     filename_base = f"template_{normalized_domain.lower()}"
     if normalized_format == "csv":
         return csv_response(IMPORT_TEMPLATE_COLUMNS[normalized_domain], rows, f"{filename_base}.csv")
-    return workbook_response([(EXPORT_DOMAIN_LABELS.get(normalized_domain, normalized_domain), IMPORT_TEMPLATE_COLUMNS[normalized_domain], rows)], f"{filename_base}.xlsx")
+    depots = db.scalars(
+        select(MasterDepot)
+        .where(MasterDepot.active_status != "DELETED")
+        .order_by(MasterDepot.depot_name, MasterDepot.depot_id)
+    ).all()
+    return workbook_response(
+        [(EXPORT_DOMAIN_LABELS.get(normalized_domain, normalized_domain), IMPORT_TEMPLATE_COLUMNS[normalized_domain], rows)],
+        f"{filename_base}.xlsx",
+        template_required=IMPORT_TEMPLATE_REQUIRED[normalized_domain],
+        depot_reference=depots if "depot_id" in IMPORT_TEMPLATE_COLUMNS[normalized_domain] else None,
+    )
 
 
 @app.get("/api/v1/exports/data")
@@ -621,14 +693,12 @@ def crud_create_master(domain: str, payload: dict = Body(...), db: Session = Dep
 @app.post("/api/v1/master-crud/{domain}/sync")
 def crud_sync_master(domain: str, db: Session = Depends(get_db)) -> dict:
     normalized_domain = normalize_crud_domain(domain)
-    if normalized_domain == "DEPOT":
-        result = sync_depots_from_sources(db)
-    elif normalized_domain == "PRODUCT":
+    if normalized_domain == "PRODUCT":
         result = sync_products_from_sources(db)
     elif normalized_domain == "TAG":
         result = sync_tags_from_sources(db)
     else:
-        raise HTTPException(status_code=400, detail="Sync is available only for DEPOT, PRODUCT, and TAG.")
+        raise HTTPException(status_code=400, detail="Sync is available only for PRODUCT and TAG. Depot records must be managed manually.")
     db.commit()
     return {"domain": normalized_domain, **result}
 
@@ -1169,7 +1239,7 @@ def crud_model_and_key(domain: str):
     mapping = {
         "MOBIL_TANGKI": (MasterMT, MasterMT.mt_id),
         "SPBU": (MasterSPBU, MasterSPBU.spbu_id),
-        "LOADING_ORDER": (FactLoadingOrderLine, FactLoadingOrderLine.loading_order_number),
+        "LOADING_ORDER": (FactLoadingOrderLine, FactLoadingOrderLine.loading_order_id),
         "DEPOT": (MasterDepot, MasterDepot.depot_id),
         "PRODUCT": (MasterProduct, MasterProduct.product_id),
         "TAG": (MasterTag, MasterTag.tag_id),
@@ -1196,8 +1266,6 @@ def decode_loading_order_record_id(record_id: str) -> tuple[str, str]:
 
 def get_crud_record(db: Session, domain: str, record_id: str):
     model, _ = crud_model_and_key(domain)
-    if domain == "LOADING_ORDER":
-        return db.get(model, decode_loading_order_record_id(record_id))
     return db.get(model, record_id)
 
 
@@ -1274,7 +1342,7 @@ def serialize_crud_record(
 ) -> dict:
     data = public(record)
     if domain == "LOADING_ORDER":
-        data["crud_record_id"] = encode_loading_order_record_id(record.loading_order_number, record.source_depot_name)
+        data["crud_record_id"] = record.loading_order_id
         shipment = (lo_shipment_values or {}).get(record.shipment_id)
         data["vehicle_registration"] = shipment.vehicle_registration if shipment else None
         data["validation_datetime"] = shipment.validation_datetime if shipment else None
@@ -1330,6 +1398,7 @@ def crud_default_sort_columns(domain: str) -> tuple:
 def crud_search_columns(domain: str) -> dict[str, object]:
     return {
         "MOBIL_TANGKI": {
+            "depot_id": MasterMT.depot_id,
             "vehicle_registration": MasterMT.vehicle_registration,
             "vehicle_name_raw": MasterMT.vehicle_name_raw,
             "tag_vehicle_class": MasterMT.vehicle_type_tag,
@@ -1339,8 +1408,10 @@ def crud_search_columns(domain: str) -> dict[str, object]:
             "active_status": MasterMT.active_status,
         },
         "SPBU": {
+            "primary_depot_id": MasterSPBU.primary_depot_id,
             "spbu_code": MasterSPBU.spbu_code,
             "city": MasterSPBU.city,
+            "source_coordinate": MasterSPBU.source_coordinate,
             "tag_vehicle_class": MasterSPBU.vehicle_type_tag,
             "vehicle_type_tag": MasterSPBU.vehicle_type_tag,
             "latitude": MasterSPBU.latitude,
@@ -1350,6 +1421,7 @@ def crud_search_columns(domain: str) -> dict[str, object]:
             "active_status": MasterSPBU.active_status,
         },
         "LOADING_ORDER": {
+            "depot_id": FactShipment.depot_id,
             "loading_order_number": FactLoadingOrderLine.loading_order_number,
             "source_depot_name": FactLoadingOrderLine.source_depot_name,
             "shipment_id": FactLoadingOrderLine.shipment_id,
@@ -1371,6 +1443,7 @@ def crud_search_columns(domain: str) -> dict[str, object]:
             "status": FactLoadingOrderLine.status,
         },
         "DEPOT": {
+            "depot_id": MasterDepot.depot_id,
             "depot_code": MasterDepot.depot_code,
             "depot_name": MasterDepot.depot_name,
             "latitude": MasterDepot.latitude,
@@ -1566,8 +1639,9 @@ def build_crud_record(domain: str, payload: dict):
         capacity = clean_str(payload.get("capacity_label"))
         if not registration:
             registration, capacity, _ = parse_mt_name(raw_name)
+        depot_id = required_text(payload, "depot_id")
         return MasterMT(
-            mt_id=make_id("mt", registration or raw_name),
+            mt_id=make_id("mt", depot_id, registration or raw_name),
             source_mt_id=clean_str(payload.get("source_mt_id")),
             vehicle_name_raw=raw_name,
             vehicle_registration=registration,
@@ -1576,13 +1650,14 @@ def build_crud_record(domain: str, payload: dict):
             project_tag_raw=clean_str(payload.get("project_tag_raw")),
             number_of_compartments=source_int(payload.get("number_of_compartments")),
             large_vehicle_profile_status="NOT_REQUIRED",
-            depot_id=clean_str(payload.get("depot_id")),
+            depot_id=depot_id,
             source_hub_id=clean_str(payload.get("source_hub_id")),
             assignee=clean_str(payload.get("assignee")),
             active_status=clean_str(payload.get("active_status")) or "ACTIVE",
         )
     if domain == "SPBU":
         code = required_text(payload, "spbu_code")
+        depot_id = required_text(payload, "primary_depot_id")
         source_coordinate = clean_str(payload.get("source_coordinate"))
         latitude = source_number(payload.get("latitude"))
         longitude = source_number(payload.get("longitude"))
@@ -1592,7 +1667,7 @@ def build_crud_record(domain: str, payload: dict):
                 latitude = parsed_latitude
                 longitude = parsed_longitude
         return MasterSPBU(
-            spbu_id=make_id("spbu", code),
+            spbu_id=make_id("spbu", depot_id, code),
             spbu_code=code,
             spbu_name=clean_str(payload.get("spbu_name")) or code,
             address=clean_str(payload.get("address")),
@@ -1604,15 +1679,19 @@ def build_crud_record(domain: str, payload: dict):
             master_travel_time_min=source_number(payload.get("master_travel_time_min")),
             vehicle_type_tag=source_int(payload.get("vehicle_type_tag")),
             project_tag_raw=clean_str(payload.get("project_tag_raw")),
-            primary_depot_id=clean_str(payload.get("primary_depot_id")),
+            primary_depot_id=depot_id,
             active_status=clean_str(payload.get("active_status")) or "ACTIVE",
             official_window_start=source_time(payload.get("official_window_start"), time(0, 0)),
             official_window_end=source_time(payload.get("official_window_end"), time(23, 59)),
         )
     if domain == "LOADING_ORDER":
         source_depot_name = required_text(payload, "source_depot_name")
+        depot_id = required_text(payload, "depot_id")
+        loading_order_number = required_text(payload, "loading_order_number")
         return FactLoadingOrderLine(
-            loading_order_number=required_text(payload, "loading_order_number"),
+            loading_order_id=make_id("lo", depot_id, loading_order_number),
+            loading_order_number=loading_order_number,
+            depot_id=depot_id,
             source_depot_name=source_depot_name,
             shipment_id=required_text(payload, "shipment_id"),
             spbu_id=clean_str(payload.get("spbu_id")),
@@ -1748,11 +1827,8 @@ def apply_crud_tag_links(db: Session, domain: str, record, payload: dict) -> Non
 
 def reactivate_deleted_crud_record(db: Session, domain: str, record):
     model, key_column = crud_model_and_key(domain)
-    if domain == "LOADING_ORDER":
-        existing = db.get(model, (record.loading_order_number, record.source_depot_name))
-    else:
-        record_id = getattr(record, key_column.key)
-        existing = db.get(model, record_id)
+    record_id = getattr(record, key_column.key)
+    existing = db.get(model, record_id)
     if not existing:
         existing = find_deleted_crud_record_by_business_key(db, domain, record)
     if not existing:
@@ -1769,9 +1845,9 @@ def reactivate_deleted_crud_record(db: Session, domain: str, record):
 
 def find_deleted_crud_record_by_business_key(db: Session, domain: str, record):
     if domain == "MOBIL_TANGKI" and record.vehicle_registration:
-        return db.scalar(select(MasterMT).where(MasterMT.vehicle_registration == record.vehicle_registration, MasterMT.active_status == "DELETED"))
+        return db.scalar(select(MasterMT).where(MasterMT.depot_id == record.depot_id, MasterMT.vehicle_registration == record.vehicle_registration, MasterMT.active_status == "DELETED"))
     if domain == "SPBU" and record.spbu_code:
-        return db.scalar(select(MasterSPBU).where(MasterSPBU.spbu_code == record.spbu_code, MasterSPBU.active_status == "DELETED"))
+        return db.scalar(select(MasterSPBU).where(MasterSPBU.primary_depot_id == record.primary_depot_id, MasterSPBU.spbu_code == record.spbu_code, MasterSPBU.active_status == "DELETED"))
     if domain == "DEPOT" and record.depot_code:
         return db.scalar(select(MasterDepot).where(MasterDepot.depot_code == record.depot_code, MasterDepot.active_status == "DELETED"))
     if domain == "PRODUCT" and record.normalized_product:
@@ -1792,92 +1868,6 @@ def record_sync(result: dict, outcome: str) -> None:
 
 def active_loading_order_filter():
     return (FactLoadingOrderLine.status.is_(None)) | (FactLoadingOrderLine.status != "DELETED")
-
-
-def sync_depot_candidate(db: Session, name, code, result: dict) -> None:
-    depot_name = clean_str(name) or clean_str(code)
-    if not depot_name:
-        record_sync(result, "skipped")
-        return
-    normalized_name = normalize_key(depot_name)
-    if not normalized_name:
-        record_sync(result, "skipped")
-        return
-    depot_code = clean_str(code) or normalized_name
-    depot_id = make_id("depot", normalized_name)
-    depot = db.get(MasterDepot, depot_id)
-    if not depot and depot_code:
-        depot = db.scalar(select(MasterDepot).where(MasterDepot.depot_code == depot_code))
-    if not depot:
-        db.add(MasterDepot(depot_id=depot_id, depot_code=depot_code, depot_name=depot_name, active_status="ACTIVE", source_import_id="sync:depot"))
-        actual_depot_id = depot_id
-        outcome = "created"
-    else:
-        actual_depot_id = depot.depot_id
-        outcome = "reactivated" if depot.active_status == "DELETED" else "updated"
-        depot.depot_code = depot.depot_code or depot_code
-        depot.depot_name = depot_name
-        depot.active_status = "ACTIVE"
-        depot.source_import_id = depot.source_import_id or "sync:depot"
-    db.merge(
-        DepotIdentifierAlias(
-            depot_identifier_alias_id=make_id("depotalias", actual_depot_id, "DEPOT_NAME", depot_name),
-            depot_id=actual_depot_id,
-            identifier_type="DEPOT_NAME",
-            identifier_value=depot_name,
-            normalized_identifier=normalized_name,
-            source_system="SYNC",
-            active_status="ACTIVE",
-        )
-    )
-    if depot_code:
-        db.merge(
-            DepotIdentifierAlias(
-                depot_identifier_alias_id=make_id("depotalias", actual_depot_id, "DEPOT_CODE", depot_code),
-                depot_id=actual_depot_id,
-                identifier_type="DEPOT_CODE",
-                identifier_value=depot_code,
-                normalized_identifier=normalize_key(depot_code) or depot_code,
-                source_system="SYNC",
-                active_status="ACTIVE",
-            )
-        )
-    db.flush()
-    record_sync(result, outcome)
-
-
-def sync_depots_from_sources(db: Session) -> dict:
-    result = sync_result()
-    seen: set[tuple[str | None, str | None]] = set()
-
-    def add_candidate(name, code=None):
-        key = (normalize_key(name), normalize_key(code))
-        if key in seen:
-            return
-        seen.add(key)
-        sync_depot_candidate(db, name, code, result)
-
-    for (source_depot_name,) in db.execute(
-        select(FactLoadingOrderLine.source_depot_name)
-        .where(FactLoadingOrderLine.source_depot_name.is_not(None), active_loading_order_filter())
-        .distinct()
-    ).all():
-        add_candidate(source_depot_name)
-    for depot_id in {
-        value
-        for (value,) in db.execute(select(MasterMT.depot_id).where(MasterMT.depot_id.is_not(None), MasterMT.active_status != "DELETED")).all()
-        + db.execute(select(MasterSPBU.primary_depot_id).where(MasterSPBU.primary_depot_id.is_not(None), MasterSPBU.active_status != "DELETED")).all()
-        + db.execute(
-            select(FactShipment.depot_id)
-            .join(FactLoadingOrderLine, FactLoadingOrderLine.shipment_id == FactShipment.shipment_id)
-            .where(FactShipment.depot_id.is_not(None), active_loading_order_filter())
-            .distinct()
-        ).all()
-    }:
-        depot = db.get(MasterDepot, depot_id)
-        if depot:
-            add_candidate(depot.depot_name, depot.depot_code)
-    return result
 
 
 def sync_product_candidate(db: Session, product_name, result: dict) -> None:
@@ -2027,18 +2017,75 @@ def format_cell(value):
     return value
 
 
-def workbook_response(sheets: list[tuple[str, list[str], list[list]]], filename: str) -> StreamingResponse:
+def workbook_response(
+    sheets: list[tuple[str, list[str], list[list]]],
+    filename: str,
+    template_required: set[str] | None = None,
+    depot_reference: list[MasterDepot] | None = None,
+) -> StreamingResponse:
     workbook = Workbook()
     default_sheet = workbook.active
     workbook.remove(default_sheet)
-    for sheet_name, headers, rows in sheets:
+    for sheet_index, (sheet_name, headers, rows) in enumerate(sheets):
         worksheet = workbook.create_sheet(title=sheet_name[:31])
         worksheet.append(headers)
         for row in rows:
             worksheet.append([format_cell(value) for value in row])
-        for cell in worksheet[1]:
-            cell.style = "Headline 4"
+        for column_index, cell in enumerate(worksheet[1], start=1):
+            required = bool(template_required and sheet_index == 0 and cell.value in template_required)
+            cell.fill = PatternFill("solid", fgColor="C55A11" if required else "1F4E78")
+            cell.font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            worksheet.column_dimensions[get_column_letter(column_index)].width = min(max(len(str(cell.value)) + 3, 14), 28)
+        worksheet.row_dimensions[1].height = 28
+        worksheet.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{max(worksheet.max_row, 1)}"
         worksheet.freeze_panes = "A2"
+        if template_required is not None and sheet_index == 0:
+            if "active_status" in headers:
+                status_column = get_column_letter(headers.index("active_status") + 1)
+                status_validation = DataValidation(type="list", formula1='"ACTIVE,INACTIVE"', allow_blank=True)
+                worksheet.add_data_validation(status_validation)
+                status_validation.add(f"{status_column}2:{status_column}50001")
+    if template_required is not None:
+        guide = workbook.create_sheet(title="Template Guide")
+        guide.append(["column_name", "requirement", "format"])
+        date_columns = {"operating_date", "validation_date", "gate_out_date", "shipment_end_date"}
+        time_columns = {"official_window_start", "official_window_end", "validation_time", "gate_out_time", "shipment_end_time"}
+        for header in sheets[0][1]:
+            column_format = "YYYY-MM-DD" if header in date_columns else "HH:MM:SS" if header in time_columns else "Text / number sesuai kolom"
+            guide.append([header, "Wajib" if header in template_required else "Opsional", column_format])
+        for cell in guide[1]:
+            cell.fill = PatternFill("solid", fgColor="1F4E78")
+            cell.font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        guide.freeze_panes = "A2"
+        guide.auto_filter.ref = f"A1:C{guide.max_row}"
+        guide.column_dimensions["A"].width = 28
+        guide.column_dimensions["B"].width = 14
+        guide.column_dimensions["C"].width = 28
+    if depot_reference is not None:
+        reference = workbook.create_sheet(title="Depot Reference")
+        reference.append(["depot_id", "depot_name", "depot_code"])
+        for depot in depot_reference:
+            reference.append([depot.depot_id, depot.depot_name, depot.depot_code])
+        for cell in reference[1]:
+            cell.fill = PatternFill("solid", fgColor="1F4E78")
+            cell.font = Font(name="Arial", size=10, bold=True, color="FFFFFF")
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        reference.freeze_panes = "A2"
+        reference.auto_filter.ref = f"A1:C{max(reference.max_row, 1)}"
+        reference.column_dimensions["A"].width = 34
+        reference.column_dimensions["B"].width = 30
+        reference.column_dimensions["C"].width = 18
+        if depot_reference:
+            workbook.defined_names.add(
+                DefinedName("DepotIds", attr_text=f"'Depot Reference'!$A$2:$A${len(depot_reference) + 1}")
+            )
+            import_sheet = workbook.worksheets[0]
+            depot_column = get_column_letter(sheets[0][1].index("depot_id") + 1)
+            depot_validation = DataValidation(type="list", formula1="=DepotIds", allow_blank=False)
+            import_sheet.add_data_validation(depot_validation)
+            depot_validation.add(f"{depot_column}2:{depot_column}50001")
     output = BytesIO()
     workbook.save(output)
     output.seek(0)
@@ -2107,6 +2154,7 @@ def build_tag_lookup(db: Session, owner: str, ids: list[str]) -> dict[str, str]:
 
 def build_mt_export(db: Session, depot: MasterDepot) -> tuple[str, list[str], list[list]]:
     headers = [
+        "depot_id",
         "depot_code",
         "depot_name",
         "source_mt_id",
@@ -2125,6 +2173,7 @@ def build_mt_export(db: Session, depot: MasterDepot) -> tuple[str, list[str], li
     tag_lookup = build_tag_lookup(db, "MT", [mt.mt_id for mt in mts])
     rows = [
         [
+            depot.depot_id,
             depot.depot_code,
             depot.depot_name,
             mt.source_mt_id,
@@ -2146,6 +2195,7 @@ def build_mt_export(db: Session, depot: MasterDepot) -> tuple[str, list[str], li
 
 def build_spbu_export(db: Session, depot: MasterDepot) -> tuple[str, list[str], list[list]]:
     headers = [
+        "depot_id",
         "depot_code",
         "depot_name",
         "spbu_code",
@@ -2168,6 +2218,7 @@ def build_spbu_export(db: Session, depot: MasterDepot) -> tuple[str, list[str], 
     tag_lookup = build_tag_lookup(db, "SPBU", [spbu.spbu_id for spbu in spbus])
     rows = [
         [
+            depot.depot_id,
             depot.depot_code,
             depot.depot_name,
             spbu.spbu_code,
@@ -2193,6 +2244,7 @@ def build_spbu_export(db: Session, depot: MasterDepot) -> tuple[str, list[str], 
 
 def build_shipment_export(db: Session, depot: MasterDepot) -> tuple[str, list[str], list[list]]:
     headers = [
+        "depot_id",
         "depot_code",
         "depot_name",
         "source_shipment_id",
@@ -2215,6 +2267,7 @@ def build_shipment_export(db: Session, depot: MasterDepot) -> tuple[str, list[st
     shipments = db.scalars(select(FactShipment).where(FactShipment.depot_id == depot.depot_id).order_by(FactShipment.source_shipment_id)).all()
     rows = [
         [
+            depot.depot_id,
             depot.depot_code,
             depot.depot_name,
             shipment.source_shipment_id,
@@ -2241,6 +2294,7 @@ def build_shipment_export(db: Session, depot: MasterDepot) -> tuple[str, list[st
 
 def build_loading_order_export(db: Session, depot: MasterDepot) -> tuple[str, list[str], list[list]]:
     headers = [
+        "depot_id",
         "depot_code",
         "depot_name",
         "source_depot_name",
@@ -2281,6 +2335,7 @@ def build_loading_order_export(db: Session, depot: MasterDepot) -> tuple[str, li
         product = products.get(line.product_id)
         rows.append(
             [
+                depot.depot_id,
                 depot.depot_code,
                 depot.depot_name,
                 line.source_depot_name,

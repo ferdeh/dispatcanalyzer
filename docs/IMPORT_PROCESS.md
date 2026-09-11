@@ -6,7 +6,6 @@ RAW FILE -> STAGING -> VALIDATION -> NORMALIZATION -> REFERENCE MAPPING -> QUALI
 
 Phase 0 APIs:
 
-- `POST /api/v1/imports/sample`
 - `POST /api/v1/imports?domain=...&sheet_name=...`
 - `GET /api/v1/imports`
 - `GET /api/v1/imports/{id}`
@@ -16,6 +15,12 @@ Phase 0 APIs:
 Every staged row keeps `raw_payload`, `normalized_payload`, `validation_status`, and `validation_messages`.
 
 Template export supports `MOBIL_TANGKI`, `SPBU`, `LOADING_ORDER`, and `GPS`.
+
+Depot is the root master and is created manually through Master Data CRUD. The
+system generates `depot_id` when the depot is created. Every MT, SPBU, and
+Loading Order row must use an existing, non-deleted `depot_id`; imports with a
+blank or unknown value fail before any canonical row is written. Import never
+creates a depot from a source name or source code.
 
 Data export is filtered by depot from `master_depot` and supports:
 

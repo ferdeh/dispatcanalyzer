@@ -6,6 +6,7 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
 from app.compatibility import evaluate_mt_spbu_compatibility
+from app.import_jobs import claim_next_import, process_import
 from app.importer import ImportProcessor
 from app.models import (
     Base,
@@ -14,6 +15,8 @@ from app.models import (
     DataQualityIssue,
     FactLoadingOrderLine,
     FactShipment,
+    ImportAudit,
+    MasterDepot,
     MasterMT,
     MasterProduct,
     MasterSPBU,
@@ -119,6 +122,143 @@ def test_loading_order_number_can_repeat_across_depots(db_session, tmp_path) -> 
     lines = db_session.scalars(select(FactLoadingOrderLine).where(FactLoadingOrderLine.loading_order_number == "LO-001")).all()
     assert len(lines) == 2
     assert {line.source_depot_name for line in lines} == {"DEPOT A", "DEPOT B"}
+
+
+def test_v2_import_identity_and_tags_are_scoped_by_depot(db_session, tmp_path) -> None:
+    db_session.add_all(
+        [
+            MasterDepot(depot_id="DEPOT-A", depot_code="DA", depot_name="Depot A", active_status="ACTIVE"),
+            MasterDepot(depot_id="DEPOT-B", depot_code="DB", depot_name="Depot B", active_status="ACTIVE"),
+        ]
+    )
+    db_session.commit()
+    processor = ImportProcessor(db_session)
+
+    mt_path = tmp_path / "mt.csv"
+    mt_path.write_text(
+        "depot_id,vehicle_registration,vehicle_name_raw,capacity_label,project_tag\n"
+        "DEPOT-A,B9067WFU,B9067WFU - 24 KL,24KL,All In\n"
+        "DEPOT-B,B9067WFU,B9067WFU - 24 KL,24KL,Singkil\n",
+        encoding="utf-8",
+    )
+    processor.import_master_mt(mt_path, require_depot_id=True)
+    mts = db_session.scalars(select(MasterMT).where(MasterMT.vehicle_registration == "B9067WFU")).all()
+    assert {mt.mt_id for mt in mts} == {
+        make_id("mt", "DEPOT-A", "B9067WFU"),
+        make_id("mt", "DEPOT-B", "B9067WFU"),
+    }
+
+    mt_update_path = tmp_path / "mt_update.csv"
+    mt_update_path.write_text(
+        'depot_id,vehicle_registration,vehicle_name_raw,project_tag\nDEPOT-A,B9067WFU,B9067WFU - 24 KL,"NON-PTO,Gunung"\n',
+        encoding="utf-8",
+    )
+    processor.import_master_mt(mt_update_path, require_depot_id=True)
+    depot_a_mt_id = make_id("mt", "DEPOT-A", "B9067WFU")
+    depot_a_tags = set(
+        db_session.scalars(
+            select(MasterTag.tag_value)
+            .join(BridgeMTTag, BridgeMTTag.tag_id == MasterTag.tag_id)
+            .where(BridgeMTTag.mt_id == depot_a_mt_id)
+        ).all()
+    )
+    assert depot_a_tags == {"NON-PTO", "Gunung"}
+
+    spbu_path = tmp_path / "spbu.csv"
+    spbu_path.write_text(
+        "depot_id,spbu_code,spbu_name,project_tag\nDEPOT-A,SPBU-01,SPBU A,Gunung\nDEPOT-B,SPBU-01,SPBU B,Singkil\n",
+        encoding="utf-8",
+    )
+    processor.import_master_spbu(spbu_path, require_depot_id=True)
+    spbus = db_session.scalars(select(MasterSPBU).where(MasterSPBU.spbu_code == "SPBU-01")).all()
+    assert {spbu.spbu_id for spbu in spbus} == {
+        make_id("spbu", "DEPOT-A", "SPBU-01"),
+        make_id("spbu", "DEPOT-B", "SPBU-01"),
+    }
+
+    lo_path = tmp_path / "lo.csv"
+    lo_path.write_text(
+        "depot_id,shipment_id,loading_order_number,source_depot_name,vehicle_registration,source_spbu_code,source_product_name,quantity\n"
+        "DEPOT-A,SHP-A,LO-001,Depot A,B9067WFU,SPBU-01,PERTALITE,8\n"
+        "DEPOT-B,SHP-B,LO-001,Depot B,B9067WFU,SPBU-01,PERTALITE,8\n",
+        encoding="utf-8",
+    )
+    processor.import_loading_order(lo_path, require_depot_id=True)
+    lines = db_session.scalars(select(FactLoadingOrderLine).where(FactLoadingOrderLine.loading_order_number == "LO-001")).all()
+    assert {line.loading_order_id for line in lines} == {
+        make_id("lo", "DEPOT-A", "LO-001"),
+        make_id("lo", "DEPOT-B", "LO-001"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("domain", "content"),
+    [
+        ("MOBIL_TANGKI", "depot_id,vehicle_registration\nDEPOT-UNKNOWN,B1234AA\n"),
+        ("SPBU", "depot_id,spbu_code\nDEPOT-UNKNOWN,SPBU-01\n"),
+        (
+            "LOADING_ORDER",
+            "depot_id,shipment_id,loading_order_number,source_depot_name\n"
+            "DEPOT-UNKNOWN,SHP-01,LO-01,Unknown Depot\n",
+        ),
+    ],
+)
+def test_v2_import_rejects_unknown_depot_id(db_session, tmp_path, domain, content) -> None:
+    csv_path = tmp_path / f"{domain.lower()}_unknown_depot.csv"
+    csv_path.write_text(content, encoding="utf-8")
+    processor = ImportProcessor(db_session)
+
+    with pytest.raises(ValueError, match="Buat Depot terlebih dahulu") as exc_info:
+        if domain == "MOBIL_TANGKI":
+            processor.import_master_mt(csv_path, require_depot_id=True)
+        elif domain == "SPBU":
+            processor.import_master_spbu(csv_path, require_depot_id=True)
+        else:
+            processor.import_loading_order(csv_path, require_depot_id=True)
+
+    assert "DEPOT-UNKNOWN" in str(exc_info.value)
+    assert db_session.scalar(select(func.count()).select_from(MasterDepot)) == 0
+
+
+def test_v2_import_rejects_blank_depot_id(db_session, tmp_path) -> None:
+    csv_path = tmp_path / "mt_blank_depot.csv"
+    csv_path.write_text("depot_id,vehicle_registration\n,B1234AA\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="depot_id kosong pada baris 2") as exc_info:
+        ImportProcessor(db_session).import_master_mt(csv_path, require_depot_id=True)
+
+    assert "Master Data > Depot" in str(exc_info.value)
+
+
+def test_durable_import_job_is_claimed_and_published(db_session, tmp_path) -> None:
+    db_session.add(MasterDepot(depot_id="DEPOT-JOB", depot_code="DJ", depot_name="Depot Job", active_status="ACTIVE"))
+    csv_path = tmp_path / "queued_mt.csv"
+    csv_path.write_text(
+        "depot_id,name,project_tag\nDEPOT-JOB,BJOB123 - 16 KL,Job Tag\n",
+        encoding="utf-8",
+    )
+    audit = ImportAudit(
+        import_id="imp_durable_test",
+        domain="MOBIL_TANGKI",
+        filename=csv_path.name,
+        sheet_name="Mobil Tangki",
+        stored_path=str(csv_path),
+        status="QUEUED",
+        mapping_version="phase0.v2",
+    )
+    db_session.add(audit)
+    db_session.commit()
+
+    assert claim_next_import(db_session) == audit.import_id
+    assert db_session.get(ImportAudit, audit.import_id).status == "PROCESSING"
+    process_import(db_session, audit.import_id)
+
+    published = db_session.get(ImportAudit, audit.import_id)
+    assert published.status == "PUBLISHED"
+    assert published.processed_rows == 1
+    assert published.completed_at is not None
+    assert db_session.get(MasterMT, make_id("mt", "DEPOT-JOB", "BJOB123")) is not None
+    assert not csv_path.exists()
 
 
 def test_loading_order_import_stores_personnel_on_shipment(db_session, tmp_path) -> None:

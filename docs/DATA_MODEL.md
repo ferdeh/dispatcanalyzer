@@ -12,12 +12,20 @@ Phase 0 core tables:
 - Phase 4 derived historical fleet intelligence: `fact_spbu_mt_pair`, `fact_spbu_mt_profile`, `fact_spbu_mt_temporal_profile`.
 - Quality: `data_quality_issue`.
 
+Phase 10 integration persistence:
+
+- `integration_client`: logical consumer identity, client code/name, SHA-256 token hash, non-secret hint, active flag, read scope, rotation/last-used timestamps, and creator. Raw bearer tokens are never persisted.
+- `integration_dataset_version`: last logical version/freshness snapshot for terminal, vehicle, historical operation, route result, and shift configuration datasets.
+- `integration_api_log`: correlation ID, sanitized client/method/path/query, request time, response status/duration/record count, IP, and safe error fields. Authorization and raw secrets are outside the schema.
+
+Migration `0029_phase10_amt_connector` also adds compound indexes for depot/date historical reads, shipment/LO update lookup, Phase 7 route-version vehicle timeline, and Phase 8 dispatch-vehicle departure/return timeline. Operational source rows remain in their existing Phase 0/7/8 tables; Phase 10 does not duplicate route or trip state.
+
 Important separation:
 
 - Master/reference estimates remain in `master_spbu.master_distance_km` and `master_spbu.master_travel_time_min`.
 - Observed travel/visit evidence belongs in GPS and derived fact tables.
 - Loading Order row order is not an actual stop sequence when GPS evidence exists.
-- `fact_loading_order_line` uses a composite primary key: `loading_order_number` + `source_depot_name`/`tbbm`. `loading_order_number` may repeat across depots, and source `shipment_id` is allowed to repeat because one shipment can contain multiple loading orders, SPBU destinations, and compartments in the same MT.
+- Master identities are depot-scoped: `master_mt` is unique by `depot_id + vehicle_registration`, `master_spbu` by `primary_depot_id + spbu_code`, and `fact_loading_order_line` by `depot_id + loading_order_number`. Their deterministic IDs are generated from those same pairs. `loading_order_number` may repeat across depots, and source `shipment_id` is allowed to repeat because one shipment can contain multiple loading orders, SPBU destinations, and compartments in the same MT.
 
 Phase 3 derived facts:
 

@@ -23,11 +23,15 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://dispatch:dispatch@db:5432/dispatch_intelligence}
       EXAMPLE_DATA_DIR: /app/example data
+      IMPORT_UPLOAD_DIR: /app/import_uploads
       ML_ARTIFACT_DIR: /app/ml_artifacts
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:3001,http://localhost:5173}
       GOOGLE_ROUTES_ENCRYPTION_KEY: ${GOOGLE_ROUTES_ENCRYPTION_KEY:-}
+      PHASE10_RATE_LIMIT_PER_MINUTE: ${PHASE10_RATE_LIMIT_PER_MINUTE:-600}
+      PHASE10_DEFAULT_TIMEZONE: ${PHASE10_DEFAULT_TIMEZONE:-Asia/Jakarta}
     volumes:
       - ./example data:/app/example data:ro
+      - import_uploads:/app/import_uploads
       - ml_artifacts:/app/ml_artifacts
     ports:
       - "${API_PORT:-8000}:8000"
@@ -63,6 +67,24 @@ services:
       api:
         condition: service_healthy
 
+  import-worker:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "app.import_worker"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://dispatch:dispatch@db:5432/dispatch_intelligence}
+      EXAMPLE_DATA_DIR: /app/example data
+      IMPORT_UPLOAD_DIR: /app/import_uploads
+      IMPORT_WORKER_POLL_SECONDS: ${IMPORT_WORKER_POLL_SECONDS:-1}
+    volumes:
+      - ./example data:/app/example data:ro
+      - import_uploads:/app/import_uploads
+    depends_on:
+      api:
+        condition: service_healthy
+
   web:
     build:
       context: apps/web
@@ -81,4 +103,5 @@ services:
 
 volumes:
   postgres_data:
+  import_uploads:
   ml_artifacts:
